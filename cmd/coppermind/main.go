@@ -13,6 +13,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/mcp"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
+	"github.com/bonjoski/coppermind/pkg/seeder"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 )
 
@@ -34,6 +35,8 @@ func main() {
 		runRecall(os.Args[2:])
 	case "scratchpad":
 		runScratchpad(os.Args[2:])
+	case "seed":
+		runSeed(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	case "version", "--version", "-v":
@@ -235,6 +238,51 @@ func runScratchpad(args []string) {
 		fmt.Fprintf(os.Stderr, "Unknown scratchpad action: %q\n", action)
 		os.Exit(1)
 	}
+}
+
+func runSeed(args []string) {
+	fs := flag.NewFlagSet("seed", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory for database files")
+	category := fs.String("category", "documentation", "Default category for ingested documents")
+	_ = fs.Parse(args)
+
+	rest := fs.Args()
+	if len(rest) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: path to markdown file or directory is required\nUsage: coppermind seed [--category <cat>] <path>\n")
+		os.Exit(1)
+	}
+	targetPath := rest[0]
+
+	mgr, err := initManager(*dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+	info, err := os.Stat(targetPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error accessing %s: %v\n", targetPath, err)
+		os.Exit(1)
+	}
+
+	var count int
+	if info.IsDir() {
+		fmt.Printf("Seeding Coppermind from directory %s...\n", targetPath)
+		count, err = seeder.IngestDirectory(ctx, mgr, targetPath, *category)
+	} else {
+		fmt.Printf("Seeding Coppermind from file %s...\n", targetPath)
+		count, err = seeder.IngestFile(ctx, mgr, targetPath, *category)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Seeding failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	total, _ := mgr.Count(ctx, "")
+	fmt.Printf("✓ Successfully ingested %d knowledge chunks into Coppermind! (Total memories in brain: %d)\n", count, total)
 }
 
 func runStatus(args []string) {
