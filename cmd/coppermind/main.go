@@ -18,6 +18,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/doctor"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/hook"
+	"github.com/bonjoski/coppermind/pkg/indexer"
 	"github.com/bonjoski/coppermind/pkg/keystore"
 	"github.com/bonjoski/coppermind/pkg/mcp"
 	"github.com/bonjoski/coppermind/pkg/project"
@@ -90,6 +91,8 @@ func main() {
 		runDispatch(cmdArgs)
 	case "seed":
 		runSeed(cmdArgs)
+	case "index":
+		runIndex(cmdArgs)
 	case "export":
 		runExport(cmdArgs)
 	case "import":
@@ -131,6 +134,7 @@ Commands:
   scratchpad   Interact with fast in-memory working state (get, set, keys)
   dispatch     Enqueue an asynchronous cognitive task onto the message bus
   seed         Ingest markdown files or directories into memory
+  index        Scan, chunk, and index a codebase repository into semantic memory
   export       Export the brain into a portable, verified capsule archive
   import       Restore a brain from a capsule archive with path traversal checks
   verify       Audit cryptographic Merkle chain integrity for a session
@@ -234,13 +238,38 @@ func initBroker() (queue.Broker, error) {
 
 func initRouter() router.ModelRouter {
 	endpoint := os.Getenv("COPPERMIND_LITELLM_URL")
+	model := os.Getenv("COPPERMIND_MODEL")
+	apiKey := os.Getenv("COPPERMIND_API_KEY")
+
+	// If OpenAI / Gemini keys are in ambient environment
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+	if apiKey == "" {
+		apiKey = os.Getenv("GEMINI_API_KEY")
+		if apiKey != "" && endpoint == "" {
+			endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
+			if model == "" {
+				model = "gemini-2.5-flash"
+			}
+		}
+	}
+
 	if endpoint == "" {
+		endpoint = os.Getenv("OPENAI_BASE_URL")
+	}
+
+	if endpoint == "" && apiKey == "" {
 		// Offline fallback reflection mode; does not query keystore or prompt Touch ID
 		return router.NewLiteLLMRouter("", "")
 	}
-	ks := keystore.NewLocksmithKeystore()
-	apiKey, _ := ks.GetSecret(context.Background(), "OPENAI_API_KEY")
-	return router.NewLiteLLMRouter(endpoint, apiKey)
+
+	if apiKey == "" {
+		ks := keystore.NewLocksmithKeystore()
+		apiKey, _ = ks.GetSecret(context.Background(), "OPENAI_API_KEY")
+	}
+
+	return router.NewLiteLLMRouterWithModel(endpoint, apiKey, model)
 }
 
 func runMCP(args []string) {
@@ -436,7 +465,7 @@ func runDispatch(args []string) {
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: task_type is required\nUsage: coppermind dispatch [--session <sess>] <summarize_session|deep_reflect|extract_decisions|defrag_memory>\n")
+		fmt.Fprintf(os.Stderr, "Error: task_type is required\nUsage: coppermind dispatch [--session <sess>] <summarize_session|deep_reflect|extract_decisions|defrag_memory|index_git_tree>\n")
 		os.Exit(1)
 	}
 	taskType := queue.TaskType(rest[0])
@@ -524,6 +553,43 @@ func runSeed(args []string) {
 
 	total, _ := mgr.Count(ctx, "")
 	fmt.Printf("✓ Successfully ingested %d knowledge chunks into vault %q! (Total memories: %d)\n", count, activeProj, total)
+}
+
+func runIndex(args []string) {
+	fs := flag.NewFlagSet("index", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory for database files")
+	project := fs.String("project", "", "Target project vault")
+	targetDir := fs.String("dir", ".", "Codebase directory to index")
+	category := fs.String("category", "code", "Category for indexed code chunks")
+	maxChunks := fs.Int("max-chunks", 1000, "Maximum chunks to index")
+	chunkLines := fs.Int("chunk-lines", 50, "Lines per chunk")
+	_ = fs.Parse(args)
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	fmt.Printf("🔍 Indexing codebase at %q into vault %q (category: %q)...\n", *targetDir, activeProj, *category)
+	stats, err := indexer.IndexDirectory(context.Background(), mgr, *targetDir, indexer.IndexOptions{
+		Category:   *category,
+		MaxChunks:  *maxChunks,
+		ChunkLines: *chunkLines,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Indexing failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✓ Codebase indexing complete in %v:\n", stats.Duration)
+	fmt.Printf("• Files Scanned: %d\n", stats.FilesScanned)
+	fmt.Printf("• Files Indexed: %d (Chunks Stored: %d)\n", stats.FilesIndexed, stats.ChunksStored)
+	fmt.Printf("• Files Skipped: %d\n", stats.FilesSkipped)
+	if stats.Redactions > 0 {
+		fmt.Printf("• Secret Redactions: %d (credentials quarantined)\n", stats.Redactions)
+	}
 }
 
 func runExport(args []string) {

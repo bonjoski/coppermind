@@ -42,23 +42,34 @@ type CompletionResponse struct {
 type ModelRouter interface {
 	Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error)
 	Reflect(ctx context.Context, sessionID string, memories []*brain.MemoryNode) (string, error)
+	DistillDecisions(ctx context.Context, sessionID string, memories []*brain.MemoryNode) (string, error)
 }
 
 // LiteLLMRouter provides an HTTP client adapter to LiteLLM Proxy / Ollama / OpenAI-compatible APIs.
 type LiteLLMRouter struct {
-	endpoint string
-	apiKey   string
-	client   *http.Client
+	endpoint     string
+	apiKey       string
+	defaultModel string
+	client       *http.Client
 }
 
 // NewLiteLLMRouter creates a new router targeting an endpoint.
 func NewLiteLLMRouter(endpoint, apiKey string) *LiteLLMRouter {
+	return NewLiteLLMRouterWithModel(endpoint, apiKey, "default")
+}
+
+// NewLiteLLMRouterWithModel creates a new router targeting an endpoint with a specific model.
+func NewLiteLLMRouterWithModel(endpoint, apiKey, defaultModel string) *LiteLLMRouter {
 	if endpoint == "" {
 		endpoint = "http://localhost:4000/v1"
 	}
+	if defaultModel == "" {
+		defaultModel = "default"
+	}
 	return &LiteLLMRouter{
-		endpoint: strings.TrimRight(endpoint, "/"),
-		apiKey:   apiKey,
+		endpoint:     strings.TrimRight(endpoint, "/"),
+		apiKey:       apiKey,
+		defaultModel: defaultModel,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -217,5 +228,70 @@ func fallbackReflection(sessionID string, memories []*brain.MemoryNode) string {
 		}
 	}
 
+	return sb.String()
+}
+
+// DistillDecisions extracts architectural decision records (ADRs) from session memories.
+func (r *LiteLLMRouter) DistillDecisions(ctx context.Context, sessionID string, memories []*brain.MemoryNode) (string, error) {
+	if len(memories) == 0 {
+		return "No decisions recorded for this session.", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Reviewing session %s with %d episodic records:\n\n", sessionID, len(memories)))
+	for i, m := range memories {
+		sb.WriteString(fmt.Sprintf("- [%s] %s\n", m.Category, m.Content))
+		if i >= 50 {
+			break
+		}
+	}
+
+	prompt := fmt.Sprintf(
+		"You are Coppermind. Distill the following memories into clear Architectural Decision Records (ADRs).\n"+
+			"Format each decision as:\n### ADR: <Title>\n- Context: <Why>\n- Decision: <What was chosen>\n- Consequence: <Impact>\n\n%s",
+		sb.String(),
+	)
+
+	model := r.defaultModel
+	if model == "" {
+		model = "default"
+	}
+
+	req := &CompletionRequest{
+		Model: model,
+		Messages: []Message{
+			{Role: "system", Content: "You are Coppermind, an expert architectural decision synthesizer."},
+			{Role: "user", Content: prompt},
+		},
+		Temperature: 0.1,
+		MaxTokens:   512,
+	}
+
+	resp, err := r.Complete(ctx, req)
+	if err != nil {
+		return fallbackDecisions(sessionID, memories), nil
+	}
+
+	return resp.Content, nil
+}
+
+func fallbackDecisions(sessionID string, memories []*brain.MemoryNode) string {
+	var decisions []string
+	for _, m := range memories {
+		c := strings.ToLower(m.Content)
+		if strings.Contains(c, "decid") || strings.Contains(c, "adr") || strings.Contains(c, "choose") || strings.Contains(c, "invariant") || m.Category == "decision" {
+			decisions = append(decisions, m.Content)
+		}
+	}
+
+	if len(decisions) == 0 {
+		return fmt.Sprintf("No architectural decisions recorded for session %s.", sessionID)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("### Architectural Decision Records: Session %s\n\n", sessionID))
+	for i, d := range decisions {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, d))
+	}
 	return sb.String()
 }

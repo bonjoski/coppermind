@@ -120,10 +120,142 @@ Add Coppermind to your agent's MCP configuration (`mcp_config.json` or `claude_d
 
 ---
 
-## Architectural Plans & Governance
+## Runtime Profiles: Profile A (Local) vs Profile B (Cluster)
 
-Coppermind is governed by the `bonjoski` sovereign AI agent security ecosystem. Architectural plans and STRIDE threat models are maintained at:
-* [`spanreed/docs/plans/accepted/2026-11-13-coppermind-portable-ai-brain-rfc.md`](https://github.com/bonjoski/spanreed)
+Coppermind features a **dual-profile runtime architecture** designed to meet the developer where they work: zero-dependency micro-appliance on local machines, or resilient high-throughput cluster on Kubernetes.
+
+| Architectural Component | Profile A: Local Micro-Appliance (Default) | Profile B: Distributed Cluster Appliance |
+| :--- | :--- | :--- |
+| **Target Workload** | Individual developer laptops, CI runners, edge workstations | Multi-agent teams, Kubernetes clusters, enterprise pools |
+| **Activation Environment** | `COPPERMIND_PROFILE=local` (or unset) | `COPPERMIND_PROFILE=cluster` |
+| **Relational Storage** | Pure-Go SQLite in WAL mode (`coppermind.db`) | PostgreSQL 17 (`pgvector/pgvector:pg17`) |
+| **Vector Engine** | Embedded 128-dim subword vectorizer + FTS5 BM25 | `pgvector` HNSW cosine index (`vector(128)`) |
+| **Working Memory** | In-memory thread-safe RESP scratchpad with mutexes | Redis Cluster 7.x / Dragonfly (`COPPERMIND_REDIS_ADDR`) |
+| **Task Queue** | Embedded Go buffered channel topic bus (256 queue) | RabbitMQ Cluster AMQP 0-9-1 (`COPPERMIND_RABBITMQ_URL`) |
+| **Model Router & Keys** | LiteLLM client + Locksmith Touch ID biometric leasing | Centralized LiteLLM proxy pool + SPIFFE mTLS tokens |
+| **Resource Footprint** | Single Go binary (<50MB, <80MB RAM, <150ms cold boot) | OCI container pods (`deploy/helm/coppermind`) |
+
+---
+
+### Configuration Environment Variables
+
+| Variable | Default Value | Profile | Description |
+| :--- | :--- | :--- | :--- |
+| `COPPERMIND_PROFILE` | `local` | Both | Runtime profile selection: `local` or `cluster`. |
+| `COPPERMIND_DATA_DIR` | `~/.coppermind` | Both | Root directory for SQLite databases, vaults, and sockets. |
+| `COPPERMIND_PROJECT` | `github` | Both | Active project vault (enforces 0% context cross-contamination). |
+| `COPPERMIND_POSTGRES_URL`| `postgres://coppermind:sovereign_secret@localhost:5433/coppermind?sslmode=disable` | Profile B | Connection string for PostgreSQL 17 + pgvector. |
+| `COPPERMIND_PG_PORT` | `5433` | Profile B | Port mapped for PostgreSQL container in Docker Compose. |
+| `COPPERMIND_REDIS_ADDR` | `127.0.0.1:6379` | Profile B | Host and port for external Redis working memory scratchpad. |
+| `COPPERMIND_RABBITMQ_URL`| `amqp://guest:guest@localhost:5672/` | Profile B | AMQP broker connection URL for async task queues. |
+| `COPPERMIND_LITELLM_URL` | *None (offline fallback)* | Both | Optional upstream LiteLLM gateway endpoint for deep reflection. |
+| `OPENAI_API_KEY` | *None* | Both | Optional API key (auto-resolved from Locksmith Secure Enclave if installed). |
+
+---
+
+### Docker Compose Cluster Setup (Profile B)
+
+A production-grade Docker Compose manifest is included at the repository root (`docker-compose.yml`), provisioning PostgreSQL 17 with `pgvector`, Redis 7, RabbitMQ 3, and Coppermind:
+
+```bash
+# 1. Start the distributed Profile B infrastructure in the background
+docker compose up -d
+
+# 2. Verify all cluster services are healthy
+docker compose ps
+
+# 3. Confirm pgvector extension is operational
+docker compose exec postgres psql -U coppermind -d coppermind -c \
+  "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
+
+# 4. Confirm Redis working memory responds
+docker compose exec redis redis-cli ping
+
+# 5. Run Coppermind diagnostic inspection against the cluster
+COPPERMIND_PROFILE=cluster coppermind doctor
+
+# 6. Store and recall memories using Profile B cluster
+COPPERMIND_PROFILE=cluster coppermind remember --category architecture "Postgres 17 pgvector cluster verified"
+COPPERMIND_PROFILE=cluster coppermind recall "Which database engine is active?"
+
+# 7. Tear down cluster stack
+docker compose down
+```
+
+---
+
+### Kubernetes Helm Deployment (Profile B)
+
+For enterprise team clusters and cloud-native orchestration, deploy Coppermind via its official Helm chart located at `deploy/helm/coppermind`:
+
+```bash
+# 1. Inspect default chart values
+helm show values deploy/helm/coppermind
+
+# 2. Deploy Coppermind into dedicated namespace
+helm upgrade --install coppermind deploy/helm/coppermind \
+  --namespace coppermind \
+  --create-namespace \
+  --set profile=cluster \
+  --set postgres.url="postgres://coppermind:secret@postgres-service.coppermind.svc.cluster.local:5432/coppermind?sslmode=disable" \
+  --set redis.addr="redis-service.coppermind.svc.cluster.local:6379" \
+  --set rabbitmq.url="amqp://guest:guest@rabbitmq-service.coppermind.svc.cluster.local:5672/"
+
+# 3. Verify running pods and service endpoints
+kubectl get pods -n coppermind -l app.kubernetes.io/name=coppermind
+kubectl get svc -n coppermind coppermind
+```
+
+---
+
+### MCP Agent Configurations (Claude Code, Cursor, Antigravity)
+
+Configure your AI agent to mount Coppermind using either Profile A (local zero-dependency) or Profile B (connected to your team cluster):
+
+#### Profile A: Local Sovereign STDIO Mount (`claude_desktop_config.json` or `mcp_config.json`)
+```json
+{
+  "mcpServers": {
+    "coppermind": {
+      "command": "coppermind",
+      "args": ["mcp"],
+      "env": {
+        "COPPERMIND_PROFILE": "local",
+        "COPPERMIND_PROJECT": "github"
+      }
+    }
+  }
+}
+```
+
+#### Profile B: Distributed Cluster STDIO Mount (`mcp_config.json`)
+```json
+{
+  "mcpServers": {
+    "coppermind-cluster": {
+      "command": "coppermind",
+      "args": ["mcp"],
+      "env": {
+        "COPPERMIND_PROFILE": "cluster",
+        "COPPERMIND_POSTGRES_URL": "postgres://coppermind:sovereign_secret@localhost:5433/coppermind?sslmode=disable",
+        "COPPERMIND_REDIS_ADDR": "127.0.0.1:6379",
+        "COPPERMIND_RABBITMQ_URL": "amqp://guest:guest@localhost:5672/",
+        "COPPERMIND_PROJECT": "team-shared"
+      }
+    }
+  }
+}
+```
+
+---
+
+## Ecosystem Integration
+
+Coppermind operates as the persistent memory and cognitive runtime tier within the `bonjoski` sovereign AI agent security ecosystem, integrating natively alongside:
+* [**`bonjoski/fabrial`**](https://github.com/bonjoski/fabrial): Unified security fabric and dynamic multi-tier agent router.
+* [**`bonjoski/airlock`**](https://github.com/bonjoski/airlock): Sub-15ms kernel-enforced sandbox for AI agents and build tools.
+* [**`bonjoski/locksmith`**](https://github.com/bonjoski/locksmith): Hardware biometric secrets vault and MCP credential manager.
+* [**`bonjoski/homebrew-tap`**](https://github.com/bonjoski/homebrew-tap): Official distribution tap for pre-compiled binaries.
 
 ---
 

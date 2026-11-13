@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -150,5 +151,38 @@ func TestCognitiveWorker_ReflectionPipeline(t *testing.T) {
 	}
 	if val, ok := sp.Get(ctx, "last_defrag_time"); !ok || val == "" {
 		t.Fatalf("expected last_defrag_time to be populated by defrag task")
+	}
+
+	// Test TaskIndexGitTree
+	codeFile := filepath.Join(tmpDir, "sample.go")
+	_ = os.WriteFile(codeFile, []byte("package sample\n\nfunc Helper() string { return \"indexed_successfully\" }\n"), 0644)
+
+	indexTask := &queue.TaskEnvelope{
+		SessionID: sessionID,
+		Type:      queue.TaskIndexGitTree,
+		Payload: map[string]interface{}{
+			"dir": tmpDir,
+		},
+	}
+	if err := broker.Publish(ctx, "tasks.index", indexTask); err != nil {
+		t.Fatalf("failed to publish index task: %v", err)
+	}
+
+	var indexResults []*brain.SearchResult
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		indexResults, _ = mgr.Recall(ctx, brain.RecallRequest{
+			Category: "code",
+			Query:    "indexed_successfully",
+			Limit:    1,
+			MinScore: 0.0,
+		})
+		if len(indexResults) > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(indexResults) == 0 {
+		t.Fatalf("worker failed to index git tree within deadline")
 	}
 }

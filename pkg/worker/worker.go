@@ -3,12 +3,12 @@ package worker
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/indexer"
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/router"
 )
@@ -72,6 +72,8 @@ func (w *CognitiveWorker) processTask(ctx context.Context, task *queue.TaskEnvel
 		err = w.handleReflection(ctx, task)
 	case queue.TaskExtractDecisions:
 		err = w.handleExtractDecisions(ctx, task)
+	case queue.TaskIndexGitTree:
+		err = w.handleIndexGitTree(ctx, task)
 	case queue.TaskDefragMemory:
 		err = w.handleDefrag(ctx)
 	default:
@@ -152,23 +154,24 @@ func (w *CognitiveWorker) handleExtractDecisions(ctx context.Context, task *queu
 		return fmt.Errorf("failed to recall memories for decision extraction: %w", err)
 	}
 
-	var decisions []string
+	var nodes []*brain.MemoryNode
 	for _, r := range results {
-		c := strings.ToLower(r.Node.Content)
-		if strings.Contains(c, "decid") || strings.Contains(c, "adr") || strings.Contains(c, "choose") || strings.Contains(c, "invariant") || r.Node.Category == "decision" {
-			decisions = append(decisions, r.Node.Content)
-		}
+		nodes = append(nodes, r.Node)
 	}
 
-	if len(decisions) == 0 {
+	if len(nodes) == 0 {
 		return nil
 	}
 
-	summary := fmt.Sprintf("Architectural Decisions for session %s:\n- %s", sessionID, strings.Join(decisions, "\n- "))
+	distilled, err := w.router.DistillDecisions(ctx, sessionID, nodes)
+	if err != nil {
+		return fmt.Errorf("failed to distill decisions: %w", err)
+	}
+
 	_, err = w.manager.Remember(ctx, brain.RememberRequest{
 		SessionID:  sessionID,
 		Category:   "decision",
-		Content:    summary,
+		Content:    distilled,
 		Provenance: brain.ProvenanceLocalWorkspace,
 		Metadata: map[string]string{
 			"task_id":     task.ID,
@@ -192,6 +195,17 @@ func (w *CognitiveWorker) handleDefrag(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (w *CognitiveWorker) handleIndexGitTree(ctx context.Context, task *queue.TaskEnvelope) error {
+	dir := "."
+	if task.Payload != nil {
+		if d, ok := task.Payload["dir"].(string); ok && d != "" {
+			dir = d
+		}
+	}
+	_, err := indexer.IndexDirectory(ctx, w.manager, dir, indexer.IndexOptions{})
+	return err
 }
 
 // Metrics returns current worker telemetry.
