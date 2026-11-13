@@ -24,17 +24,19 @@ type MemoryNode struct {
 	Provenance ProvenanceTier    `json:"provenance"`
 	TaintScore float64           `json:"taint_score"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
+	PrevHash   string            `json:"prev_hash"`
+	Hash       string            `json:"hash"`
 	CreatedAt  time.Time         `json:"created_at"`
 	UpdatedAt  time.Time         `json:"updated_at"`
 }
 
 // MemoryFilter specifies search criteria for recall operations.
 type MemoryFilter struct {
-	SessionID    string         `json:"session_id,omitempty"`
-	Category     string         `json:"category,omitempty"`
-	Provenance   ProvenanceTier `json:"provenance,omitempty"`
-	MinScore     float32        `json:"min_score,omitempty"`
-	Limit        int            `json:"limit,omitempty"`
+	SessionID  string         `json:"session_id,omitempty"`
+	Category   string         `json:"category,omitempty"`
+	Provenance ProvenanceTier `json:"provenance,omitempty"`
+	MinScore   float32        `json:"min_score,omitempty"`
+	Limit      int            `json:"limit,omitempty"`
 }
 
 // SearchResult contains a retrieved memory node and its relevance score.
@@ -59,6 +61,10 @@ type MemoryStore interface {
 
 	// Count returns the count of memory nodes, optionally filtered by session prefix.
 	Count(ctx context.Context, sessionPrefix string) (int, error)
+
+	// VerifySessionChain audits the cryptographic Merkle chain for a given session.
+	// Returns true and the verified count if intact, or false with the offending node ID and error if tampered.
+	VerifySessionChain(ctx context.Context, sessionID string) (bool, int, string, error)
 
 	// Close releases any database connections or locks.
 	Close() error

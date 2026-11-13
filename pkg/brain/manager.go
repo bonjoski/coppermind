@@ -64,6 +64,15 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 	// 2. Normalize content via NFKC and strip invisible runes (Stormcage cognitive firewall invariant)
 	normalized := sanitizeText(secRes.SanitizedText)
 
+	// 3. Cognitive Firewall Scan (OWASP LLM01 Prompt Injection & Jailbreak Defense)
+	threatRes, err := security.InspectCognitiveThreats(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("cognitive threat inspection failed: %w", err)
+	}
+	if threatRes.IsCritical && req.Provenance != ProvenanceLocalWorkspace {
+		return nil, fmt.Errorf("untrusted input rejected: %w", security.ErrPromptInjectionRejected)
+	}
+
 	if req.Category == "" {
 		req.Category = "general"
 	}
@@ -81,8 +90,14 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		}
 		metadata["redacted_secrets"] = fmt.Sprintf("%d", secRes.RedactedCount)
 	}
+	if len(threatRes.Flags) > 0 {
+		if metadata == nil {
+			metadata = make(map[string]string)
+		}
+		metadata["firewall_flags"] = strings.Join(threatRes.Flags, ",")
+	}
 
-	// 3. Generate embedding vector from sanitized content
+	// 4. Generate embedding vector from sanitized content
 	vec, err := m.embedder.Embed(ctx, normalized)
 	if err != nil {
 		return nil, fmt.Errorf("embedding generation failed: %w", err)
@@ -98,6 +113,7 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		Content:    normalized,
 		Vector:     vec,
 		Provenance: req.Provenance,
+		TaintScore: threatRes.TaintScore,
 		Metadata:   metadata,
 		CreatedAt:  now,
 		UpdatedAt:  now,
@@ -141,6 +157,11 @@ func (m *Manager) Scratchpad() Scratchpad {
 // Count returns the number of memories matching a session prefix.
 func (m *Manager) Count(ctx context.Context, sessionPrefix string) (int, error) {
 	return m.store.Count(ctx, sessionPrefix)
+}
+
+// VerifySessionChain audits the cryptographic Merkle chain for a given session.
+func (m *Manager) VerifySessionChain(ctx context.Context, sessionID string) (bool, int, string, error) {
+	return m.store.VerifySessionChain(ctx, sessionID)
 }
 
 // Close releases the underlying store resources.

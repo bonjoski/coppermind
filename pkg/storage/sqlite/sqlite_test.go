@@ -137,3 +137,67 @@ func TestSQLiteStore_ConcurrentWriters(t *testing.T) {
 		t.Errorf("expected %d total records across parallel subagents, got %d", expectedTotal, total)
 	}
 }
+
+func TestADV_MerkleTamperDetection(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "tamper_test.db")
+
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	session := "session-secure-merkle"
+	for i := 1; i <= 4; i++ {
+		err := store.Store(ctx, &brain.MemoryNode{
+			ID:         fmt.Sprintf("node-%d", i),
+			SessionID:  session,
+			Category:   "audit",
+			Content:    fmt.Sprintf("Legitimate audit log entry %d", i),
+			Provenance: brain.ProvenanceLocalWorkspace,
+			CreatedAt:  time.Unix(int64(1700000000+i*10), 0),
+		})
+		if err != nil {
+			t.Fatalf("store node-%d failed: %v", i, err)
+		}
+	}
+
+	// 1. Verify clean chain
+	intact, count, badID, err := store.VerifySessionChain(ctx, session)
+	if err != nil || !intact || count != 4 {
+		t.Fatalf("expected chain intact with 4 verified nodes, got intact=%v, count=%d, badID=%s, err=%v", intact, count, badID, err)
+	}
+
+	// 2. Adversarial Tamper: Directly alter content of node-2 in SQLite
+	_, err = store.db.Exec("UPDATE memory_nodes SET content = 'TAMPERED: Injected adversary log entry' WHERE id = 'node-2'")
+	if err != nil {
+		t.Fatalf("direct SQL update failed: %v", err)
+	}
+
+	// 3. Verify detection of content tampering
+	intact, count, badID, err = store.VerifySessionChain(ctx, session)
+	if intact {
+		t.Fatalf("expected chain verification to FAIL after content tampering, but returned intact=true")
+	}
+	if badID != "node-2" {
+		t.Errorf("expected badID to be node-2, got %q", badID)
+	}
+	if err == nil {
+		t.Fatalf("expected tamper error, got nil")
+	}
+	t.Logf("✓ Successfully detected content tampering: %v", err)
+
+	// 4. Adversarial Tamper: Alter prev_hash link
+	_, err = store.db.Exec("UPDATE memory_nodes SET prev_hash = 'deadbeef00000000000000000000000000000000000000000000000000000000' WHERE id = 'node-3'")
+	if err != nil {
+		t.Fatalf("direct SQL update failed: %v", err)
+	}
+
+	intact, _, badID, err = store.VerifySessionChain(ctx, session)
+	if intact {
+		t.Fatalf("expected chain verification to FAIL after prev_hash tampering, but returned intact=true")
+	}
+	t.Logf("✓ Successfully detected link break at %s: %v", badID, err)
+}

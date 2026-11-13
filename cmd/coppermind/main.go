@@ -51,6 +51,8 @@ func main() {
 		runExport(os.Args[2:])
 	case "import":
 		runImport(os.Args[2:])
+	case "verify":
+		runVerify(os.Args[2:])
 	case "doctor":
 		runDoctor(os.Args[2:])
 	case "hook":
@@ -83,6 +85,7 @@ Commands:
   seed         Ingest markdown files or directories into memory
   export       Export the brain into a portable, verified capsule archive
   import       Restore a brain from a capsule archive with path traversal checks
+  verify       Audit cryptographic Merkle chain integrity for a session
   doctor       Execute the 10-pillar diagnostic inspection suite
   hook         Install automated git hooks (e.g. post-commit episodic capture)
   status       Display brain health metrics and stored memory counts
@@ -119,7 +122,7 @@ func initManager(dataDir string) (*brain.Manager, error) {
 		return nil, fmt.Errorf("failed to open storage at %s: %w", dbPath, err)
 	}
 
-	embedder := embedding.NewLocalHashEmbedder(128)
+	embedder := embedding.NewEmbedderFromEnv()
 	sp := scratchpad.NewMemoryScratchpad()
 	return brain.NewManager(store, embedder, sp), nil
 }
@@ -431,6 +434,34 @@ func runImport(args []string) {
 	fmt.Printf("✓ Successfully restored brain capsule from %s\n", capsulePath)
 	fmt.Printf("• Restored Records: %d\n", manifest.TotalRecords)
 	fmt.Printf("• Verified Checksum: %s\n", manifest.DBChecksum)
+}
+
+func runVerify(args []string) {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	session := fs.String("session", "", "Session ID to verify (empty for default)")
+	_ = fs.Parse(args)
+
+	mgr, err := initManager(*dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	targetSession := *session
+	if targetSession == "" {
+		targetSession = "default"
+	}
+
+	fmt.Printf("🔍 Auditing cryptographic Merkle chain for session %q...\n", targetSession)
+	intact, count, badID, err := mgr.VerifySessionChain(context.Background(), targetSession)
+	if err != nil || !intact {
+		fmt.Printf("❌ Cryptographic chain verification FAILED!\n• Tampered Node: %s\n• Error: %v\n", badID, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✓ Cryptographic Merkle chain verified INTACT!\n• Verified Nodes: %d\n• Tampering: None detected\n", count)
 }
 
 func runDoctor(args []string) {

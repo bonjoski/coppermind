@@ -3,12 +3,15 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -80,14 +83,39 @@ func initSchema(db *sql.DB) error {
 		taint_score REAL NOT NULL DEFAULT 0.0,
 		metadata_json TEXT,
 		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL
+		updated_at INTEGER NOT NULL,
+		prev_hash TEXT NOT NULL DEFAULT '',
+		hash TEXT NOT NULL DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS idx_memory_session ON memory_nodes(session_id);
 	CREATE INDEX IF NOT EXISTS idx_memory_category ON memory_nodes(category);
 	CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory_nodes(created_at);
 	`
-	_, err := db.Exec(schema)
-	return err
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Migrations for existing databases
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN hash TEXT NOT NULL DEFAULT ''")
+
+	return nil
+}
+
+func computeNodeHash(prevHash, id, sessionID, category, content string, createdAtNano int64) string {
+	h := sha256.New()
+	h.Write([]byte(prevHash))
+	h.Write([]byte(":"))
+	h.Write([]byte(id))
+	h.Write([]byte(":"))
+	h.Write([]byte(sessionID))
+	h.Write([]byte(":"))
+	h.Write([]byte(category))
+	h.Write([]byte(":"))
+	h.Write([]byte(content))
+	h.Write([]byte(":"))
+	h.Write([]byte(strconv.FormatInt(createdAtNano, 10)))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (s *SQLiteStore) writeWorker() {
@@ -124,10 +152,22 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 	vecBlob := encodeVector(node.Vector)
 	metaJSON, _ := json.Marshal(node.Metadata)
 
+	// Ensure Merkle hash chaining
+	if node.Hash == "" {
+		var prevHash string
+		row := s.db.QueryRow("SELECT hash FROM memory_nodes WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", node.SessionID)
+		_ = row.Scan(&prevHash)
+		if prevHash == "" {
+			prevHash = "0000000000000000000000000000000000000000000000000000000000000000"
+		}
+		node.PrevHash = prevHash
+		node.Hash = computeNodeHash(node.PrevHash, node.ID, node.SessionID, node.Category, node.Content, node.CreatedAt.UnixNano())
+	}
+
 	query := `
 	INSERT INTO memory_nodes (
-		id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		category=excluded.category,
 		content=excluded.content,
@@ -135,7 +175,9 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 		provenance=excluded.provenance,
 		taint_score=excluded.taint_score,
 		metadata_json=excluded.metadata_json,
-		updated_at=excluded.updated_at;
+		updated_at=excluded.updated_at,
+		prev_hash=excluded.prev_hash,
+		hash=excluded.hash;
 	`
 	_, err := s.db.Exec(query,
 		node.ID,
@@ -148,6 +190,8 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 		string(metaJSON),
 		node.CreatedAt.UnixNano(),
 		node.UpdatedAt.UnixNano(),
+		node.PrevHash,
+		node.Hash,
 	)
 	return err
 }
@@ -217,7 +261,7 @@ func (s *SQLiteStore) Delete(ctx context.Context, id string) error {
 
 // RecallSemantic performs hybrid vector similarity search over stored memory nodes.
 func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32, filter brain.MemoryFilter) ([]*brain.SearchResult, error) {
-	query := `SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at FROM memory_nodes WHERE 1=1`
+	query := `SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash FROM memory_nodes WHERE 1=1`
 	var args []interface{}
 
 	if filter.SessionID != "" {
@@ -243,13 +287,13 @@ func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32,
 
 	for rows.Next() {
 		var (
-			id, sessionID, category, content, provStr, metaJSON string
-			vecBlob                                             []byte
-			taintScore                                          float64
-			createdAtNano, updatedAtNano                        int64
+			id, sessionID, category, content, provStr, metaJSON, prevHash, hash string
+			vecBlob                                                             []byte
+			taintScore                                                          float64
+			createdAtNano, updatedAtNano                                        int64
 		)
 
-		if err := rows.Scan(&id, &sessionID, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano); err != nil {
+		if err := rows.Scan(&id, &sessionID, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash); err != nil {
 			return nil, err
 		}
 
@@ -274,6 +318,8 @@ func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32,
 			Provenance: brain.ProvenanceTier(provStr),
 			TaintScore: taintScore,
 			Metadata:   metadata,
+			PrevHash:   prevHash,
+			Hash:       hash,
 			CreatedAt:  time.Unix(0, createdAtNano),
 			UpdatedAt:  time.Unix(0, updatedAtNano),
 		}
@@ -309,7 +355,7 @@ func (s *SQLiteStore) RecallEpisodic(ctx context.Context, sessionID string, limi
 		limit = 20
 	}
 	query := `
-	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at
+	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash
 	FROM memory_nodes
 	WHERE session_id = ?
 	ORDER BY created_at ASC
@@ -324,12 +370,12 @@ func (s *SQLiteStore) RecallEpisodic(ctx context.Context, sessionID string, limi
 	var nodes []*brain.MemoryNode
 	for rows.Next() {
 		var (
-			id, sid, category, content, provStr, metaJSON string
-			vecBlob                                       []byte
-			taintScore                                    float64
-			createdAtNano, updatedAtNano                  int64
+			id, sid, category, content, provStr, metaJSON, prevHash, hash string
+			vecBlob                                                       []byte
+			taintScore                                                    float64
+			createdAtNano, updatedAtNano                                  int64
 		)
-		if err := rows.Scan(&id, &sid, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano); err != nil {
+		if err := rows.Scan(&id, &sid, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash); err != nil {
 			return nil, err
 		}
 
@@ -347,12 +393,61 @@ func (s *SQLiteStore) RecallEpisodic(ctx context.Context, sessionID string, limi
 			Provenance: brain.ProvenanceTier(provStr),
 			TaintScore: taintScore,
 			Metadata:   metadata,
+			PrevHash:   prevHash,
+			Hash:       hash,
 			CreatedAt:  time.Unix(0, createdAtNano),
 			UpdatedAt:  time.Unix(0, updatedAtNano),
 		})
 	}
 
 	return nodes, rows.Err()
+}
+
+// VerifySessionChain audits the cryptographic Merkle chain for a given session.
+func (s *SQLiteStore) VerifySessionChain(ctx context.Context, sessionID string) (bool, int, string, error) {
+	query := `
+	SELECT id, session_id, category, content, created_at, prev_hash, hash
+	FROM memory_nodes
+	WHERE session_id = ?
+	ORDER BY created_at ASC, rowid ASC;
+	`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return false, 0, "", err
+	}
+	defer rows.Close()
+
+	expectedPrevHash := "0000000000000000000000000000000000000000000000000000000000000000"
+	verifiedCount := 0
+
+	for rows.Next() {
+		var (
+			id, sid, category, content, prevHash, storedHash string
+			createdAtNano                                    int64
+		)
+		if err := rows.Scan(&id, &sid, &category, &content, &createdAtNano, &prevHash, &storedHash); err != nil {
+			return false, verifiedCount, "", err
+		}
+
+		// Backward compatibility for pre-existing records prior to hashing
+		if prevHash == "" && storedHash == "" {
+			continue
+		}
+
+		if prevHash != expectedPrevHash {
+			return false, verifiedCount, id, fmt.Errorf("cryptographic chain break at node %s: expected prev_hash %s, got %s", id, expectedPrevHash, prevHash)
+		}
+
+		computedHash := computeNodeHash(prevHash, id, sid, category, content, createdAtNano)
+		if computedHash != storedHash {
+			return false, verifiedCount, id, fmt.Errorf("tamper detected at node %s: expected hash %s, stored hash %s", id, computedHash, storedHash)
+		}
+
+		expectedPrevHash = storedHash
+		verifiedCount++
+	}
+
+	return true, verifiedCount, "", rows.Err()
 }
 
 // Count returns the count of memory nodes.
