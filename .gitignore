@@ -1,0 +1,21 @@
+# Binaries and build artifacts
+bin/
+*.exe
+*.test
+*.prof
+
+# Database and test artifacts
+*.db
+*.db-wal
+*.db-shm
+test-data/
+
+# OS artifacts
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE configs
+.idea/
+.vscode/
+*.code-workspace
