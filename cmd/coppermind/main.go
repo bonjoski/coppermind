@@ -25,6 +25,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/router"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/seeder"
+	"github.com/bonjoski/coppermind/pkg/storage/postgres"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 	"github.com/bonjoski/coppermind/pkg/version"
 	"github.com/bonjoski/coppermind/pkg/worker"
@@ -52,6 +53,15 @@ func main() {
 			args = args[2:]
 		} else if strings.HasPrefix(args[0], "--data-dir=") {
 			_ = os.Setenv("COPPERMIND_DATA_DIR", strings.TrimPrefix(args[0], "--data-dir="))
+			args = args[1:]
+		} else if (args[0] == "--profile" || args[0] == "-profile") && len(args) > 1 {
+			_ = os.Setenv("COPPERMIND_PROFILE", args[1])
+			args = args[2:]
+		} else if strings.HasPrefix(args[0], "--profile=") {
+			_ = os.Setenv("COPPERMIND_PROFILE", strings.TrimPrefix(args[0], "--profile="))
+			args = args[1:]
+		} else if strings.HasPrefix(args[0], "-profile=") {
+			_ = os.Setenv("COPPERMIND_PROFILE", strings.TrimPrefix(args[0], "-profile="))
 			args = args[1:]
 		} else {
 			break
@@ -155,11 +165,50 @@ func getDBPath(dataDir, explicitProject string) string {
 	return filepath.Join(dir, "coppermind.db")
 }
 
+func getProfile() string {
+	p := strings.ToLower(strings.TrimSpace(os.Getenv("COPPERMIND_PROFILE")))
+	if p == "cluster" || p == "b" || p == "profile-b" || p == "profile_b" {
+		return "cluster"
+	}
+	return "local"
+}
+
 func initManager(dataDir, explicitProject string) (*brain.Manager, string, error) {
 	pm := project.NewManager(dataDir)
 	projectName, projectDir, err := pm.ResolveProject(explicitProject)
 	if err != nil {
 		return nil, "", err
+	}
+
+	embedder := embedding.NewEmbedderFromEnv()
+	profile := getProfile()
+
+	if profile == "cluster" {
+		pgURL := os.Getenv("COPPERMIND_POSTGRES_URL")
+		if pgURL == "" {
+			pgPort := os.Getenv("COPPERMIND_PG_PORT")
+			if pgPort == "" {
+				pgPort = "5433"
+			}
+			pgURL = fmt.Sprintf("postgres://coppermind:sovereign_secret@localhost:%s/coppermind?sslmode=disable", pgPort)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		store, err := postgres.NewPostgresStore(ctx, postgres.Config{
+			URL:       pgURL,
+			Dimension: embedder.Dimension(),
+		})
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to open cluster postgres store: %w", err)
+		}
+
+		redisAddr := os.Getenv("COPPERMIND_REDIS_ADDR")
+		if redisAddr == "" {
+			redisAddr = "127.0.0.1:6379"
+		}
+		sp := scratchpad.NewRedisScratchpad(redisAddr)
+		return brain.NewManager(store, embedder, sp), projectName, nil
 	}
 
 	dbPath := filepath.Join(projectDir, "coppermind.db")
@@ -168,14 +217,16 @@ func initManager(dataDir, explicitProject string) (*brain.Manager, string, error
 		return nil, "", fmt.Errorf("failed to open storage at %s: %w", dbPath, err)
 	}
 
-	embedder := embedding.NewEmbedderFromEnv()
 	sp := scratchpad.NewMemoryScratchpad()
 	return brain.NewManager(store, embedder, sp), projectName, nil
 }
 
 func initBroker() (queue.Broker, error) {
 	amqpURL := os.Getenv("COPPERMIND_RABBITMQ_URL")
-	if amqpURL != "" {
+	if amqpURL != "" || getProfile() == "cluster" {
+		if amqpURL == "" {
+			amqpURL = "amqp://guest:guest@localhost:5672/"
+		}
 		return queue.NewRabbitMQBroker(amqpURL, "coppermind.tasks")
 	}
 	return queue.NewEmbeddedBroker(256), nil
@@ -336,7 +387,16 @@ func runScratchpad(args []string) {
 		os.Exit(1)
 	}
 	action := args[0]
-	sp := scratchpad.NewMemoryScratchpad()
+	var sp brain.Scratchpad
+	if getProfile() == "cluster" {
+		redisAddr := os.Getenv("COPPERMIND_REDIS_ADDR")
+		if redisAddr == "" {
+			redisAddr = "127.0.0.1:6379"
+		}
+		sp = scratchpad.NewRedisScratchpad(redisAddr)
+	} else {
+		sp = scratchpad.NewMemoryScratchpad()
+	}
 	ctx := context.Background()
 
 	switch action {
@@ -650,10 +710,12 @@ func runDoctor(args []string) {
 
 	results := doctor.RunDiagnostics(context.Background(), dir)
 	allPassed := true
+	hasWarnings := false
 	for _, p := range results {
 		icon := "✓"
 		if p.Status == doctor.StatusWarn {
 			icon = "⚠️"
+			hasWarnings = true
 		} else if p.Status == doctor.StatusFail {
 			icon = "❌"
 			allPassed = false
@@ -662,10 +724,12 @@ func runDoctor(args []string) {
 	}
 
 	fmt.Println()
-	if allPassed {
+	if allPassed && !hasWarnings {
 		fmt.Println("🎉 All Coppermind health pillars PASSED! Cognitive brain is healthy and operating within SLAs.")
+	} else if allPassed && hasWarnings {
+		fmt.Println("⚠️ Diagnostic warnings detected. Operational, but some cluster services are offline or unconfigured.")
 	} else {
-		fmt.Println("⚠️ Diagnostic warnings or failures detected. Please review the output above.")
+		fmt.Println("❌ Diagnostic failures detected. Please review the output above.")
 	}
 }
 
@@ -810,11 +874,21 @@ func runStatus(args []string) {
 		os.Exit(1)
 	}
 
+	profile := getProfile()
 	fmt.Println("Coppermind Brain Status:")
+	fmt.Printf("• Runtime Profile: Profile %s\n", strings.ToUpper(profile[:1])+profile[1:])
 	fmt.Printf("• Active Project Vault: %s\n", activeProj)
-	fmt.Printf("• Database Path: %s\n", getDBPath(*dataDir, *project))
+	if profile == "cluster" {
+		fmt.Println("• Storage Backend: PostgreSQL 17 + pgvector")
+		fmt.Println("• Working Memory: Redis Cluster / Dragonfly RESP")
+		fmt.Println("• Message Broker: RabbitMQ AMQP 0-9-1")
+	} else {
+		fmt.Printf("• Database Path: %s\n", getDBPath(*dataDir, *project))
+		fmt.Println("• Storage Backend: Pure-Go SQLite WAL Mode")
+		fmt.Println("• Working Memory: In-Memory RESP Scratchpad")
+		fmt.Println("• Message Broker: In-Memory Topic Bus")
+	}
 	fmt.Printf("• Total Stored Memories: %s\n", strconv.Itoa(total))
-	fmt.Println("• Storage Backend: Pure-Go SQLite WAL Mode")
 	fmt.Println("• Embedding Engine: 128-dim FastText-style Subword/N-Gram Hashing")
 	fmt.Println("• Interface: Model Context Protocol (MCP) over STDIO")
 }

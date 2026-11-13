@@ -8,6 +8,7 @@ services:
     ports:
       - "8765:8765"
     environment:
+      - COPPERMIND_PROFILE=cluster
       - COPPERMIND_POSTGRES_URL=postgres://coppermind:sovereign_secret@postgres:5432/coppermind?sslmode=disable
       - COPPERMIND_REDIS_ADDR=redis:6379
       - COPPERMIND_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
@@ -30,7 +31,7 @@ services:
       - POSTGRES_USER=coppermind
       - POSTGRES_PASSWORD=sovereign_secret
     ports:
-      - "5432:5432"
+      - "${COPPERMIND_PG_PORT:-5433}:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:

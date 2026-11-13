@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-coppermind
+  labels:
+    app.kubernetes.io/name: coppermind
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: mcp-tcp
+      protocol: TCP
+      name: mcp-tcp
+  selector:
+    app.kubernetes.io/name: coppermind
+    app.kubernetes.io/instance: {{ .Release.Name }}

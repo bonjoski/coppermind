@@ -1,0 +1,21 @@
+apiVersion: v2
+name: coppermind
+description: Portable Cognitive AI Brain & Sovereign Agent Memory Runtime (Profile B Cluster Appliance)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - ai-memory
+  - cognitive-brain
+  - mcp
+  - pgvector
+  - postgresql
+  - redis
+  - rabbitmq
+home: https://github.com/bonjoski/coppermind
+sources:
+  - https://github.com/bonjoski/coppermind
+maintainers:
+  - name: Ben Skolmoski
+    email: bskolmoski@gmail.com
+    url: https://github.com/bonjoski
