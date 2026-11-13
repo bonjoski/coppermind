@@ -12,6 +12,7 @@
 - Use pure-Go SQLite (`modernc.org/sqlite`) with WAL mode (`PRAGMA journal_mode=WAL`).
 - All persistent writes must route through the single-writer channel worker to guarantee zero lock contention across parallel subagents.
 - Text normalization via `golang.org/x/text/unicode/norm` (NFKC) and zero-width rune stripping before vector embedding.
+- Strict credential quarantine via `pkg/security`: raw private keys fail closed, and embedded API keys are redacted with typed placeholders before persistence.
 - FastText-style subword/word n-gram hashing embedder producing L2-normalized 128-dimensional vectors.
 - Strict adherence to Model Context Protocol (MCP) JSON-RPC 2.0 specifications.
 

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/bonjoski/coppermind/pkg/security"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -47,13 +49,20 @@ func NewManager(store MemoryStore, embedder Embedder, scratchpad Scratchpad) *Ma
 }
 
 // Remember sanitizes, embeds, and stores a new memory node.
+// Enforces strict secret quarantine: credentials and private keys are never stored.
 func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNode, error) {
 	if strings.TrimSpace(req.Content) == "" {
 		return nil, fmt.Errorf("content cannot be empty")
 	}
 
-	// Normalize content via NFKC and strip invisible runes (Stormcage cognitive firewall invariant)
-	normalized := sanitizeText(req.Content)
+	// 1. Secret & Credential Scan (Fail-closed or sanitize)
+	secRes, err := security.SanitizeMemory(req.Content)
+	if err != nil {
+		return nil, fmt.Errorf("memory rejected: %w", err)
+	}
+
+	// 2. Normalize content via NFKC and strip invisible runes (Stormcage cognitive firewall invariant)
+	normalized := sanitizeText(secRes.SanitizedText)
 
 	if req.Category == "" {
 		req.Category = "general"
@@ -65,7 +74,15 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		req.SessionID = "default"
 	}
 
-	// Generate embedding vector
+	metadata := req.Metadata
+	if secRes.RedactedCount > 0 {
+		if metadata == nil {
+			metadata = make(map[string]string)
+		}
+		metadata["redacted_secrets"] = fmt.Sprintf("%d", secRes.RedactedCount)
+	}
+
+	// 3. Generate embedding vector from sanitized content
 	vec, err := m.embedder.Embed(ctx, normalized)
 	if err != nil {
 		return nil, fmt.Errorf("embedding generation failed: %w", err)
@@ -81,7 +98,7 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		Content:    normalized,
 		Vector:     vec,
 		Provenance: req.Provenance,
-		Metadata:   req.Metadata,
+		Metadata:   metadata,
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}

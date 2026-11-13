@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/bonjoski/coppermind/pkg/security"
 )
 
 type item struct {
@@ -43,7 +45,14 @@ func (s *MemoryScratchpad) Get(_ context.Context, key string) (string, bool) {
 }
 
 // Set stores a key-value pair with an optional TTL duration.
+// Rejects raw private keys and automatically redacts credentials.
 func (s *MemoryScratchpad) Set(_ context.Context, key string, val string, ttl time.Duration) error {
+	secRes, err := security.SanitizeMemory(val)
+	if err != nil {
+		return fmt.Errorf("scratchpad write rejected: %w", err)
+	}
+	val = secRes.SanitizedText
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

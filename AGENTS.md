@@ -26,7 +26,10 @@ When working in `coppermind`, you act as the **Lead Cognitive Systems Architect 
    - Normalize all inbound memory strings using NFKC Unicode decomposition.
    - Strip invisible zero-width runes (`\u200b`–`\u200f`, `\ufeff`).
    - Tag memories with provenance classifications (`TRUST_LOCAL_WORKSPACE`, `TAINT_EXTERNAL_USER`, `TAINT_UNTRUSTED_WEB`).
-5. **Fail-Closed Isolation**:
+5. **Absolute Credential & Secret Quarantine (Fail-Closed)**:
+   - Raw credentials, API keys (OpenAI, Anthropic, AWS, GitHub, Google, Slack), private keys, database passwords, and high-entropy tokens are strictly forbidden from Coppermind memory or vector embeddings.
+   - All inputs pass through `pkg/security.SanitizeMemory`. Standalone keys and private keys are rejected fail-closed (`ErrSecretRejected`), and embedded credentials are automatically redacted with `[REDACTED_*]` tokens before persistence.
+6. **Fail-Closed Isolation**:
    - Tainted memories or corrupted payload frames must fail closed without poisoning the root vector space or crashing peer connections.
 
 ---

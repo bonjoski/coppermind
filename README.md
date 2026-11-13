@@ -44,6 +44,7 @@ flowchart TD
 2. **Zero Hop Tax & Sub-10ms Latency**: Connects over persistent STDIO or Unix Domain Sockets; eliminates intermediate CLI wrapper latency.
 3. **Multi-Agent Concurrency ($N=8$ Stress-Tested)**: Features a single-writer channel worker with SQLite Write-Ahead Logging (WAL mode), enabling 8+ parallel subagents to store, search, and lock memory without database collisions or lock timeouts.
 4. **Cognitive Security & Taint Defense**: Normalizes all inbound memories via NFKC Unicode decomposition and strips invisible zero-width characters (OWASP LLM01 indirect prompt injection defense).
+5. **Absolute Secret & Credential Quarantine**: Strict fail-closed defense scanning for private keys, AWS/OpenAI/Anthropic/GitHub API keys, and high-entropy tokens. Raw keys are rejected with typed security errors, and embedded tokens are redacted (`[REDACTED_*]`) before reaching SQLite or vector embeddings.
 
 ---
 
