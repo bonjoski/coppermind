@@ -377,7 +377,7 @@ func runDispatch(args []string) {
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: task_type is required\nUsage: coppermind dispatch [--session <sess>] <summarize_session|deep_reflect|defrag_memory>\n")
+		fmt.Fprintf(os.Stderr, "Error: task_type is required\nUsage: coppermind dispatch [--session <sess>] <summarize_session|deep_reflect|extract_decisions|defrag_memory>\n")
 		os.Exit(1)
 	}
 	taskType := queue.TaskType(rest[0])
@@ -672,27 +672,44 @@ func runDoctor(args []string) {
 
 func runHook(args []string) {
 	if len(args) < 1 {
-		fmt.Println("Usage: coppermind hook install [--repo <path>]")
+		fmt.Println("Usage: coppermind hook <install|uninstall|status> [--repo <path>]")
 		os.Exit(1)
 	}
 
 	action := args[0]
-	if action != "install" {
-		fmt.Fprintf(os.Stderr, "Unknown hook action: %q. Expected 'install'\n", action)
-		os.Exit(1)
-	}
-
-	fs := flag.NewFlagSet("hook install", flag.ExitOnError)
+	fs := flag.NewFlagSet("hook "+action, flag.ExitOnError)
 	repo := fs.String("repo", ".", "Repository root directory")
 	_ = fs.Parse(args[1:])
 
-	hookPath, err := hook.InstallGitHook(*repo)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to install git hook: %v\n", err)
+	switch action {
+	case "install":
+		hookPath, err := hook.InstallGitHook(*repo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to install git hook: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Successfully installed automated episodic git commit hook!\n• Hook Path: %s\n", hookPath)
+	case "uninstall", "remove":
+		if err := hook.UninstallGitHook(*repo); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to uninstall git hook: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Successfully uninstalled git commit hook from %s\n", *repo)
+	case "status":
+		installed, err := hook.StatusGitHook(*repo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error inspecting git hook: %v\n", err)
+			os.Exit(1)
+		}
+		if installed {
+			fmt.Printf("✓ Coppermind episodic git hook is ACTIVE in %s\n", *repo)
+		} else {
+			fmt.Printf("• Coppermind episodic git hook is NOT installed in %s\n", *repo)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown hook action: %q. Expected 'install', 'uninstall', or 'status'\n", action)
 		os.Exit(1)
 	}
-
-	fmt.Printf("✓ Successfully installed automated episodic git commit hook!\n• Hook Path: %s\n", hookPath)
 }
 
 func runProject(args []string) {

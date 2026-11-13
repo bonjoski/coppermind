@@ -55,26 +55,49 @@ flowchart TD
 ### Installation & Build
 
 ```bash
-# Build the binary
-go build -o bin/coppermind ./cmd/coppermind
+# Via Homebrew Tap (Recommended)
+brew tap bonjoski/tap
+brew install coppermind
 
-# Verify installation
-./bin/coppermind version
+# Or build from source with Go 1.27+
+go build -o bin/coppermind ./cmd/coppermind
+cp bin/coppermind ~/.local/bin/coppermind
 ```
 
 ### CLI Usage
 
 ```bash
-# Store an architectural invariant into memory
+# Manage isolated project vaults (0% cross-contamination)
+coppermind project list
+coppermind project use personal
+coppermind --project personal remember --category "family" "Bailey the dog is allergic to chicken"
+coppermind --project personal recall "What is Bailey allergic to?"
+
+# Store an architectural invariant into default (github) vault
 coppermind remember --category architecture "Always use Go 1.27 pure-Go SQLite with WAL mode"
 
-# Semantic recall using natural language query
+# Semantic and BM25 hybrid recall using natural language query
 coppermind recall "What database engine and journal mode do we use?"
 
 # Fast in-memory scratchpad operations
 coppermind scratchpad set active_task "Refactor auth middleware"
 coppermind scratchpad get active_task
 coppermind scratchpad keys
+
+# Install automated episodic git commit hook in current repository
+coppermind hook install
+coppermind hook status
+
+# Run background reflection or memory defragmentation
+coppermind dispatch summarize_session
+coppermind dispatch extract_decisions
+coppermind dispatch defrag_memory
+
+# Purge expired TTL nodes and compact database
+coppermind vacuum
+
+# Run 10-pillar diagnostic inspection
+coppermind doctor
 
 # Brain health and metrics
 coppermind status

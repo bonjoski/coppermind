@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,7 @@ type CognitiveWorker struct {
 	router     router.ModelRouter
 	metrics    WorkerMetrics
 	mu         sync.RWMutex
+	wg         sync.WaitGroup
 	stopCh     chan struct{}
 	cancelFunc context.CancelFunc
 }
@@ -57,6 +59,9 @@ func (w *CognitiveWorker) Start(ctx context.Context) error {
 }
 
 func (w *CognitiveWorker) processTask(ctx context.Context, task *queue.TaskEnvelope) error {
+	w.wg.Add(1)
+	defer w.wg.Done()
+
 	w.mu.Lock()
 	w.metrics.LastTaskTime = time.Now()
 	w.mu.Unlock()
@@ -65,6 +70,8 @@ func (w *CognitiveWorker) processTask(ctx context.Context, task *queue.TaskEnvel
 	switch task.Type {
 	case queue.TaskSummarizeSession, queue.TaskDeepReflect:
 		err = w.handleReflection(ctx, task)
+	case queue.TaskExtractDecisions:
+		err = w.handleExtractDecisions(ctx, task)
 	case queue.TaskDefragMemory:
 		err = w.handleDefrag(ctx)
 	default:
@@ -110,10 +117,15 @@ func (w *CognitiveWorker) handleReflection(ctx context.Context, task *queue.Task
 		return fmt.Errorf("reflection engine failed: %w", err)
 	}
 
+	category := "reflection"
+	if task.Type == queue.TaskSummarizeSession {
+		category = "summary"
+	}
+
 	// Persist the synthesized reflection
 	_, err = w.manager.Remember(ctx, brain.RememberRequest{
 		SessionID:  sessionID,
-		Category:   "reflection",
+		Category:   category,
 		Content:    reflection,
 		Provenance: brain.ProvenanceLocalWorkspace,
 		Metadata: map[string]string{
@@ -124,8 +136,61 @@ func (w *CognitiveWorker) handleReflection(ctx context.Context, task *queue.Task
 	return err
 }
 
-func (w *CognitiveWorker) handleDefrag(_ context.Context) error {
-	// In local SQLite mode, memory defragmentation ensures scratchpad keys are pruned
+func (w *CognitiveWorker) handleExtractDecisions(ctx context.Context, task *queue.TaskEnvelope) error {
+	sessionID := task.SessionID
+	if sessionID == "" {
+		sessionID = "default"
+	}
+
+	results, err := w.manager.Recall(ctx, brain.RecallRequest{
+		SessionID: sessionID,
+		Query:     "decision decided ADR choose implement architectural",
+		Limit:     25,
+		MinScore:  0.0,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to recall memories for decision extraction: %w", err)
+	}
+
+	var decisions []string
+	for _, r := range results {
+		c := strings.ToLower(r.Node.Content)
+		if strings.Contains(c, "decid") || strings.Contains(c, "adr") || strings.Contains(c, "choose") || strings.Contains(c, "invariant") || r.Node.Category == "decision" {
+			decisions = append(decisions, r.Node.Content)
+		}
+	}
+
+	if len(decisions) == 0 {
+		return nil
+	}
+
+	summary := fmt.Sprintf("Architectural Decisions for session %s:\n- %s", sessionID, strings.Join(decisions, "\n- "))
+	_, err = w.manager.Remember(ctx, brain.RememberRequest{
+		SessionID:  sessionID,
+		Category:   "decision",
+		Content:    summary,
+		Provenance: brain.ProvenanceLocalWorkspace,
+		Metadata: map[string]string{
+			"task_id":     task.ID,
+			"synthesized": "true",
+		},
+	})
+	return err
+}
+
+func (w *CognitiveWorker) handleDefrag(ctx context.Context) error {
+	// 1. Purge expired memories across vaults
+	_, _ = w.manager.PurgeExpired(ctx)
+
+	// 2. Perform passive WAL checkpoint and vacuum
+	_ = w.manager.Vacuum(ctx)
+
+	// 3. Update scratchpad with defrag timestamp
+	sp := w.manager.Scratchpad()
+	if sp != nil {
+		_ = sp.Set(ctx, "last_defrag_time", time.Now().Format(time.RFC3339), 0)
+	}
+
 	return nil
 }
 
@@ -140,9 +205,10 @@ func (w *CognitiveWorker) Metrics() WorkerMetrics {
 	}
 }
 
-// Stop shuts down the worker.
+// Stop shuts down the worker and waits for active task processing to complete.
 func (w *CognitiveWorker) Stop() {
 	if w.cancelFunc != nil {
 		w.cancelFunc()
 	}
+	w.wg.Wait()
 }

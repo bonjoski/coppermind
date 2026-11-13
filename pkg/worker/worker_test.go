@@ -103,4 +103,52 @@ func TestCognitiveWorker_ReflectionPipeline(t *testing.T) {
 	if metrics.TasksProcessed != 1 {
 		t.Errorf("expected 1 task processed, got %d", metrics.TasksProcessed)
 	}
+
+	// Test TaskExtractDecisions
+	decTask := &queue.TaskEnvelope{
+		SessionID: sessionID,
+		Type:      queue.TaskExtractDecisions,
+	}
+	if err := broker.Publish(ctx, "tasks.decisions", decTask); err != nil {
+		t.Fatalf("failed to publish decision task: %v", err)
+	}
+
+	var decResults []*brain.SearchResult
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		decResults, _ = mgr.Recall(ctx, brain.RecallRequest{
+			SessionID: sessionID,
+			Category:  "decision",
+			Query:     "decision",
+			Limit:     1,
+			MinScore:  0.0,
+		})
+		if len(decResults) > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(decResults) == 0 {
+		t.Fatalf("worker failed to extract decisions within deadline")
+	}
+
+	// Test TaskDefragMemory
+	defragTask := &queue.TaskEnvelope{
+		SessionID: sessionID,
+		Type:      queue.TaskDefragMemory,
+	}
+	if err := broker.Publish(ctx, "tasks.defrag", defragTask); err != nil {
+		t.Fatalf("failed to publish defrag task: %v", err)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if val, ok := sp.Get(ctx, "last_defrag_time"); ok && val != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if val, ok := sp.Get(ctx, "last_defrag_time"); !ok || val == "" {
+		t.Fatalf("expected last_defrag_time to be populated by defrag task")
+	}
 }

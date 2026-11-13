@@ -1,0 +1,75 @@
+services:
+  coppermind:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coppermind-cluster
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      - COPPERMIND_POSTGRES_URL=postgres://coppermind:sovereign_secret@postgres:5432/coppermind?sslmode=disable
+      - COPPERMIND_REDIS_ADDR=redis:6379
+      - COPPERMIND_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - coppermind-data:/data
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: coppermind-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=coppermind
+      - POSTGRES_USER=coppermind
+      - POSTGRES_PASSWORD=sovereign_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coppermind -d coppermind"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: coppermind-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: coppermind-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  coppermind-data:
+  pg-data:
+  redis-data:
+  rabbitmq-data:

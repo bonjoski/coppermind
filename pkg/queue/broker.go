@@ -20,6 +20,7 @@ const (
 	TaskDeepReflect      TaskType = "deep_reflect"
 	TaskIndexGitTree     TaskType = "index_git_tree"
 	TaskDefragMemory     TaskType = "defrag_memory"
+	TaskExtractDecisions TaskType = "extract_decisions"
 )
 
 // TaskEnvelope carries metadata, payload, and traceability for background execution.
