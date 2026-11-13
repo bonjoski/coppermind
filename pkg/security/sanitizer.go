@@ -6,7 +6,8 @@ import (
 	"math"
 	"regexp"
 	"strings"
-	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 var (
@@ -18,14 +19,14 @@ var (
 type SecretPattern struct {
 	Name        string
 	Regex       *regexp.Regexp
-	IsCritical  bool // Critical patterns (e.g. private keys) cause immediate rejection if dominant
+	IsCritical  bool
 	Replacement string
 }
 
 var builtinPatterns = []SecretPattern{
 	{
 		Name:        "Private Key Block",
-		Regex:       regexp.MustCompile(`-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|PGP|ENCRYPTED|ED25519) )?PRIVATE KEY-----[\s\S]+?-----END (?:(?:RSA|EC|DSA|OPENSSH|PGP|ENCRYPTED|ED25519) )?PRIVATE KEY-----`),
+		Regex:       regexp.MustCompile(`-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|PGP|ENCRYPTED|ED25519) )?PRIVATE KEY(?: BLOCK)?-----[\s\S]+?-----END (?:(?:RSA|EC|DSA|OPENSSH|PGP|ENCRYPTED|ED25519) )?PRIVATE KEY(?: BLOCK)?-----`),
 		IsCritical:  true,
 		Replacement: "[REDACTED_PRIVATE_KEY]",
 	},
@@ -107,26 +108,29 @@ type SanitizationResult struct {
 
 // SanitizeMemory evaluates input text for secrets, stripping or rejecting credentials.
 func SanitizeMemory(input string) (*SanitizationResult, error) {
-	trimmed := strings.TrimSpace(input)
+	// Step 0: De-obfuscate zero-width runes and decompose Unicode (NFKC) FIRST.
+	// This defeats zero-width rune smuggling (ADV-01).
+	cleanedInput := stripZeroWidthRunes(norm.NFKC.String(input))
+
+	trimmed := strings.TrimSpace(cleanedInput)
 	if len(trimmed) == 0 {
 		return &SanitizationResult{SanitizedText: input}, nil
 	}
 
 	result := &SanitizationResult{
-		SanitizedText: input,
+		SanitizedText: cleanedInput,
 	}
 
-	// 1. Check for standalone critical secrets (e.g. raw private key)
-	if strings.Contains(input, "-----BEGIN") && strings.Contains(input, "PRIVATE KEY-----") {
-		// If the entire text or majority is a private key, fail-closed reject
-		if len(trimmed) < 4096 {
+	// 1. Check for standalone private key blocks (all variants including PGP/OpenSSH) (ADV-03)
+	if strings.Contains(cleanedInput, "-----BEGIN") && strings.Contains(cleanedInput, "PRIVATE KEY") {
+		if len(trimmed) < 8192 {
 			return nil, fmt.Errorf("%w: private key block detected", ErrSecretRejected)
 		}
 	}
 
-	// 2. Check for standalone high-entropy token (e.g. raw token passed directly as content)
+	// 2. Check for standalone high-entropy token
 	tokens := strings.Fields(trimmed)
-	if len(tokens) == 1 && len(trimmed) >= 24 && ShannonEntropy(trimmed) >= 4.2 {
+	if len(tokens) == 1 && len(trimmed) >= 24 && hasHighEntropySegment(trimmed, 24, 4.2) {
 		return nil, fmt.Errorf("%w: raw high-entropy secret detected", ErrSecretRejected)
 	}
 
@@ -140,16 +144,15 @@ func SanitizeMemory(input string) (*SanitizationResult, error) {
 		}
 	}
 
-	// 4. Entropy scanning on unredacted long words/tokens
+	// 4. Sliding-window entropy scanning to defeat padding dilution attacks (ADV-02)
 	words := strings.Fields(result.SanitizedText)
 	for _, word := range words {
 		if strings.Contains(word, "[REDACTED_") {
 			continue
 		}
-		cleaned := strings.Trim(word, `"',;:=()[]{}<>`)
-		if len(cleaned) >= 32 && ShannonEntropy(cleaned) >= 4.5 {
-			// Suspected raw cryptographic token that evaded regex
-			result.SanitizedText = strings.ReplaceAll(result.SanitizedText, cleaned, "[REDACTED_HIGH_ENTROPY_SECRET]")
+		candidate := strings.Trim(word, `"',;:=()[]{}<>`)
+		if len(candidate) >= 24 && hasHighEntropySegment(candidate, 24, 4.3) {
+			result.SanitizedText = strings.ReplaceAll(result.SanitizedText, word, "[REDACTED_HIGH_ENTROPY_SECRET]")
 			result.RedactedCount++
 			result.DetectedTypes = append(result.DetectedTypes, "High-Entropy Secret")
 		}
@@ -158,28 +161,57 @@ func SanitizeMemory(input string) (*SanitizationResult, error) {
 	return result, nil
 }
 
-// ShannonEntropy calculates the bits of entropy per character.
-func ShannonEntropy(s string) float64 {
-	if len(s) == 0 {
+func stripZeroWidthRunes(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		if (r >= 0x200B && r <= 0x200F) || r == 0xFEFF || (r >= 0xE0000 && r <= 0xE007F) {
+			continue
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+// hasHighEntropySegment slides a window across candidate runes to defeat low-entropy padding.
+func hasHighEntropySegment(s string, winLen int, threshold float64) bool {
+	runes := []rune(s)
+	if len(runes) < winLen {
+		return ShannonEntropy(s) >= threshold
+	}
+
+	// Overall check
+	if ShannonEntropy(s) >= threshold {
+		return true
+	}
+
+	// Sliding window scan
+	for start := 0; start+winLen <= len(runes); start++ {
+		window := runes[start : start+winLen]
+		if shannonEntropyRunes(window) >= threshold {
+			return true
+		}
+	}
+	return false
+}
+
+func shannonEntropyRunes(runes []rune) float64 {
+	if len(runes) == 0 {
 		return 0.0
 	}
 	freq := make(map[rune]float64)
-	runeCount := 0
-	for _, r := range s {
-		if unicode.IsGraphic(r) {
-			freq[r]++
-			runeCount++
-		}
+	for _, r := range runes {
+		freq[r]++
 	}
-	if runeCount == 0 {
-		return 0.0
-	}
-
-	total := float64(runeCount)
+	total := float64(len(runes))
 	var entropy float64
 	for _, count := range freq {
 		p := count / total
 		entropy -= p * math.Log2(p)
 	}
 	return entropy
+}
+
+// ShannonEntropy calculates the bits of entropy per character.
+func ShannonEntropy(s string) float64 {
+	return shannonEntropyRunes([]rune(s))
 }

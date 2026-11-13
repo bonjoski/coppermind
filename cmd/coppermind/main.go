@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/capsule"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/mcp"
 	"github.com/bonjoski/coppermind/pkg/queue"
@@ -43,6 +44,10 @@ func main() {
 		runDispatch(os.Args[2:])
 	case "seed":
 		runSeed(os.Args[2:])
+	case "export":
+		runExport(os.Args[2:])
+	case "import":
+		runImport(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	case "version", "--version", "-v":
@@ -69,6 +74,8 @@ Commands:
   scratchpad   Interact with fast in-memory working state (get, set, keys)
   dispatch     Enqueue an asynchronous cognitive task onto the message bus
   seed         Ingest markdown files or directories into memory
+  export       Export the brain into a portable, verified capsule archive
+  import       Restore a brain from a capsule archive with path traversal checks
   status       Display brain health metrics and stored memory counts
   version      Print version information
 
@@ -372,6 +379,48 @@ func runSeed(args []string) {
 
 	total, _ := mgr.Count(ctx, "")
 	fmt.Printf("✓ Successfully ingested %d knowledge chunks into Coppermind! (Total memories in brain: %d)\n", count, total)
+}
+
+func runExport(args []string) {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	outPath := fs.String("out", "coppermind.capsule", "Output capsule path")
+	_ = fs.Parse(args)
+
+	dbPath := getDBPath(*dataDir)
+	manifest, err := capsule.ExportCapsule(context.Background(), dbPath, *outPath, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Export failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✓ Successfully exported brain capsule to %s\n", *outPath)
+	fmt.Printf("• Total Records: %d\n", manifest.TotalRecords)
+	fmt.Printf("• SHA-256 Checksum: %s\n", manifest.DBChecksum)
+}
+
+func runImport(args []string) {
+	fs := flag.NewFlagSet("import", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	_ = fs.Parse(args)
+
+	rest := fs.Args()
+	if len(rest) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: capsule path is required\nUsage: coppermind import <capsule.capsule>\n")
+		os.Exit(1)
+	}
+	capsulePath := rest[0]
+	targetDB := getDBPath(*dataDir)
+
+	manifest, err := capsule.ImportCapsule(context.Background(), capsulePath, targetDB, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Import failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✓ Successfully restored brain capsule from %s\n", capsulePath)
+	fmt.Printf("• Restored Records: %d\n", manifest.TotalRecords)
+	fmt.Printf("• Verified Checksum: %s\n", manifest.DBChecksum)
 }
 
 func runStatus(args []string) {
