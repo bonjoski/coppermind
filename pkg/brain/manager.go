@@ -9,17 +9,20 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/bonjoski/coppermind/pkg/gitscope"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"golang.org/x/text/unicode/norm"
 )
 
 // RememberRequest specifies input parameters for storing a memory.
 type RememberRequest struct {
-	SessionID  string            `json:"session_id"`
-	Category   string            `json:"category"`
-	Content    string            `json:"content"`
-	Provenance ProvenanceTier    `json:"provenance"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
+	SessionID   string            `json:"session_id"`
+	Category    string            `json:"category"`
+	Content     string            `json:"content"`
+	Provenance  ProvenanceTier    `json:"provenance"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	TTL         time.Duration     `json:"ttl,omitempty"`
+	Deduplicate bool              `json:"deduplicate,omitempty"`
 }
 
 // RecallRequest specifies query parameters for retrieving memories.
@@ -30,6 +33,9 @@ type RecallRequest struct {
 	Limit      int            `json:"limit,omitempty"`
 	MinScore   float32        `json:"min_score,omitempty"`
 	Provenance ProvenanceTier `json:"provenance,omitempty"`
+	Hybrid     bool           `json:"hybrid,omitempty"`
+	GitRepo    string         `json:"git_repo,omitempty"`
+	GitBranch  string         `json:"git_branch,omitempty"`
 }
 
 // Manager orchestrates the cognitive memory store, embedder, and scratchpad.
@@ -97,14 +103,63 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		metadata["firewall_flags"] = strings.Join(threatRes.Flags, ",")
 	}
 
+	// Automatic ambient Git repository & branch detection
+	if req.Provenance == ProvenanceLocalWorkspace {
+		gitCtx := gitscope.Detect("")
+		if gitCtx.IsGit {
+			if metadata == nil {
+				metadata = make(map[string]string)
+			}
+			if _, exists := metadata["git_repo"]; !exists && gitCtx.RepoName != "" {
+				metadata["git_repo"] = gitCtx.RepoName
+			}
+			if _, exists := metadata["git_branch"]; !exists && gitCtx.Branch != "" {
+				metadata["git_branch"] = gitCtx.Branch
+			}
+			if _, exists := metadata["git_commit"]; !exists && gitCtx.Commit != "" {
+				metadata["git_commit"] = gitCtx.Commit
+			}
+		}
+	}
+
 	// 4. Generate embedding vector from sanitized content
 	vec, err := m.embedder.Embed(ctx, normalized)
 	if err != nil {
 		return nil, fmt.Errorf("embedding generation failed: %w", err)
 	}
 
+	// 5. Intelligent Near-Duplicate Deduplication: Check if identical content exists in session if requested
+	if req.Deduplicate {
+		existing, _ := m.store.RecallSemantic(ctx, vec, MemoryFilter{
+			SessionID: req.SessionID,
+			Category:  req.Category,
+			Limit:     1,
+			MinScore:  0.98,
+		})
+		if len(existing) > 0 && strings.EqualFold(existing[0].Node.Content, normalized) {
+			existingNode := existing[0].Node
+			existingNode.UpdatedAt = time.Now()
+			if metadata != nil {
+				if existingNode.Metadata == nil {
+					existingNode.Metadata = make(map[string]string)
+				}
+				for k, v := range metadata {
+					existingNode.Metadata[k] = v
+				}
+			}
+			_ = m.store.Store(ctx, existingNode)
+			return existingNode, nil
+		}
+	}
+
 	id := generateID()
 	now := time.Now()
+
+	var expiresAt *time.Time
+	if req.TTL > 0 {
+		exp := now.Add(req.TTL)
+		expiresAt = &exp
+	}
 
 	node := &MemoryNode{
 		ID:         id,
@@ -117,6 +172,7 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		Metadata:   metadata,
 		CreatedAt:  now,
 		UpdatedAt:  now,
+		ExpiresAt:  expiresAt,
 	}
 
 	if err := m.store.Store(ctx, node); err != nil {
@@ -126,7 +182,7 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 	return node, nil
 }
 
-// Recall performs semantic similarity search over stored memory nodes.
+// Recall performs semantic or hybrid similarity search over stored memory nodes.
 func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResult, error) {
 	if strings.TrimSpace(req.Query) == "" {
 		return nil, fmt.Errorf("query cannot be empty")
@@ -144,9 +200,27 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 		Provenance: req.Provenance,
 		MinScore:   req.MinScore,
 		Limit:      req.Limit,
+		Hybrid:     req.Hybrid,
+		GitRepo:    req.GitRepo,
+		GitBranch:  req.GitBranch,
+	}
+
+	if req.Hybrid {
+		return m.store.RecallHybrid(ctx, normalizedQuery, queryVec, filter)
 	}
 
 	return m.store.RecallSemantic(ctx, queryVec, filter)
+}
+
+// Vacuum compacts database files, checkpoints the WAL, and cleans expired TTL memories.
+func (m *Manager) Vacuum(ctx context.Context) error {
+	_, _ = m.store.PurgeExpired(ctx)
+	return m.store.Vacuum(ctx)
+}
+
+// PurgeExpired cleans up any memories that have exceeded their designated TTL.
+func (m *Manager) PurgeExpired(ctx context.Context) (int, error) {
+	return m.store.PurgeExpired(ctx)
 }
 
 // Scratchpad returns access to the working memory layer.

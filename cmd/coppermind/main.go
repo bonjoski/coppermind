@@ -5,18 +5,22 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/capsule"
+	"github.com/bonjoski/coppermind/pkg/daemon"
 	"github.com/bonjoski/coppermind/pkg/doctor"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/hook"
 	"github.com/bonjoski/coppermind/pkg/keystore"
 	"github.com/bonjoski/coppermind/pkg/mcp"
+	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/router"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
@@ -33,32 +37,66 @@ func main() {
 		os.Exit(1)
 	}
 
-	command := os.Args[1]
+	args := os.Args[1:]
+	for len(args) > 0 {
+		if (args[0] == "--project" || args[0] == "-p") && len(args) > 1 {
+			_ = os.Setenv("COPPERMIND_PROJECT", args[1])
+			args = args[2:]
+		} else if strings.HasPrefix(args[0], "--project=") {
+			_ = os.Setenv("COPPERMIND_PROJECT", strings.TrimPrefix(args[0], "--project="))
+			args = args[1:]
+		} else if strings.HasPrefix(args[0], "-p=") {
+			_ = os.Setenv("COPPERMIND_PROJECT", strings.TrimPrefix(args[0], "-p="))
+			args = args[1:]
+		} else if (args[0] == "--data-dir") && len(args) > 1 {
+			_ = os.Setenv("COPPERMIND_DATA_DIR", args[1])
+			args = args[2:]
+		} else if strings.HasPrefix(args[0], "--data-dir=") {
+			_ = os.Setenv("COPPERMIND_DATA_DIR", strings.TrimPrefix(args[0], "--data-dir="))
+			args = args[1:]
+		} else {
+			break
+		}
+	}
+
+	if len(args) == 0 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	command := args[0]
+	cmdArgs := args[1:]
 	switch command {
-	case "mcp", "daemon":
-		runMCP(os.Args[2:])
+	case "mcp":
+		runMCP(cmdArgs)
+	case "daemon":
+		runDaemon(cmdArgs)
 	case "remember":
-		runRemember(os.Args[2:])
+		runRemember(cmdArgs)
 	case "recall":
-		runRecall(os.Args[2:])
+		runRecall(cmdArgs)
 	case "scratchpad":
-		runScratchpad(os.Args[2:])
+		runScratchpad(cmdArgs)
 	case "dispatch":
-		runDispatch(os.Args[2:])
+		runDispatch(cmdArgs)
 	case "seed":
-		runSeed(os.Args[2:])
+		runSeed(cmdArgs)
 	case "export":
-		runExport(os.Args[2:])
+		runExport(cmdArgs)
 	case "import":
-		runImport(os.Args[2:])
+		runImport(cmdArgs)
 	case "verify":
-		runVerify(os.Args[2:])
+		runVerify(cmdArgs)
+	case "vacuum", "gc":
+		runVacuum(cmdArgs)
+	case "project", "projects":
+		runProject(cmdArgs)
 	case "doctor":
-		runDoctor(os.Args[2:])
+		runDoctor(cmdArgs)
 	case "hook":
-		runHook(os.Args[2:])
+		runHook(cmdArgs)
 	case "status":
-		runStatus(os.Args[2:])
+		runStatus(cmdArgs)
 	case "version", "--version", "-v":
 		fmt.Printf("coppermind version %s\n", Version)
 	case "help", "--help", "-h":
@@ -78,14 +116,17 @@ Usage:
 
 Commands:
   mcp          Start the Model Context Protocol (MCP) server over STDIO
+  daemon       Start background daemon listening on Unix domain socket or TCP
   remember     Store an architectural fact, decision, or runbook into memory
-  recall       Perform semantic similarity search over stored memories
+  recall       Perform semantic or hybrid similarity search over stored memories
   scratchpad   Interact with fast in-memory working state (get, set, keys)
   dispatch     Enqueue an asynchronous cognitive task onto the message bus
   seed         Ingest markdown files or directories into memory
   export       Export the brain into a portable, verified capsule archive
   import       Restore a brain from a capsule archive with path traversal checks
   verify       Audit cryptographic Merkle chain integrity for a session
+  vacuum       Purge expired TTL memories and compact SQLite storage
+  project      Manage isolated vaults (list, use, create, delete)
   doctor       Execute the 10-pillar diagnostic inspection suite
   hook         Install automated git hooks (e.g. post-commit episodic capture)
   status       Display brain health metrics and stored memory counts
@@ -102,29 +143,35 @@ Examples:
   coppermind status`)
 }
 
-func getDBPath(dataDir string) string {
-	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			dataDir = ".coppermind"
-		} else {
+func getDBPath(dataDir, explicitProject string) string {
+	pm := project.NewManager(dataDir)
+	_, dir, err := pm.ResolveProject(explicitProject)
+	if err != nil {
+		if dataDir == "" {
+			home, _ := os.UserHomeDir()
 			dataDir = filepath.Join(home, ".coppermind")
 		}
+		return filepath.Join(dataDir, "coppermind.db")
 	}
-	_ = os.MkdirAll(dataDir, 0700)
-	return filepath.Join(dataDir, "coppermind.db")
+	return filepath.Join(dir, "coppermind.db")
 }
 
-func initManager(dataDir string) (*brain.Manager, error) {
-	dbPath := getDBPath(dataDir)
+func initManager(dataDir, explicitProject string) (*brain.Manager, string, error) {
+	pm := project.NewManager(dataDir)
+	projectName, projectDir, err := pm.ResolveProject(explicitProject)
+	if err != nil {
+		return nil, "", err
+	}
+
+	dbPath := filepath.Join(projectDir, "coppermind.db")
 	store, err := sqlite.NewSQLiteStore(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open storage at %s: %w", dbPath, err)
+		return nil, "", fmt.Errorf("failed to open storage at %s: %w", dbPath, err)
 	}
 
 	embedder := embedding.NewEmbedderFromEnv()
 	sp := scratchpad.NewMemoryScratchpad()
-	return brain.NewManager(store, embedder, sp), nil
+	return brain.NewManager(store, embedder, sp), projectName, nil
 }
 
 func initBroker() (queue.Broker, error) {
@@ -137,6 +184,10 @@ func initBroker() (queue.Broker, error) {
 
 func initRouter() router.ModelRouter {
 	endpoint := os.Getenv("COPPERMIND_LITELLM_URL")
+	if endpoint == "" {
+		// Offline fallback reflection mode; does not query keystore or prompt Touch ID
+		return router.NewLiteLLMRouter("", "")
+	}
 	ks := keystore.NewLocksmithKeystore()
 	apiKey, _ := ks.GetSecret(context.Background(), "OPENAI_API_KEY")
 	return router.NewLiteLLMRouter(endpoint, apiKey)
@@ -145,9 +196,10 @@ func initRouter() router.ModelRouter {
 func runMCP(args []string) {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory for database files")
+	project := fs.String("project", "", "Target project vault (e.g. github, personal, work)")
 	_ = fs.Parse(args)
 
-	mgr, err := initManager(*dataDir)
+	mgr, activeProj, err := initManager(*dataDir, *project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -171,6 +223,7 @@ func runMCP(args []string) {
 
 	server := mcp.NewServer(mgr, os.Stdout)
 	server.SetWorker(broker, cw)
+	_ = activeProj
 
 	if err := server.ServeSTDIO(ctx, os.Stdin); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server stopped: %v\n", err)
@@ -181,8 +234,10 @@ func runMCP(args []string) {
 func runRemember(args []string) {
 	fs := flag.NewFlagSet("remember", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault (e.g. github, personal, work)")
 	category := fs.String("category", "general", "Category (architecture, convention, decision, runbook)")
 	session := fs.String("session", "default", "Session or worktree identifier")
+	ttl := fs.Duration("ttl", 0, "Optional TTL (e.g. 24h, 30m) after which the memory expires")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
@@ -192,7 +247,7 @@ func runRemember(args []string) {
 	}
 	content := strings.Join(rest, " ")
 
-	mgr, err := initManager(*dataDir)
+	mgr, activeProj, err := initManager(*dataDir, *project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -204,22 +259,31 @@ func runRemember(args []string) {
 		Category:   *category,
 		Content:    content,
 		Provenance: brain.ProvenanceLocalWorkspace,
+		TTL:        *ttl,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error storing memory: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ Stored memory [%s] in category %q: %s\n", node.ID, node.Category, node.Content)
+	expMsg := ""
+	if node.ExpiresAt != nil {
+		expMsg = fmt.Sprintf(" (expires %s)", node.ExpiresAt.Format("2006-01-02 15:04"))
+	}
+	fmt.Printf("✓ Stored memory [%s] in vault %q [%s]%s: %s\n", node.ID, activeProj, node.Category, expMsg, node.Content)
 }
 
 func runRecall(args []string) {
 	fs := flag.NewFlagSet("recall", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault (e.g. github, personal, work)")
 	category := fs.String("category", "", "Optional category filter")
 	session := fs.String("session", "", "Optional session filter")
+	repo := fs.String("repo", "", "Optional git repository scope filter")
+	branch := fs.String("branch", "", "Optional git branch scope filter")
 	limit := fs.Int("limit", 5, "Maximum results to retrieve")
 	minScore := fs.Float64("min-score", 0.0, "Minimum cosine score threshold")
+	hybrid := fs.Bool("hybrid", true, "Use hybrid FTS5 BM25 + vector RRF search (default true)")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
@@ -229,7 +293,7 @@ func runRecall(args []string) {
 	}
 	query := strings.Join(rest, " ")
 
-	mgr, err := initManager(*dataDir)
+	mgr, activeProj, err := initManager(*dataDir, *project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -242,6 +306,9 @@ func runRecall(args []string) {
 		Query:     query,
 		Limit:     *limit,
 		MinScore:  float32(*minScore),
+		Hybrid:    *hybrid,
+		GitRepo:   *repo,
+		GitBranch: *branch,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error recalling memory: %v\n", err)
@@ -253,7 +320,11 @@ func runRecall(args []string) {
 		return
 	}
 
-	fmt.Printf("Found %d matching memories for %q:\n\n", len(results), query)
+	mode := "Hybrid BM25+Vector"
+	if !*hybrid {
+		mode = "Cosine Vector"
+	}
+	fmt.Printf("Found %d matching memories (%s) in vault %q for %q:\n\n", len(results), mode, activeProj, query)
 	for i, r := range results {
 		fmt.Printf("%d. [Score: %.3f] [%s | %s]\n   %s\n\n",
 			i+1, r.Score, r.Node.Category, r.Node.SessionID, r.Node.Content)
@@ -301,6 +372,7 @@ func runDispatch(args []string) {
 	fs := flag.NewFlagSet("dispatch", flag.ExitOnError)
 	session := fs.String("session", "default", "Target session or worktree")
 	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
@@ -310,7 +382,7 @@ func runDispatch(args []string) {
 	}
 	taskType := queue.TaskType(rest[0])
 
-	mgr, err := initManager(*dataDir)
+	mgr, _, err := initManager(*dataDir, *project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -352,6 +424,7 @@ func runDispatch(args []string) {
 func runSeed(args []string) {
 	fs := flag.NewFlagSet("seed", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory for database files")
+	project := fs.String("project", "", "Target project vault")
 	category := fs.String("category", "documentation", "Default category for ingested documents")
 	_ = fs.Parse(args)
 
@@ -362,7 +435,7 @@ func runSeed(args []string) {
 	}
 	targetPath := rest[0]
 
-	mgr, err := initManager(*dataDir)
+	mgr, activeProj, err := initManager(*dataDir, *project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -378,10 +451,10 @@ func runSeed(args []string) {
 
 	var count int
 	if info.IsDir() {
-		fmt.Printf("Seeding Coppermind from directory %s...\n", targetPath)
+		fmt.Printf("Seeding Coppermind vault %q from directory %s...\n", activeProj, targetPath)
 		count, err = seeder.IngestDirectory(ctx, mgr, targetPath, *category)
 	} else {
-		fmt.Printf("Seeding Coppermind from file %s...\n", targetPath)
+		fmt.Printf("Seeding Coppermind vault %q from file %s...\n", activeProj, targetPath)
 		count, err = seeder.IngestFile(ctx, mgr, targetPath, *category)
 	}
 
@@ -391,16 +464,17 @@ func runSeed(args []string) {
 	}
 
 	total, _ := mgr.Count(ctx, "")
-	fmt.Printf("✓ Successfully ingested %d knowledge chunks into Coppermind! (Total memories in brain: %d)\n", count, total)
+	fmt.Printf("✓ Successfully ingested %d knowledge chunks into vault %q! (Total memories: %d)\n", count, activeProj, total)
 }
 
 func runExport(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault")
 	outPath := fs.String("out", "coppermind.capsule", "Output capsule path")
 	_ = fs.Parse(args)
 
-	dbPath := getDBPath(*dataDir)
+	dbPath := getDBPath(*dataDir, *project)
 	manifest, err := capsule.ExportCapsule(context.Background(), dbPath, *outPath, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Export failed: %v\n", err)
@@ -415,6 +489,7 @@ func runExport(args []string) {
 func runImport(args []string) {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
@@ -423,7 +498,7 @@ func runImport(args []string) {
 		os.Exit(1)
 	}
 	capsulePath := rest[0]
-	targetDB := getDBPath(*dataDir)
+	targetDB := getDBPath(*dataDir, *project)
 
 	manifest, err := capsule.ImportCapsule(context.Background(), capsulePath, targetDB, nil)
 	if err != nil {
@@ -439,10 +514,11 @@ func runImport(args []string) {
 func runVerify(args []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault")
 	session := fs.String("session", "", "Session ID to verify (empty for default)")
 	_ = fs.Parse(args)
 
-	mgr, err := initManager(*dataDir)
+	mgr, activeProj, err := initManager(*dataDir, *project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -454,7 +530,7 @@ func runVerify(args []string) {
 		targetSession = "default"
 	}
 
-	fmt.Printf("🔍 Auditing cryptographic Merkle chain for session %q...\n", targetSession)
+	fmt.Printf("🔍 Auditing cryptographic Merkle chain for session %q in vault %q...\n", targetSession, activeProj)
 	intact, count, badID, err := mgr.VerifySessionChain(context.Background(), targetSession)
 	if err != nil || !intact {
 		fmt.Printf("❌ Cryptographic chain verification FAILED!\n• Tampered Node: %s\n• Error: %v\n", badID, err)
@@ -462,6 +538,97 @@ func runVerify(args []string) {
 	}
 
 	fmt.Printf("✓ Cryptographic Merkle chain verified INTACT!\n• Verified Nodes: %d\n• Tampering: None detected\n", count)
+}
+
+func runVacuum(args []string) {
+	fs := flag.NewFlagSet("vacuum", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault")
+	_ = fs.Parse(args)
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	fmt.Printf("🧹 Running Coppermind memory purge & WAL compaction for vault %q...\n", activeProj)
+	purged, err := mgr.PurgeExpired(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning during expired memory purge: %v\n", err)
+	} else if purged > 0 {
+		fmt.Printf("• Purged %d expired memory nodes\n", purged)
+	}
+
+	if err := mgr.Vacuum(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "Error during vacuum: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✓ Database compaction and passive WAL checkpoint complete!")
+}
+
+func runDaemon(args []string) {
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault")
+	socketPath := fs.String("socket", "", "Unix Domain Socket path (default: ~/.coppermind/coppermind.sock)")
+	tcpAddr := fs.String("listen", "", "Optional TCP listen address (e.g. 127.0.0.1:8765)")
+	_ = fs.Parse(args)
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	broker, err := initBroker()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer broker.Close()
+
+	modelRouter := initRouter()
+	cognitiveWorker := worker.NewCognitiveWorker(broker, mgr, modelRouter)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := cognitiveWorker.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: worker start: %v\n", err)
+	}
+
+	sock := *socketPath
+	if sock == "" {
+		home, _ := os.UserHomeDir()
+		sock = filepath.Join(home, ".coppermind", "coppermind.sock")
+	}
+
+	d := daemon.NewDaemon(daemon.Config{
+		SocketPath: sock,
+		TCPAddr:    *tcpAddr,
+	}, mgr, broker, cognitiveWorker)
+
+	if err := d.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Daemon failed to start: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("🤖 Coppermind daemon active (vault %q) and listening for MCP connections:\n", activeProj)
+	if sock != "" {
+		fmt.Printf("• Unix Domain Socket: %s\n", sock)
+	}
+	if *tcpAddr != "" {
+		fmt.Printf("• TCP Address: %s\n", *tcpAddr)
+	}
+	fmt.Println("Press Ctrl+C to terminate.")
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+
+	fmt.Println("\nShutting down Coppermind daemon...")
+	_ = d.Stop()
 }
 
 func runDoctor(args []string) {
@@ -528,12 +695,93 @@ func runHook(args []string) {
 	fmt.Printf("✓ Successfully installed automated episodic git commit hook!\n• Hook Path: %s\n", hookPath)
 }
 
+func runProject(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage: coppermind project <list|use|create|delete> [name]")
+		os.Exit(1)
+	}
+
+	action := args[0]
+	fs := flag.NewFlagSet("project "+action, flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	_ = fs.Parse(args[1:])
+
+	pm := project.NewManager(*dataDir)
+
+	switch action {
+	case "list", "ls":
+		projects, err := pm.ListProjects()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error listing projects: %v\n", err)
+			os.Exit(1)
+		}
+		cfg, _ := pm.LoadConfig()
+		active := cfg.CurrentProject
+		if active == "" {
+			active = "github"
+		}
+		fmt.Println("Coppermind Project Vaults:")
+		for _, p := range projects {
+			mark := "  "
+			if p.Name == active || p.IsActive {
+				mark = "* "
+			}
+			fmt.Printf("%s%-16s (%s)\n", mark, p.Name, p.DBPath)
+		}
+
+	case "use", "switch":
+		rest := fs.Args()
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: project name required\nUsage: coppermind project use <name>\n")
+			os.Exit(1)
+		}
+		name := rest[0]
+		if err := pm.SetCurrentProject(name); err != nil {
+			fmt.Fprintf(os.Stderr, "Error switching project: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Switched active project vault to %q\n", name)
+
+	case "create", "new":
+		rest := fs.Args()
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: project name required\nUsage: coppermind project create <name>\n")
+			os.Exit(1)
+		}
+		name := rest[0]
+		p, err := pm.CreateProject(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating project: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Created project vault %q at %s\n", name, p.DataDir)
+
+	case "delete", "rm":
+		rest := fs.Args()
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: project name required\nUsage: coppermind project delete <name>\n")
+			os.Exit(1)
+		}
+		name := rest[0]
+		if err := pm.DeleteProject(name); err != nil {
+			fmt.Fprintf(os.Stderr, "Error deleting project: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Deleted project vault %q\n", name)
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown project action: %q. Use list, use, create, delete\n", action)
+		os.Exit(1)
+	}
+}
+
 func runStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault")
 	_ = fs.Parse(args)
 
-	mgr, err := initManager(*dataDir)
+	mgr, activeProj, err := initManager(*dataDir, *project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -547,7 +795,8 @@ func runStatus(args []string) {
 	}
 
 	fmt.Println("Coppermind Brain Status:")
-	fmt.Printf("• Database Path: %s\n", getDBPath(*dataDir))
+	fmt.Printf("• Active Project Vault: %s\n", activeProj)
+	fmt.Printf("• Database Path: %s\n", getDBPath(*dataDir, *project))
 	fmt.Printf("• Total Stored Memories: %s\n", strconv.Itoa(total))
 	fmt.Println("• Storage Backend: Pure-Go SQLite WAL Mode")
 	fmt.Println("• Embedding Engine: 128-dim FastText-style Subword/N-Gram Hashing")

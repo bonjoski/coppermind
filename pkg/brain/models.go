@@ -28,6 +28,7 @@ type MemoryNode struct {
 	Hash       string            `json:"hash"`
 	CreatedAt  time.Time         `json:"created_at"`
 	UpdatedAt  time.Time         `json:"updated_at"`
+	ExpiresAt  *time.Time        `json:"expires_at,omitempty"`
 }
 
 // MemoryFilter specifies search criteria for recall operations.
@@ -37,6 +38,9 @@ type MemoryFilter struct {
 	Provenance ProvenanceTier `json:"provenance,omitempty"`
 	MinScore   float32        `json:"min_score,omitempty"`
 	Limit      int            `json:"limit,omitempty"`
+	Hybrid     bool           `json:"hybrid,omitempty"`
+	GitRepo    string         `json:"git_repo,omitempty"`
+	GitBranch  string         `json:"git_branch,omitempty"`
 }
 
 // SearchResult contains a retrieved memory node and its relevance score.
@@ -53,6 +57,9 @@ type MemoryStore interface {
 	// RecallSemantic searches memories via cosine similarity against a query vector.
 	RecallSemantic(ctx context.Context, queryVector []float32, filter MemoryFilter) ([]*SearchResult, error)
 
+	// RecallHybrid searches memories using combined FTS5 BM25 keyword matching and vector cosine similarity.
+	RecallHybrid(ctx context.Context, query string, queryVector []float32, filter MemoryFilter) ([]*SearchResult, error)
+
 	// RecallEpisodic retrieves chronologically ordered memory nodes for a session.
 	RecallEpisodic(ctx context.Context, sessionID string, limit int) ([]*MemoryNode, error)
 
@@ -61,6 +68,12 @@ type MemoryStore interface {
 
 	// Count returns the count of memory nodes, optionally filtered by session prefix.
 	Count(ctx context.Context, sessionPrefix string) (int, error)
+
+	// PurgeExpired removes memories that have exceeded their TTL.
+	PurgeExpired(ctx context.Context) (int, error)
+
+	// Vacuum compacts storage, checkpoints WAL, and reclaims disk pages.
+	Vacuum(ctx context.Context) error
 
 	// VerifySessionChain audits the cryptographic Merkle chain for a given session.
 	// Returns true and the verified count if intact, or false with the offending node ID and error if tampered.

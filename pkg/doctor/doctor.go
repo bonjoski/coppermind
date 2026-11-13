@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/security"
 	_ "modernc.org/sqlite"
 )
@@ -35,6 +37,16 @@ func RunDiagnostics(ctx context.Context, dataDir string) []PillarResult {
 	var results []PillarResult
 
 	dbPath := filepath.Join(dataDir, "coppermind.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		pm := project.NewManager(dataDir)
+		_, pDir, err := pm.ResolveProject("")
+		if err == nil {
+			cand := filepath.Join(pDir, "coppermind.db")
+			if _, err := os.Stat(cand); err == nil {
+				dbPath = cand
+			}
+		}
+	}
 
 	// Pillar 1: SQLite File & Schema Integrity
 	start := time.Now()

@@ -7,24 +7,30 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/queue"
+	"github.com/bonjoski/coppermind/pkg/scratchpad"
+	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 	"github.com/bonjoski/coppermind/pkg/worker"
 )
 
 // Server implements a native Model Context Protocol (MCP) server over STDIO or arbitrary streams.
 type Server struct {
-	manager   *brain.Manager
-	broker    queue.Broker
-	worker    *worker.CognitiveWorker
-	inMu      sync.Mutex
-	outMu     sync.Mutex
-	writer    io.Writer
-	startTime time.Time
+	manager    *brain.Manager
+	projectMgr *project.Manager
+	broker     queue.Broker
+	worker     *worker.CognitiveWorker
+	inMu       sync.Mutex
+	outMu      sync.Mutex
+	writer     io.Writer
+	startTime  time.Time
 }
 
 // NewServer creates a new MCP server wrapping the brain manager.
@@ -33,9 +39,10 @@ func NewServer(manager *brain.Manager, out io.Writer) *Server {
 		out = os.Stdout
 	}
 	return &Server{
-		manager:   manager,
-		writer:    out,
-		startTime: time.Now(),
+		manager:    manager,
+		projectMgr: project.NewManager(""),
+		writer:     out,
+		startTime:  time.Now(),
 	}
 }
 
@@ -47,11 +54,17 @@ func (s *Server) SetWorker(broker queue.Broker, w *worker.CognitiveWorker) {
 
 // ServeSTDIO starts reading JSON-RPC 2.0 messages from in and writing responses to the configured output.
 func (s *Server) ServeSTDIO(ctx context.Context, in io.Reader) error {
+	return s.ServeStream(ctx, in, s.writer)
+}
+
+// ServeStream reads JSON-RPC 2.0 messages from in and writes responses to out.
+func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer) error {
 	scanner := bufio.NewScanner(in)
 	// Buffer size for handling large tool call payloads
 	buf := make([]byte, 1024*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 
+	var writeMu sync.Mutex
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(strings.TrimSpace(string(line))) == 0 {
@@ -61,13 +74,23 @@ func (s *Server) ServeSTDIO(ctx context.Context, in io.Reader) error {
 		var msg JSONRPCMessage
 		if err := json.Unmarshal(line, &msg); err != nil {
 			errResp := NewErrorResponse(nil, ErrCodeParseError, "Invalid JSON-RPC 2.0 payload")
-			_ = s.writeMessage(errResp)
+			data, _ := json.Marshal(errResp)
+			writeMu.Lock()
+			_, _ = out.Write(append(data, '\n'))
+			writeMu.Unlock()
 			continue
 		}
 
 		resp := s.handleMessage(ctx, &msg)
 		if resp != nil {
-			if err := s.writeMessage(resp); err != nil {
+			data, err := json.Marshal(resp)
+			if err != nil {
+				return err
+			}
+			writeMu.Lock()
+			_, err = out.Write(append(data, '\n'))
+			writeMu.Unlock()
+			if err != nil {
 				return err
 			}
 		}
@@ -137,7 +160,8 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 				"type": "object",
 				"properties": {
 					"content": { "type": "string", "description": "The exact fact, insight, or invariant to remember." },
-					"category": { "type": "string", "description": "Category (e.g. architecture, convention, bug_fix, runbook)." },
+					"category": { "type": "string", "description": "Category (e.g. architecture, convention, bug_fix, runbook, personal)." },
+					"project": { "type": "string", "description": "Optional isolated project vault name (e.g. github, personal, work)." },
 					"session_id": { "type": "string", "description": "Optional session/worktree identifier." },
 					"provenance": { "type": "string", "enum": ["TRUST_LOCAL_WORKSPACE", "TAINT_EXTERNAL_USER", "TAINT_UNTRUSTED_WEB"] }
 				},
@@ -146,17 +170,30 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_recall",
-			Description: "Perform semantic similarity search over stored memories using cosine vector similarity.",
+			Description: "Perform semantic and hybrid search over stored memories in a project vault.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"query": { "type": "string", "description": "Natural language query to search memory for." },
+					"project": { "type": "string", "description": "Optional isolated project vault name (e.g. github, personal, work)." },
 					"category": { "type": "string", "description": "Optional category filter." },
 					"session_id": { "type": "string", "description": "Optional session filter." },
 					"limit": { "type": "integer", "description": "Max results to return (default 5)." },
-					"min_score": { "type": "number", "description": "Minimum similarity score threshold (default 0.3)." }
+					"min_score": { "type": "number", "description": "Minimum similarity score threshold (default 0.0)." }
 				},
 				"required": ["query"]
+			}`),
+		},
+		{
+			Name:        "coppermind_project",
+			Description: "List, switch, or inspect isolated project vaults (e.g. github, personal, work).",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"action": { "type": "string", "enum": ["list", "use", "create"], "description": "Project action to perform." },
+					"name": { "type": "string", "description": "Project name for use or create actions." }
+				},
+				"required": ["action"]
 			}`),
 		},
 		{
@@ -214,6 +251,8 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *JSONRPCMessage) *JSON
 		result, err = s.callRemember(ctx, params.Arguments)
 	case "coppermind_recall":
 		result, err = s.callRecall(ctx, params.Arguments)
+	case "coppermind_project":
+		result, err = s.callProject(ctx, params.Arguments)
 	case "coppermind_scratchpad":
 		result, err = s.callScratchpad(ctx, params.Arguments)
 	case "coppermind_dispatch_task":
@@ -235,8 +274,35 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *JSONRPCMessage) *JSON
 	return resp
 }
 
+func (s *Server) getManagerForProject(projectName string) (*brain.Manager, func(), error) {
+	if projectName == "" || s.projectMgr == nil {
+		return s.manager, func() {}, nil
+	}
+
+	_, dir, err := s.projectMgr.ResolveProject(projectName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dbPath := filepath.Join(dir, "coppermind.db")
+	store, err := sqlite.NewSQLiteStore(dbPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open project database: %w", err)
+	}
+
+	embedder := embedding.NewEmbedderFromEnv()
+	sp := scratchpad.NewMemoryScratchpad()
+	mgr := brain.NewManager(store, embedder, sp)
+
+	cleanup := func() {
+		_ = mgr.Close()
+	}
+	return mgr, cleanup, nil
+}
+
 func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
 	var input struct {
+		Project    string `json:"project"`
 		Content    string `json:"content"`
 		Category   string `json:"category"`
 		SessionID  string `json:"session_id"`
@@ -246,12 +312,18 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 		return nil, fmt.Errorf("invalid arguments: %w", err)
 	}
 
+	mgr, cleanup, err := s.getManagerForProject(input.Project)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
 	prov := brain.ProvenanceLocalWorkspace
 	if input.Provenance != "" {
 		prov = brain.ProvenanceTier(input.Provenance)
 	}
 
-	node, err := s.manager.Remember(ctx, brain.RememberRequest{
+	node, err := mgr.Remember(ctx, brain.RememberRequest{
 		SessionID:  input.SessionID,
 		Category:   input.Category,
 		Content:    input.Content,
@@ -261,7 +333,11 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 		return nil, err
 	}
 
-	msg := fmt.Sprintf("Stored memory %s [%s] (%s): %s", node.ID, node.Category, node.Provenance, node.Content)
+	targetProj := input.Project
+	if targetProj == "" {
+		targetProj = "active"
+	}
+	msg := fmt.Sprintf("Stored memory %s in vault %q [%s] (%s): %s", node.ID, targetProj, node.Category, node.Provenance, node.Content)
 	return &ToolCallResult{
 		Content: []TextContent{{Type: "text", Text: msg}},
 	}, nil
@@ -269,6 +345,7 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 
 func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
 	var input struct {
+		Project   string  `json:"project"`
 		Query     string  `json:"query"`
 		Category  string  `json:"category"`
 		SessionID string  `json:"session_id"`
@@ -279,19 +356,23 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		return nil, fmt.Errorf("invalid arguments: %w", err)
 	}
 
+	mgr, cleanup, err := s.getManagerForProject(input.Project)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
 	if input.Limit <= 0 {
 		input.Limit = 5
 	}
-	if input.MinScore == 0 {
-		input.MinScore = 0.3
-	}
 
-	results, err := s.manager.Recall(ctx, brain.RecallRequest{
+	results, err := mgr.Recall(ctx, brain.RecallRequest{
 		SessionID: input.SessionID,
 		Category:  input.Category,
 		Query:     input.Query,
 		Limit:     input.Limit,
 		MinScore:  input.MinScore,
+		Hybrid:    true,
 	})
 	if err != nil {
 		return nil, err
@@ -299,12 +380,16 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 
 	if len(results) == 0 {
 		return &ToolCallResult{
-			Content: []TextContent{{Type: "text", Text: "No matching memories found above score threshold."}},
+			Content: []TextContent{{Type: "text", Text: "No matching memories found."}},
 		}, nil
 	}
 
+	targetProj := input.Project
+	if targetProj == "" {
+		targetProj = "active"
+	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Found %d relevant memories:\n\n", len(results)))
+	sb.WriteString(fmt.Sprintf("Found %d relevant memories in project vault %q:\n\n", len(results), targetProj))
 	for i, r := range results {
 		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] [%s | %s]\n   %s\n\n",
 			i+1, r.Score, r.Node.Category, r.Node.Provenance, r.Node.Content))
@@ -313,6 +398,63 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 	return &ToolCallResult{
 		Content: []TextContent{{Type: "text", Text: strings.TrimSpace(sb.String())}},
 	}, nil
+}
+
+func (s *Server) callProject(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
+	var input struct {
+		Action string `json:"action"`
+		Name   string `json:"name"`
+	}
+	if err := json.Unmarshal(args, &input); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	if s.projectMgr == nil {
+		return nil, fmt.Errorf("project manager not available")
+	}
+
+	switch input.Action {
+	case "list":
+		projects, err := s.projectMgr.ListProjects()
+		if err != nil {
+			return nil, err
+		}
+		var sb strings.Builder
+		sb.WriteString("Available Project Vaults:\n")
+		for _, p := range projects {
+			mark := " "
+			if p.IsActive {
+				mark = "*"
+			}
+			sb.WriteString(fmt.Sprintf("%s %-12s [%s]\n", mark, p.Name, p.DBPath))
+		}
+		return &ToolCallResult{
+			Content: []TextContent{{Type: "text", Text: strings.TrimSpace(sb.String())}},
+		}, nil
+	case "use", "switch":
+		if input.Name == "" {
+			return nil, fmt.Errorf("name is required for 'use' action")
+		}
+		if err := s.projectMgr.SetCurrentProject(input.Name); err != nil {
+			return nil, err
+		}
+		return &ToolCallResult{
+			Content: []TextContent{{Type: "text", Text: fmt.Sprintf("Switched active project vault to %q", input.Name)}},
+		}, nil
+	case "create":
+		if input.Name == "" {
+			return nil, fmt.Errorf("name is required for 'create' action")
+		}
+		p, err := s.projectMgr.CreateProject(input.Name)
+		if err != nil {
+			return nil, err
+		}
+		return &ToolCallResult{
+			Content: []TextContent{{Type: "text", Text: fmt.Sprintf("Created isolated project vault %q at %s", p.Name, p.DataDir)}},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown action %q: must be list, use, or create", input.Action)
+	}
 }
 
 func (s *Server) callScratchpad(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {

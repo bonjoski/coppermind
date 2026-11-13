@@ -12,8 +12,10 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
@@ -85,11 +87,20 @@ func initSchema(db *sql.DB) error {
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
 		prev_hash TEXT NOT NULL DEFAULT '',
-		hash TEXT NOT NULL DEFAULT ''
+		hash TEXT NOT NULL DEFAULT '',
+		expires_at INTEGER DEFAULT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_memory_session ON memory_nodes(session_id);
 	CREATE INDEX IF NOT EXISTS idx_memory_category ON memory_nodes(category);
 	CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory_nodes(created_at);
+
+	CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+		id UNINDEXED,
+		session_id,
+		category,
+		content,
+		tokenize = 'porter unicode61'
+	);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return err
@@ -98,6 +109,15 @@ func initSchema(db *sql.DB) error {
 	// Migrations for existing databases
 	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''")
 	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN hash TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN expires_at INTEGER DEFAULT NULL")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_expires_at ON memory_nodes(expires_at)")
+
+	// Backfill FTS5 index if empty
+	var ftsCount int
+	_ = db.QueryRow("SELECT COUNT(*) FROM memory_fts").Scan(&ftsCount)
+	if ftsCount == 0 {
+		_, _ = db.Exec("INSERT OR IGNORE INTO memory_fts(id, session_id, category, content) SELECT id, session_id, category, content FROM memory_nodes")
+	}
 
 	return nil
 }
@@ -164,10 +184,16 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 		node.Hash = computeNodeHash(node.PrevHash, node.ID, node.SessionID, node.Category, node.Content, node.CreatedAt.UnixNano())
 	}
 
+	var expiresAtVal *int64
+	if node.ExpiresAt != nil {
+		exp := node.ExpiresAt.UnixNano()
+		expiresAtVal = &exp
+	}
+
 	query := `
 	INSERT INTO memory_nodes (
-		id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		category=excluded.category,
 		content=excluded.content,
@@ -177,7 +203,8 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 		metadata_json=excluded.metadata_json,
 		updated_at=excluded.updated_at,
 		prev_hash=excluded.prev_hash,
-		hash=excluded.hash;
+		hash=excluded.hash,
+		expires_at=excluded.expires_at;
 	`
 	_, err := s.db.Exec(query,
 		node.ID,
@@ -192,11 +219,21 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 		node.UpdatedAt.UnixNano(),
 		node.PrevHash,
 		node.Hash,
+		expiresAtVal,
 	)
+	if err != nil {
+		return err
+	}
+
+	// Synchronize FTS5 virtual table
+	_, _ = s.db.Exec("DELETE FROM memory_fts WHERE id = ?", node.ID)
+	_, err = s.db.Exec("INSERT INTO memory_fts(id, session_id, category, content) VALUES (?, ?, ?, ?)",
+		node.ID, node.SessionID, node.Category, node.Content)
 	return err
 }
 
 func (s *SQLiteStore) execDelete(nodeID string) error {
+	_, _ = s.db.Exec("DELETE FROM memory_fts WHERE id = ?", nodeID)
 	_, err := s.db.Exec("DELETE FROM memory_nodes WHERE id = ?", nodeID)
 	return err
 }
@@ -259,9 +296,9 @@ func (s *SQLiteStore) Delete(ctx context.Context, id string) error {
 	}
 }
 
-// RecallSemantic performs hybrid vector similarity search over stored memory nodes.
+// RecallSemantic performs vector similarity search over stored memory nodes.
 func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32, filter brain.MemoryFilter) ([]*brain.SearchResult, error) {
-	query := `SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash FROM memory_nodes WHERE 1=1`
+	query := `SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at FROM memory_nodes WHERE 1=1`
 	var args []interface{}
 
 	if filter.SessionID != "" {
@@ -284,6 +321,7 @@ func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32,
 	defer rows.Close()
 
 	var results []*brain.SearchResult
+	nowNano := time.Now().UnixNano()
 
 	for rows.Next() {
 		var (
@@ -291,10 +329,16 @@ func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32,
 			vecBlob                                                             []byte
 			taintScore                                                          float64
 			createdAtNano, updatedAtNano                                        int64
+			expiresAtNano                                                       sql.NullInt64
 		)
 
-		if err := rows.Scan(&id, &sessionID, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash); err != nil {
+		if err := rows.Scan(&id, &sessionID, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash, &expiresAtNano); err != nil {
 			return nil, err
+		}
+
+		// Filter out expired memories
+		if expiresAtNano.Valid && expiresAtNano.Int64 < nowNano {
+			continue
 		}
 
 		nodeVec := decodeVector(vecBlob)
@@ -307,6 +351,20 @@ func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32,
 		var metadata map[string]string
 		if len(metaJSON) > 0 {
 			_ = json.Unmarshal([]byte(metaJSON), &metadata)
+		}
+
+		// Git repository and branch filtering if requested
+		if filter.GitRepo != "" && (metadata == nil || metadata["git_repo"] != filter.GitRepo) {
+			continue
+		}
+		if filter.GitBranch != "" && (metadata == nil || metadata["git_branch"] != filter.GitBranch) {
+			continue
+		}
+
+		var expiresAt *time.Time
+		if expiresAtNano.Valid {
+			exp := time.Unix(0, expiresAtNano.Int64)
+			expiresAt = &exp
 		}
 
 		node := &brain.MemoryNode{
@@ -322,6 +380,7 @@ func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32,
 			Hash:       hash,
 			CreatedAt:  time.Unix(0, createdAtNano),
 			UpdatedAt:  time.Unix(0, updatedAtNano),
+			ExpiresAt:  expiresAt,
 		}
 
 		results = append(results, &brain.SearchResult{
@@ -355,7 +414,7 @@ func (s *SQLiteStore) RecallEpisodic(ctx context.Context, sessionID string, limi
 		limit = 20
 	}
 	query := `
-	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash
+	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at
 	FROM memory_nodes
 	WHERE session_id = ?
 	ORDER BY created_at ASC
@@ -367,6 +426,7 @@ func (s *SQLiteStore) RecallEpisodic(ctx context.Context, sessionID string, limi
 	}
 	defer rows.Close()
 
+	nowNano := time.Now().UnixNano()
 	var nodes []*brain.MemoryNode
 	for rows.Next() {
 		var (
@@ -374,14 +434,25 @@ func (s *SQLiteStore) RecallEpisodic(ctx context.Context, sessionID string, limi
 			vecBlob                                                       []byte
 			taintScore                                                    float64
 			createdAtNano, updatedAtNano                                  int64
+			expiresAtNano                                                 sql.NullInt64
 		)
-		if err := rows.Scan(&id, &sid, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash); err != nil {
+		if err := rows.Scan(&id, &sid, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash, &expiresAtNano); err != nil {
 			return nil, err
+		}
+
+		if expiresAtNano.Valid && expiresAtNano.Int64 < nowNano {
+			continue
 		}
 
 		var metadata map[string]string
 		if len(metaJSON) > 0 {
 			_ = json.Unmarshal([]byte(metaJSON), &metadata)
+		}
+
+		var expiresAt *time.Time
+		if expiresAtNano.Valid {
+			exp := time.Unix(0, expiresAtNano.Int64)
+			expiresAt = &exp
 		}
 
 		nodes = append(nodes, &brain.MemoryNode{
@@ -397,10 +468,214 @@ func (s *SQLiteStore) RecallEpisodic(ctx context.Context, sessionID string, limi
 			Hash:       hash,
 			CreatedAt:  time.Unix(0, createdAtNano),
 			UpdatedAt:  time.Unix(0, updatedAtNano),
+			ExpiresAt:  expiresAt,
 		})
 	}
 
 	return nodes, rows.Err()
+}
+
+// RecallHybrid combines SQLite FTS5 BM25 keyword retrieval with vector cosine similarity via Reciprocal Rank Fusion (RRF).
+func (s *SQLiteStore) RecallHybrid(ctx context.Context, query string, queryVector []float32, filter brain.MemoryFilter) ([]*brain.SearchResult, error) {
+	// 1. Vector candidates
+	vecFilter := filter
+	vecFilter.Limit = 50
+	vecResults, err := s.RecallSemantic(ctx, queryVector, vecFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	vecRanks := make(map[string]int)
+	nodesByID := make(map[string]*brain.MemoryNode)
+	for i, r := range vecResults {
+		vecRanks[r.Node.ID] = i
+		nodesByID[r.Node.ID] = r.Node
+	}
+
+	// 2. FTS5 BM25 search
+	ftsQuery := sanitizeFTS5Query(query)
+	bm25Ranks := make(map[string]int)
+	if ftsQuery != "" {
+		ftsSQL := "SELECT id FROM memory_fts WHERE memory_fts MATCH ? LIMIT 50"
+		rows, err := s.db.QueryContext(ctx, ftsSQL, ftsQuery)
+		if err == nil {
+			defer rows.Close()
+			rankIdx := 0
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err == nil {
+					bm25Ranks[id] = rankIdx
+					rankIdx++
+					if _, exists := nodesByID[id]; !exists {
+						node, err := s.getNodeByID(ctx, id)
+						if err == nil && node != nil {
+							nodesByID[id] = node
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Reciprocal Rank Fusion (RRF)
+	const k = 60.0
+	nowNano := time.Now().UnixNano()
+	var fusedResults []*brain.SearchResult
+
+	for id, node := range nodesByID {
+		// Filter out expired memories
+		if node.ExpiresAt != nil && node.ExpiresAt.UnixNano() < nowNano {
+			continue
+		}
+		// Metadata and session filters
+		if filter.SessionID != "" && node.SessionID != filter.SessionID {
+			continue
+		}
+		if filter.Category != "" && node.Category != filter.Category {
+			continue
+		}
+		if filter.Provenance != "" && node.Provenance != filter.Provenance {
+			continue
+		}
+		if filter.GitRepo != "" && (node.Metadata == nil || node.Metadata["git_repo"] != filter.GitRepo) {
+			continue
+		}
+		if filter.GitBranch != "" && (node.Metadata == nil || node.Metadata["git_branch"] != filter.GitBranch) {
+			continue
+		}
+
+		var score float32
+		if rank, ok := vecRanks[id]; ok {
+			score += float32(1.0 / (k + float64(rank)))
+		}
+		if rank, ok := bm25Ranks[id]; ok {
+			score += float32(1.0 / (k + float64(rank)))
+		}
+
+		fusedResults = append(fusedResults, &brain.SearchResult{
+			Node:  node,
+			Score: score,
+		})
+	}
+
+	sort.Slice(fusedResults, func(i, j int) bool {
+		return fusedResults[i].Score > fusedResults[j].Score
+	})
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	if len(fusedResults) > limit {
+		fusedResults = fusedResults[:limit]
+	}
+
+	return fusedResults, nil
+}
+
+func (s *SQLiteStore) getNodeByID(ctx context.Context, id string) (*brain.MemoryNode, error) {
+	query := `
+	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at
+	FROM memory_nodes WHERE id = ?
+	`
+	var (
+		nodeID, sid, cat, content, provStr, metaJSON, prevHash, hash string
+		vecBlob                                                      []byte
+		taintScore                                                   float64
+		createdNano, updatedNano                                     int64
+		expiresAtNano                                                sql.NullInt64
+	)
+	err := s.db.QueryRowContext(ctx, query, id).Scan(
+		&nodeID, &sid, &cat, &content, &vecBlob, &provStr, &taintScore, &metaJSON, &createdNano, &updatedNano, &prevHash, &hash, &expiresAtNano,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var metadata map[string]string
+	if len(metaJSON) > 0 {
+		_ = json.Unmarshal([]byte(metaJSON), &metadata)
+	}
+
+	var expiresAt *time.Time
+	if expiresAtNano.Valid {
+		exp := time.Unix(0, expiresAtNano.Int64)
+		expiresAt = &exp
+	}
+
+	return &brain.MemoryNode{
+		ID:         nodeID,
+		SessionID:  sid,
+		Category:   cat,
+		Content:    content,
+		Vector:     decodeVector(vecBlob),
+		Provenance: brain.ProvenanceTier(provStr),
+		TaintScore: taintScore,
+		Metadata:   metadata,
+		PrevHash:   prevHash,
+		Hash:       hash,
+		CreatedAt:  time.Unix(0, createdNano),
+		UpdatedAt:  time.Unix(0, updatedNano),
+		ExpiresAt:  expiresAt,
+	}, nil
+}
+
+// PurgeExpired removes memories that have exceeded their designated TTL.
+func (s *SQLiteStore) PurgeExpired(ctx context.Context) (int, error) {
+	nowNano := time.Now().UnixNano()
+	rows, err := s.db.QueryContext(ctx, "SELECT id FROM memory_nodes WHERE expires_at IS NOT NULL AND expires_at < ?", nowNano)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+
+	for _, id := range ids {
+		_ = s.Delete(ctx, id)
+	}
+
+	return len(ids), nil
+}
+
+// Vacuum compacts storage, checkpoints WAL, and reclaims disk space.
+func (s *SQLiteStore) Vacuum(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE); VACUUM;")
+	return err
+}
+
+func sanitizeFTS5Query(q string) string {
+	var words []string
+	var cur strings.Builder
+	for _, r := range q {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			cur.WriteRune(r)
+		} else {
+			if cur.Len() > 0 {
+				words = append(words, cur.String())
+				cur.Reset()
+			}
+		}
+	}
+	if cur.Len() > 0 {
+		words = append(words, cur.String())
+	}
+
+	if len(words) == 0 {
+		return ""
+	}
+
+	var formatted []string
+	for _, w := range words {
+		formatted = append(formatted, fmt.Sprintf("%q*", w))
+	}
+	return strings.Join(formatted, " OR ")
 }
 
 // VerifySessionChain audits the cryptographic Merkle chain for a given session.

@@ -2,9 +2,13 @@ package keystore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -21,32 +25,41 @@ type LocksmithKeystore struct {
 	mu           sync.RWMutex
 	cache        map[string]cachedSecret
 	cacheTTL     time.Duration
+	leaseDir     string
 	locksmithBin string
 }
 
 type cachedSecret struct {
-	value     string
-	expiresAt time.Time
+	Value     string    `json:"value"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // NewLocksmithKeystore creates a new hardware keystore integration.
 func NewLocksmithKeystore() *LocksmithKeystore {
 	bin, _ := exec.LookPath("locksmith")
+	home, err := os.UserHomeDir()
+	leaseDir := ""
+	if err == nil {
+		leaseDir = filepath.Join(home, ".coppermind", "leases")
+		_ = os.MkdirAll(leaseDir, 0700)
+	}
+
 	return &LocksmithKeystore{
 		cache:        make(map[string]cachedSecret),
-		cacheTTL:     5 * time.Minute, // Amortized lease window
+		cacheTTL:     4 * time.Hour, // 4-hour persistent lease window to avoid biometric stalls
+		leaseDir:     leaseDir,
 		locksmithBin: bin,
 	}
 }
 
-// GetSecret fetches a secret from Locksmith (Touch ID/TPM2) with in-memory lease amortization.
+// GetSecret fetches a secret from Locksmith (Touch ID/TPM2) with multi-hour lease amortization.
 func (k *LocksmithKeystore) GetSecret(ctx context.Context, key string) (string, error) {
-	// 1. Check in-memory amortized lease cache (avoids repeated biometric prompts)
+	// 1. Check in-memory amortized lease cache
 	k.mu.RLock()
 	item, ok := k.cache[key]
-	if ok && time.Now().Before(item.expiresAt) {
+	if ok && time.Now().Before(item.ExpiresAt) {
 		k.mu.RUnlock()
-		return item.value, nil
+		return item.Value, nil
 	}
 	k.mu.RUnlock()
 
@@ -60,7 +73,23 @@ func (k *LocksmithKeystore) GetSecret(ctx context.Context, key string) (string, 
 		return envVal, nil
 	}
 
-	// 3. Query Locksmith CLI if available
+	// 3. Check persistent disk lease cache (survives process restarts across CLI tools)
+	if k.leaseDir != "" {
+		leasePath := k.getLeasePath(key)
+		if data, err := os.ReadFile(leasePath); err == nil {
+			var diskLease cachedSecret
+			if err := json.Unmarshal(data, &diskLease); err == nil {
+				if time.Now().Before(diskLease.ExpiresAt) && diskLease.Value != "" {
+					k.mu.Lock()
+					k.cache[key] = diskLease
+					k.mu.Unlock()
+					return diskLease.Value, nil
+				}
+			}
+		}
+	}
+
+	// 4. Query Locksmith CLI if available (triggers biometric authorization)
 	if k.locksmithBin == "" {
 		return "", fmt.Errorf("locksmith binary not found in PATH and %s is unset", envKey)
 	}
@@ -76,15 +105,30 @@ func (k *LocksmithKeystore) GetSecret(ctx context.Context, key string) (string, 
 		return "", fmt.Errorf("secret %q not found in Locksmith", key)
 	}
 
-	// Cache secret in-memory for the duration of the session window
-	k.mu.Lock()
-	k.cache[key] = cachedSecret{
-		value:     secret,
-		expiresAt: time.Now().Add(k.cacheTTL),
+	// Cache secret in-memory and write mode 0600 disk lease file
+	lease := cachedSecret{
+		Value:     secret,
+		ExpiresAt: time.Now().Add(k.cacheTTL),
 	}
+
+	k.mu.Lock()
+	k.cache[key] = lease
 	k.mu.Unlock()
 
+	if k.leaseDir != "" {
+		leasePath := k.getLeasePath(key)
+		if data, err := json.Marshal(lease); err == nil {
+			_ = os.WriteFile(leasePath, data, 0600)
+		}
+	}
+
 	return secret, nil
+}
+
+func (k *LocksmithKeystore) getLeasePath(key string) string {
+	h := sha256.Sum256([]byte(key))
+	filename := fmt.Sprintf("lease_%s.json", hex.EncodeToString(h[:8]))
+	return filepath.Join(k.leaseDir, filename)
 }
 
 // ListSecrets retrieves list of stored keys from Locksmith.

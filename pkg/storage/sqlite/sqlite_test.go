@@ -12,6 +12,22 @@ import (
 	"github.com/bonjoski/coppermind/pkg/embedding"
 )
 
+func TestFTS5Support(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "fts_test.db")
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer store.Close()
+
+	_, err = store.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS test_fts USING fts5(id UNINDEXED, content);")
+	if err != nil {
+		t.Fatalf("FTS5 is NOT supported in this SQLite driver: %v", err)
+	}
+	t.Log("✓ FTS5 is natively supported!")
+}
+
 func TestSQLiteStore_SemanticAndEpisodic(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -200,4 +216,118 @@ func TestADV_MerkleTamperDetection(t *testing.T) {
 		t.Fatalf("expected chain verification to FAIL after prev_hash tampering, but returned intact=true")
 	}
 	t.Logf("✓ Successfully detected link break at %s: %v", badID, err)
+}
+
+func TestSQLiteStore_RecallHybrid(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "hybrid_test.db")
+
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	embedder := embedding.NewLocalHashEmbedder(128)
+
+	memories := []struct {
+		id       string
+		category string
+		content  string
+	}{
+		{id: "m_exact", category: "convention", content: "Always configure PRAGMA wal_autocheckpoint=1000 in Go SQLite"},
+		{id: "m_fuzzy", category: "convention", content: "Configuring database journal settings for concurrent agent readers"},
+		{id: "m_other", category: "unrelated", content: "Baking sourdough bread using stone ground flour and active starter"},
+	}
+
+	for _, m := range memories {
+		vec, _ := embedder.Embed(ctx, m.content)
+		_ = store.Store(ctx, &brain.MemoryNode{
+			ID:         m.id,
+			SessionID:  "session-hybrid",
+			Category:   m.category,
+			Content:    m.content,
+			Vector:     vec,
+			Provenance: brain.ProvenanceLocalWorkspace,
+			CreatedAt:  time.Now(),
+		})
+	}
+
+	query := "wal_autocheckpoint"
+	qVec, _ := embedder.Embed(ctx, query)
+
+	results, err := store.RecallHybrid(ctx, query, qVec, brain.MemoryFilter{
+		Limit: 5,
+	})
+	if err != nil {
+		t.Fatalf("RecallHybrid failed: %v", err)
+	}
+
+	if len(results) == 0 {
+		t.Fatalf("expected hybrid results, got 0")
+	}
+
+	if results[0].Node.ID != "m_exact" {
+		t.Errorf("expected m_exact to be ranked top due to exact BM25 keyword match, got %s", results[0].Node.ID)
+	}
+	t.Logf("✓ Top hybrid match: %s with composite score %f", results[0].Node.ID, results[0].Score)
+}
+
+func TestSQLiteStore_TTLAndVacuum(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "ttl_test.db")
+
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+	expiredTime := now.Add(-1 * time.Hour)
+	futureTime := now.Add(1 * time.Hour)
+
+	// Ingest 1 expired memory, 1 active memory
+	_ = store.Store(ctx, &brain.MemoryNode{
+		ID:         "mem_expired",
+		SessionID:  "sess-ttl",
+		Category:   "temp",
+		Content:    "Ephemeral memory that has already expired",
+		ExpiresAt:  &expiredTime,
+		CreatedAt:  now.Add(-2 * time.Hour),
+		Provenance: brain.ProvenanceLocalWorkspace,
+	})
+
+	_ = store.Store(ctx, &brain.MemoryNode{
+		ID:         "mem_active",
+		SessionID:  "sess-ttl",
+		Category:   "temp",
+		Content:    "Active memory that will live for another hour",
+		ExpiresAt:  &futureTime,
+		CreatedAt:  now,
+		Provenance: brain.ProvenanceLocalWorkspace,
+	})
+
+	// Purge expired
+	purged, err := store.PurgeExpired(ctx)
+	if err != nil {
+		t.Fatalf("PurgeExpired failed: %v", err)
+	}
+	if purged != 1 {
+		t.Errorf("expected 1 purged memory, got %d", purged)
+	}
+
+	// Verify only active remains
+	count, err := store.Count(ctx, "sess-ttl")
+	if err != nil || count != 1 {
+		t.Errorf("expected 1 remaining memory, got %d (err: %v)", count, err)
+	}
+
+	// Vacuum
+	if err := store.Vacuum(ctx); err != nil {
+		t.Fatalf("Vacuum failed: %v", err)
+	}
+	t.Log("✓ Vacuum completed successfully")
 }

@@ -139,11 +139,11 @@ func (b *EmbeddedBroker) Close() error {
 
 // RabbitMQBroker implements Broker backed by an external AMQP 0-9-1 RabbitMQ cluster.
 type RabbitMQBroker struct {
-	conn       *amqp.Connection
-	ch         *amqp.Channel
-	exchange   string
-	closeMu    sync.Mutex
-	isClosed   bool
+	conn     *amqp.Connection
+	ch       *amqp.Channel
+	exchange string
+	closeMu  sync.Mutex
+	isClosed bool
 }
 
 // NewRabbitMQBroker connects to a RabbitMQ server.

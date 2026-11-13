@@ -130,3 +130,72 @@ func TestManager_CognitiveFirewallAndMerkleChain(t *testing.T) {
 		t.Errorf("expected intact chain with 1 node, got intact=%v, count=%d, badID=%s, err=%v", intact, count, badID, err)
 	}
 }
+
+func TestManager_DeduplicationAndGitScope(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "dedup_test.db")
+
+	store, err := sqlite.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer store.Close()
+
+	embedder := embedding.NewLocalHashEmbedder(128)
+	sp := scratchpad.NewMemoryScratchpad()
+	mgr := brain.NewManager(store, embedder, sp)
+
+	fact := "Always sign git commits with user GPG key 7BB5B44244E586B0"
+
+	// 1. Initial ingestion
+	n1, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:   "agent-test",
+		Category:    "convention",
+		Content:     fact,
+		Provenance:  brain.ProvenanceLocalWorkspace,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("first Remember failed: %v", err)
+	}
+
+	// Verify ambient git metadata was captured
+	if n1.Metadata["git_repo"] == "" {
+		t.Errorf("expected git_repo to be automatically populated in local workspace provenance")
+	}
+
+	// 2. Duplicate ingestion in the same session with Deduplicate: true
+	n2, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:   "agent-test",
+		Category:    "convention",
+		Content:     fact,
+		Provenance:  brain.ProvenanceLocalWorkspace,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("second Remember failed: %v", err)
+	}
+
+	// Verify same ID returned and not duplicated
+	if n1.ID != n2.ID {
+		t.Errorf("expected duplicate memory to update existing node ID %s, got %s", n1.ID, n2.ID)
+	}
+
+	total, err := mgr.Count(ctx, "agent-test")
+	if err != nil || total != 1 {
+		t.Errorf("expected total memory count 1 after deduplication, got %d (err: %v)", total, err)
+	}
+
+	// 3. Test Hybrid Recall
+	results, err := mgr.Recall(ctx, brain.RecallRequest{
+		Query:  "GPG key 7BB5B44244E586B0",
+		Hybrid: true,
+	})
+	if err != nil || len(results) == 0 {
+		t.Fatalf("hybrid recall failed: %v (results: %d)", err, len(results))
+	}
+	if results[0].Node.ID != n1.ID {
+		t.Errorf("expected top hybrid result %s, got %s", n1.ID, results[0].Node.ID)
+	}
+}
