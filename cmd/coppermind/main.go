@@ -12,7 +12,10 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/capsule"
+	"github.com/bonjoski/coppermind/pkg/doctor"
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/hook"
+	"github.com/bonjoski/coppermind/pkg/keystore"
 	"github.com/bonjoski/coppermind/pkg/mcp"
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/router"
@@ -48,6 +51,10 @@ func main() {
 		runExport(os.Args[2:])
 	case "import":
 		runImport(os.Args[2:])
+	case "doctor":
+		runDoctor(os.Args[2:])
+	case "hook":
+		runHook(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	case "version", "--version", "-v":
@@ -76,6 +83,8 @@ Commands:
   seed         Ingest markdown files or directories into memory
   export       Export the brain into a portable, verified capsule archive
   import       Restore a brain from a capsule archive with path traversal checks
+  doctor       Execute the 10-pillar diagnostic inspection suite
+  hook         Install automated git hooks (e.g. post-commit episodic capture)
   status       Display brain health metrics and stored memory counts
   version      Print version information
 
@@ -125,7 +134,8 @@ func initBroker() (queue.Broker, error) {
 
 func initRouter() router.ModelRouter {
 	endpoint := os.Getenv("COPPERMIND_LITELLM_URL")
-	apiKey := os.Getenv("COPPERMIND_OPENAI_API_KEY")
+	ks := keystore.NewLocksmithKeystore()
+	apiKey, _ := ks.GetSecret(context.Background(), "OPENAI_API_KEY")
 	return router.NewLiteLLMRouter(endpoint, apiKey)
 }
 
@@ -421,6 +431,70 @@ func runImport(args []string) {
 	fmt.Printf("✓ Successfully restored brain capsule from %s\n", capsulePath)
 	fmt.Printf("• Restored Records: %d\n", manifest.TotalRecords)
 	fmt.Printf("• Verified Checksum: %s\n", manifest.DBChecksum)
+}
+
+func runDoctor(args []string) {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	_ = fs.Parse(args)
+
+	dir := *dataDir
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			dir = filepath.Join(home, ".coppermind")
+		} else {
+			dir = ".coppermind"
+		}
+	}
+
+	fmt.Println("🏥 Running Coppermind 10-Pillar Diagnostic Inspection...")
+	fmt.Printf("• Target Data Directory: %s\n\n", dir)
+
+	results := doctor.RunDiagnostics(context.Background(), dir)
+	allPassed := true
+	for _, p := range results {
+		icon := "✓"
+		if p.Status == doctor.StatusWarn {
+			icon = "⚠️"
+		} else if p.Status == doctor.StatusFail {
+			icon = "❌"
+			allPassed = false
+		}
+		fmt.Printf("%s [%s] %-35s (%v)\n   %s\n", icon, p.Status, p.Name, p.Latency.Round(time.Microsecond), p.Message)
+	}
+
+	fmt.Println()
+	if allPassed {
+		fmt.Println("🎉 All Coppermind health pillars PASSED! Cognitive brain is healthy and operating within SLAs.")
+	} else {
+		fmt.Println("⚠️ Diagnostic warnings or failures detected. Please review the output above.")
+	}
+}
+
+func runHook(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: coppermind hook install [--repo <path>]")
+		os.Exit(1)
+	}
+
+	action := args[0]
+	if action != "install" {
+		fmt.Fprintf(os.Stderr, "Unknown hook action: %q. Expected 'install'\n", action)
+		os.Exit(1)
+	}
+
+	fs := flag.NewFlagSet("hook install", flag.ExitOnError)
+	repo := fs.String("repo", ".", "Repository root directory")
+	_ = fs.Parse(args[1:])
+
+	hookPath, err := hook.InstallGitHook(*repo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to install git hook: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✓ Successfully installed automated episodic git commit hook!\n• Hook Path: %s\n", hookPath)
 }
 
 func runStatus(args []string) {
