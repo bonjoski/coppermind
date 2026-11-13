@@ -26,10 +26,9 @@ import (
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/seeder"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/version"
 	"github.com/bonjoski/coppermind/pkg/worker"
 )
-
-var Version = "0.1.0-mvp"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -98,7 +97,7 @@ func main() {
 	case "status":
 		runStatus(cmdArgs)
 	case "version", "--version", "-v":
-		fmt.Printf("coppermind version %s\n", Version)
+		fmt.Printf("coppermind version %s\n", version.String())
 	case "help", "--help", "-h":
 		printUsage()
 	default:
