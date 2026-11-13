@@ -8,13 +8,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/mcp"
+	"github.com/bonjoski/coppermind/pkg/queue"
+	"github.com/bonjoski/coppermind/pkg/router"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/seeder"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/worker"
 )
 
 var Version = "0.1.0-mvp"
@@ -35,6 +39,8 @@ func main() {
 		runRecall(os.Args[2:])
 	case "scratchpad":
 		runScratchpad(os.Args[2:])
+	case "dispatch":
+		runDispatch(os.Args[2:])
 	case "seed":
 		runSeed(os.Args[2:])
 	case "status":
@@ -61,6 +67,8 @@ Commands:
   remember     Store an architectural fact, decision, or runbook into memory
   recall       Perform semantic similarity search over stored memories
   scratchpad   Interact with fast in-memory working state (get, set, keys)
+  dispatch     Enqueue an asynchronous cognitive task onto the message bus
+  seed         Ingest markdown files or directories into memory
   status       Display brain health metrics and stored memory counts
   version      Print version information
 
@@ -100,6 +108,20 @@ func initManager(dataDir string) (*brain.Manager, error) {
 	return brain.NewManager(store, embedder, sp), nil
 }
 
+func initBroker() (queue.Broker, error) {
+	amqpURL := os.Getenv("COPPERMIND_RABBITMQ_URL")
+	if amqpURL != "" {
+		return queue.NewRabbitMQBroker(amqpURL, "coppermind.tasks")
+	}
+	return queue.NewEmbeddedBroker(256), nil
+}
+
+func initRouter() router.ModelRouter {
+	endpoint := os.Getenv("COPPERMIND_LITELLM_URL")
+	apiKey := os.Getenv("COPPERMIND_OPENAI_API_KEY")
+	return router.NewLiteLLMRouter(endpoint, apiKey)
+}
+
 func runMCP(args []string) {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory for database files")
@@ -112,8 +134,23 @@ func runMCP(args []string) {
 	}
 	defer mgr.Close()
 
-	server := mcp.NewServer(mgr, os.Stdout)
+	broker, err := initBroker()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to initialize RabbitMQ broker (%v), using embedded broker\n", err)
+		broker = queue.NewEmbeddedBroker(256)
+	}
+	defer broker.Close()
+
+	rtr := initRouter()
+	cw := worker.NewCognitiveWorker(broker, mgr, rtr)
 	ctx := context.Background()
+	if err := cw.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to start cognitive worker: %v\n", err)
+	}
+	defer cw.Stop()
+
+	server := mcp.NewServer(mgr, os.Stdout)
+	server.SetWorker(broker, cw)
 
 	if err := server.ServeSTDIO(ctx, os.Stdin); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server stopped: %v\n", err)
@@ -238,6 +275,58 @@ func runScratchpad(args []string) {
 		fmt.Fprintf(os.Stderr, "Unknown scratchpad action: %q\n", action)
 		os.Exit(1)
 	}
+}
+
+func runDispatch(args []string) {
+	fs := flag.NewFlagSet("dispatch", flag.ExitOnError)
+	session := fs.String("session", "default", "Target session or worktree")
+	dataDir := fs.String("data-dir", "", "Data directory")
+	_ = fs.Parse(args)
+
+	rest := fs.Args()
+	if len(rest) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: task_type is required\nUsage: coppermind dispatch [--session <sess>] <summarize_session|deep_reflect|defrag_memory>\n")
+		os.Exit(1)
+	}
+	taskType := queue.TaskType(rest[0])
+
+	mgr, err := initManager(*dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	broker, err := initBroker()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing broker: %v\n", err)
+		os.Exit(1)
+	}
+	defer broker.Close()
+
+	rtr := initRouter()
+	cw := worker.NewCognitiveWorker(broker, mgr, rtr)
+	ctx := context.Background()
+	if err := cw.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Error starting worker: %v\n", err)
+		os.Exit(1)
+	}
+	defer cw.Stop()
+
+	task := &queue.TaskEnvelope{
+		SessionID: *session,
+		Type:      taskType,
+	}
+
+	topic := fmt.Sprintf("tasks.%s", taskType)
+	if err := broker.Publish(ctx, topic, task); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to publish task: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Give the local worker a moment to process the task synchronously if embedded
+	time.Sleep(300 * time.Millisecond)
+	fmt.Printf("✓ Successfully dispatched cognitive task [%s] (%s) for session %q\n", task.ID, task.Type, *session)
 }
 
 func runSeed(args []string) {

@@ -6,6 +6,7 @@
 - **Run Daemon/MCP:** `./bin/coppermind mcp`
 - **Remember Command:** `./bin/coppermind remember --category architecture "your memory"`
 - **Recall Command:** `./bin/coppermind recall "your query"`
+- **Dispatch Command:** `./bin/coppermind dispatch deep_reflect`
 - **Status Command:** `./bin/coppermind status`
 
 ## Code Style & Architectural Invariants

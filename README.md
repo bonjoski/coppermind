@@ -40,11 +40,13 @@ flowchart TD
 
 ## Core Capabilities
 
-1. **MCP-Native First**: Exposes standard Model Context Protocol tools (`coppermind_remember`, `coppermind_recall`, `coppermind_scratchpad`, `coppermind_status`) directly over STDIO, allowing instant mounting in any IDE agent configuration.
+1. **MCP-Native First**: Exposes standard Model Context Protocol tools (`coppermind_remember`, `coppermind_recall`, `coppermind_scratchpad`, `coppermind_dispatch_task`, `coppermind_status`) directly over STDIO, allowing instant mounting in any IDE agent configuration.
 2. **Zero Hop Tax & Sub-10ms Latency**: Connects over persistent STDIO or Unix Domain Sockets; eliminates intermediate CLI wrapper latency.
 3. **Multi-Agent Concurrency ($N=8$ Stress-Tested)**: Features a single-writer channel worker with SQLite Write-Ahead Logging (WAL mode), enabling 8+ parallel subagents to store, search, and lock memory without database collisions or lock timeouts.
 4. **Cognitive Security & Taint Defense**: Normalizes all inbound memories via NFKC Unicode decomposition and strips invisible zero-width characters (OWASP LLM01 indirect prompt injection defense).
 5. **Absolute Secret & Credential Quarantine**: Strict fail-closed defense scanning for private keys, AWS/OpenAI/Anthropic/GitHub API keys, and high-entropy tokens. Raw keys are rejected with typed security errors, and embedded tokens are redacted (`[REDACTED_*]`) before reaching SQLite or vector embeddings.
+6. **Asynchronous AMQP / RabbitMQ Task Engine**: Dispatches background cognitive workflows (`deep_reflect`, `summarize_session`, `defrag_memory`) onto an embedded topic bus or external RabbitMQ cluster (`COPPERMIND_RABBITMQ_URL`).
+7. **LiteLLM Model Router**: Autonomous reflection and synthesis engine with outbound API key scrubbing on upstream HTTP error frames.
 
 ---
 

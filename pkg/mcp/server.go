@@ -12,11 +12,15 @@ import (
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/queue"
+	"github.com/bonjoski/coppermind/pkg/worker"
 )
 
 // Server implements a native Model Context Protocol (MCP) server over STDIO or arbitrary streams.
 type Server struct {
 	manager   *brain.Manager
+	broker    queue.Broker
+	worker    *worker.CognitiveWorker
 	inMu      sync.Mutex
 	outMu     sync.Mutex
 	writer    io.Writer
@@ -33,6 +37,12 @@ func NewServer(manager *brain.Manager, out io.Writer) *Server {
 		writer:    out,
 		startTime: time.Now(),
 	}
+}
+
+// SetWorker binds the message broker and background worker.
+func (s *Server) SetWorker(broker queue.Broker, w *worker.CognitiveWorker) {
+	s.broker = broker
+	s.worker = w
 }
 
 // ServeSTDIO starts reading JSON-RPC 2.0 messages from in and writing responses to the configured output.
@@ -171,6 +181,19 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 				"properties": {}
 			}`),
 		},
+		{
+			Name:        "coppermind_dispatch_task",
+			Description: "Dispatch an asynchronous cognitive workflow onto the RabbitMQ/AMQP message bus (e.g. session reflection, memory defragmentation).",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"task_type": { "type": "string", "enum": ["summarize_session", "deep_reflect", "defrag_memory"], "description": "Type of cognitive task to execute in the background." },
+					"session_id": { "type": "string", "description": "Target session/worktree identifier." },
+					"payload": { "type": "object", "description": "Optional arbitrary JSON parameters for the task." }
+				},
+				"required": ["task_type"]
+			}`),
+		},
 	}
 
 	resp, _ := NewSuccessResponse(msg.ID, map[string]interface{}{"tools": tools})
@@ -193,6 +216,8 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *JSONRPCMessage) *JSON
 		result, err = s.callRecall(ctx, params.Arguments)
 	case "coppermind_scratchpad":
 		result, err = s.callScratchpad(ctx, params.Arguments)
+	case "coppermind_dispatch_task":
+		result, err = s.callDispatchTask(ctx, params.Arguments)
 	case "coppermind_status":
 		result, err = s.callStatus(ctx)
 	default:
@@ -345,6 +370,45 @@ func (s *Server) callScratchpad(ctx context.Context, args json.RawMessage) (*Too
 	}, nil
 }
 
+func (s *Server) callDispatchTask(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
+	if s.broker == nil {
+		return nil, fmt.Errorf("task broker is not active in this session")
+	}
+
+	var input struct {
+		TaskType  string                 `json:"task_type"`
+		SessionID string                 `json:"session_id"`
+		Payload   map[string]interface{} `json:"payload"`
+	}
+	if err := json.Unmarshal(args, &input); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	if input.TaskType == "" {
+		return nil, fmt.Errorf("task_type is required")
+	}
+	if input.SessionID == "" {
+		input.SessionID = "default"
+	}
+
+	task := &queue.TaskEnvelope{
+		SessionID: input.SessionID,
+		Type:      queue.TaskType(input.TaskType),
+		Payload:   input.Payload,
+	}
+
+	topic := fmt.Sprintf("tasks.%s", input.TaskType)
+	if err := s.broker.Publish(ctx, topic, task); err != nil {
+		return nil, fmt.Errorf("failed to dispatch task: %w", err)
+	}
+
+	msg := fmt.Sprintf("✓ Dispatched task [%s] of type %q for session %q onto message bus",
+		task.ID, task.Type, task.SessionID)
+	return &ToolCallResult{
+		Content: []TextContent{{Type: "text", Text: msg}},
+	}, nil
+}
+
 func (s *Server) callStatus(ctx context.Context) (*ToolCallResult, error) {
 	totalMemories, err := s.manager.Count(ctx, "")
 	if err != nil {
@@ -352,15 +416,23 @@ func (s *Server) callStatus(ctx context.Context) (*ToolCallResult, error) {
 	}
 	keys := s.manager.Scratchpad().Keys(ctx)
 
+	workerStatus := "Inactive"
+	if s.worker != nil {
+		metrics := s.worker.Metrics()
+		workerStatus = fmt.Sprintf("Active (Processed: %d, Failed: %d)", metrics.TasksProcessed, metrics.TasksFailed)
+	}
+
 	status := fmt.Sprintf(
 		"Coppermind Cognitive Brain Status:\n"+
 			"• Total Stored Memories: %d\n"+
 			"• Active Scratchpad Keys: %d\n"+
+			"• Cognitive Task Worker: %s\n"+
 			"• Uptime: %s\n"+
 			"• Protocol: MCP JSON-RPC 2.0 (STDIO / SSE)\n"+
 			"• Storage Engine: Pure-Go SQLite WAL Mode + L2 Cosine Vector Index",
 		totalMemories,
 		len(keys),
+		workerStatus,
 		time.Since(s.startTime).Round(time.Second),
 	)
 
