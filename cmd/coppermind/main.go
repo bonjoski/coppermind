@@ -563,6 +563,9 @@ func runIndex(args []string) {
 	category := fs.String("category", "code", "Category for indexed code chunks")
 	maxChunks := fs.Int("max-chunks", 1000, "Maximum chunks to index")
 	chunkLines := fs.Int("chunk-lines", 50, "Lines per chunk")
+	noProgress := fs.Bool("no-progress", false, "Disable progress meter")
+	quiet := fs.Bool("quiet", false, "Suppress progress and status output")
+	fs.BoolVar(quiet, "q", false, "Suppress progress and status output (alias)")
 	_ = fs.Parse(args)
 
 	mgr, activeProj, err := initManager(*dataDir, *project)
@@ -572,23 +575,38 @@ func runIndex(args []string) {
 	}
 	defer mgr.Close()
 
-	fmt.Printf("🔍 Indexing codebase at %q into vault %q (category: %q)...\n", *targetDir, activeProj, *category)
+	if !*quiet {
+		fmt.Printf("🔍 Indexing codebase at %q into vault %q (category: %q)...\n", *targetDir, activeProj, *category)
+	}
+
+	meter := indexer.NewProgressMeter(indexer.MeterOptions{
+		Writer:     os.Stdout,
+		DisableTTY: *noProgress,
+		Quiet:      *quiet,
+	})
+	defer meter.Close()
+
 	stats, err := indexer.IndexDirectory(context.Background(), mgr, *targetDir, indexer.IndexOptions{
 		Category:   *category,
 		MaxChunks:  *maxChunks,
 		ChunkLines: *chunkLines,
+		OnProgress: meter.Update,
 	})
+	_ = meter.Close()
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Indexing failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ Codebase indexing complete in %v:\n", stats.Duration)
-	fmt.Printf("• Files Scanned: %d\n", stats.FilesScanned)
-	fmt.Printf("• Files Indexed: %d (Chunks Stored: %d)\n", stats.FilesIndexed, stats.ChunksStored)
-	fmt.Printf("• Files Skipped: %d\n", stats.FilesSkipped)
-	if stats.Redactions > 0 {
-		fmt.Printf("• Secret Redactions: %d (credentials quarantined)\n", stats.Redactions)
+	if !*quiet {
+		fmt.Printf("✓ Codebase indexing complete in %v:\n", stats.Duration.Round(time.Millisecond))
+		fmt.Printf("• Files Scanned: %d\n", stats.FilesScanned)
+		fmt.Printf("• Files Indexed: %d (Chunks Stored: %d)\n", stats.FilesIndexed, stats.ChunksStored)
+		fmt.Printf("• Files Skipped: %d\n", stats.FilesSkipped)
+		if stats.Redactions > 0 {
+			fmt.Printf("• Secret Redactions: %d (credentials quarantined)\n", stats.Redactions)
+		}
 	}
 }
 

@@ -18,12 +18,13 @@ import (
 
 // IndexOptions configures codebase traversal and chunking.
 type IndexOptions struct {
-	MaxFileSize int64    // Maximum file size in bytes to index (default: 512KB)
-	MaxChunks   int      // Maximum total chunks to create per run (default: 1000)
-	SkipDirs    []string // Extra directory names to skip
-	ChunkLines  int      // Target lines per chunk (default: 50)
-	Overlap     int      // Overlap lines between chunks (default: 5)
-	Category    string   // Target category (default: "code")
+	MaxFileSize int64        // Maximum file size in bytes to index (default: 512KB)
+	MaxChunks   int          // Maximum total chunks to create per run (default: 1000)
+	SkipDirs    []string     // Extra directory names to skip
+	ChunkLines  int          // Target lines per chunk (default: 50)
+	Overlap     int          // Overlap lines between chunks (default: 5)
+	Category    string       // Target category (default: "code")
+	OnProgress  ProgressFunc // Optional callback for real-time indexing progress events
 }
 
 // IndexStats reports the outcome of a codebase indexing run.
@@ -89,6 +90,12 @@ var supportedExtensions = map[string]bool{
 	".zsh":  true,
 }
 
+type candidateFile struct {
+	path    string
+	relPath string
+	ext     string
+}
+
 // IndexDirectory scans a directory tree, chunks source files, and indexes them into Coppermind.
 func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opts IndexOptions) (*IndexStats, error) {
 	start := time.Now()
@@ -129,18 +136,17 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 		branch = filepath.Base(absRoot)
 	}
 
-	err = filepath.Walk(absRoot, func(path string, fi os.FileInfo, walkErr error) error {
-		if walkErr != nil {
+	// Phase 1: Fast discovery scan to establish candidate file manifest
+	var candidates []candidateFile
+
+	walkErr := filepath.Walk(absRoot, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
 			stats.FilesSkipped++
 			return nil
 		}
 
 		if ctx.Err() != nil {
 			return ctx.Err()
-		}
-
-		if stats.ChunksStored >= opts.MaxChunks {
-			return filepath.SkipDir
 		}
 
 		base := fi.Name()
@@ -189,10 +195,81 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 			relPath = path
 		}
 
-		chunks, chunkErr := chunkFile(path, opts.ChunkLines, opts.Overlap)
+		candidates = append(candidates, candidateFile{
+			path:    path,
+			relPath: relPath,
+			ext:     ext,
+		})
+
+		if opts.OnProgress != nil && stats.FilesScanned%25 == 0 {
+			opts.OnProgress(IndexProgress{
+				Phase:        PhaseDiscovering,
+				FilesScanned: stats.FilesScanned,
+				FilesSkipped: stats.FilesSkipped,
+				TotalFiles:   len(candidates),
+				Elapsed:      time.Since(start),
+			})
+		}
+
+		return nil
+	})
+
+	if walkErr != nil && walkErr != context.Canceled {
+		return stats, walkErr
+	}
+
+	totalCandidates := len(candidates)
+	if opts.OnProgress != nil {
+		opts.OnProgress(IndexProgress{
+			Phase:        PhaseDiscovering,
+			FilesScanned: stats.FilesScanned,
+			FilesSkipped: stats.FilesSkipped,
+			TotalFiles:   totalCandidates,
+			Elapsed:      time.Since(start),
+		})
+	}
+
+	// Phase 2: Active indexing loop
+	for _, cand := range candidates {
+		if ctx.Err() != nil {
+			stats.Duration = time.Since(start)
+			return stats, ctx.Err()
+		}
+
+		if stats.ChunksStored >= opts.MaxChunks {
+			break
+		}
+
+		if opts.OnProgress != nil {
+			var pct float64
+			if totalCandidates > 0 {
+				pct = (float64(stats.FilesIndexed) / float64(totalCandidates)) * 100.0
+			}
+			elapsed := time.Since(start)
+			var rate float64
+			if elapsed.Seconds() > 0 {
+				rate = float64(stats.FilesIndexed) / elapsed.Seconds()
+			}
+			opts.OnProgress(IndexProgress{
+				Phase:        PhaseIndexing,
+				CurrentFile:  cand.relPath,
+				FilesScanned: stats.FilesScanned,
+				TotalFiles:   totalCandidates,
+				FilesIndexed: stats.FilesIndexed,
+				FilesSkipped: stats.FilesSkipped,
+				ChunksStored: stats.ChunksStored,
+				MaxChunks:    opts.MaxChunks,
+				Redactions:   stats.Redactions,
+				Elapsed:      elapsed,
+				Rate:         rate,
+				Percentage:   pct,
+			})
+		}
+
+		chunks, chunkErr := chunkFile(cand.path, opts.ChunkLines, opts.Overlap)
 		if chunkErr != nil {
 			stats.FilesSkipped++
-			return nil
+			continue
 		}
 
 		fileIndexed := false
@@ -213,11 +290,11 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 			}
 
 			cat := opts.Category
-			if ext == ".md" {
+			if cand.ext == ".md" {
 				cat = "documentation"
 			}
 
-			contentFormatted := fmt.Sprintf("[%s:%d-%d]\n%s", relPath, chunk.StartLine, chunk.EndLine, sanitized.SanitizedText)
+			contentFormatted := fmt.Sprintf("[%s:%d-%d]\n%s", cand.relPath, chunk.StartLine, chunk.EndLine, sanitized.SanitizedText)
 
 			_, remErr := mgr.Remember(ctx, brain.RememberRequest{
 				SessionID:  branch,
@@ -225,8 +302,8 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 				Content:    contentFormatted,
 				Provenance: brain.ProvenanceLocalWorkspace,
 				Metadata: map[string]string{
-					"path":       relPath,
-					"lang":       ext,
+					"path":       cand.relPath,
+					"lang":       cand.ext,
 					"start_line": fmt.Sprintf("%d", chunk.StartLine),
 					"end_line":   fmt.Sprintf("%d", chunk.EndLine),
 					"git_repo":   scope.RepoName,
@@ -246,13 +323,36 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 		} else {
 			stats.FilesSkipped++
 		}
-
-		return nil
-	})
+	}
 
 	stats.Duration = time.Since(start)
-	if err != nil && err != context.Canceled {
-		return stats, err
+
+	if opts.OnProgress != nil {
+		var finalPct float64 = 100.0
+		if totalCandidates > 0 && stats.ChunksStored < opts.MaxChunks {
+			finalPct = (float64(stats.FilesIndexed) / float64(totalCandidates)) * 100.0
+			if finalPct > 100.0 {
+				finalPct = 100.0
+			}
+		}
+		var finalRate float64
+		if stats.Duration.Seconds() > 0 {
+			finalRate = float64(stats.FilesIndexed) / stats.Duration.Seconds()
+		}
+		opts.OnProgress(IndexProgress{
+			Phase:        PhaseComplete,
+			FilesScanned: stats.FilesScanned,
+			TotalFiles:   totalCandidates,
+			FilesIndexed: stats.FilesIndexed,
+			FilesSkipped: stats.FilesSkipped,
+			ChunksStored: stats.ChunksStored,
+			MaxChunks:    opts.MaxChunks,
+			Redactions:   stats.Redactions,
+			Elapsed:      stats.Duration,
+			Rate:         finalRate,
+			Percentage:   finalPct,
+			Done:         true,
+		})
 	}
 
 	return stats, nil
