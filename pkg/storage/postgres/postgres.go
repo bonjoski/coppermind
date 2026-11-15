@@ -78,14 +78,31 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		updated_at BIGINT NOT NULL,
 		prev_hash VARCHAR(64) NOT NULL,
 		hash VARCHAR(64) NOT NULL,
-		expires_at BIGINT
+		expires_at BIGINT,
+		derived BOOLEAN NOT NULL DEFAULT FALSE,
+		source_lens VARCHAR(64) DEFAULT '',
+		parent_ids_json JSONB DEFAULT '[]'::jsonb,
+		severity VARCHAR(32) DEFAULT '',
+		status VARCHAR(32) DEFAULT '',
+		dedup_hash VARCHAR(64) DEFAULT ''
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_pg_session_id ON memory_nodes(session_id);
 	CREATE INDEX IF NOT EXISTS idx_pg_category ON memory_nodes(category);
 	CREATE INDEX IF NOT EXISTS idx_pg_created_at ON memory_nodes(created_at);
 	CREATE INDEX IF NOT EXISTS idx_pg_expires_at ON memory_nodes(expires_at);
+	CREATE INDEX IF NOT EXISTS idx_pg_derived ON memory_nodes(derived);
+	CREATE INDEX IF NOT EXISTS idx_pg_source_lens ON memory_nodes(source_lens);
+	CREATE INDEX IF NOT EXISTS idx_pg_dedup_hash ON memory_nodes(dedup_hash);
+	CREATE INDEX IF NOT EXISTS idx_pg_severity_status ON memory_nodes(severity, status);
 	CREATE INDEX IF NOT EXISTS idx_pg_content_fts ON memory_nodes USING gin(to_tsvector('english', content));
+
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS derived BOOLEAN NOT NULL DEFAULT FALSE;
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS source_lens VARCHAR(64) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS parent_ids_json JSONB DEFAULT '[]'::jsonb;
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS severity VARCHAR(32) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS status VARCHAR(32) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS dedup_hash VARCHAR(64) DEFAULT '';
 	`, s.dimension)
 
 	_, err := s.db.ExecContext(ctx, schema)
@@ -175,11 +192,17 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 
 	vecStr := FormatVector(node.Vector)
 
+	parentsJSON, _ := json.Marshal(node.ParentIDs)
+	if node.ParentIDs == nil {
+		parentsJSON = []byte("[]")
+	}
+
 	query := `
 	INSERT INTO memory_nodes (
-		id, session_id, category, content, vector_data, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at
+		id, session_id, category, content, vector_data, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
+		derived, source_lens, parent_ids_json, severity, status, dedup_hash
 	) VALUES (
-		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
 	)
 	ON CONFLICT (id) DO UPDATE SET
 		category = EXCLUDED.category,
@@ -189,7 +212,13 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		taint_score = EXCLUDED.taint_score,
 		metadata_json = EXCLUDED.metadata_json,
 		updated_at = EXCLUDED.updated_at,
-		expires_at = EXCLUDED.expires_at;
+		expires_at = EXCLUDED.expires_at,
+		derived = EXCLUDED.derived,
+		source_lens = EXCLUDED.source_lens,
+		parent_ids_json = EXCLUDED.parent_ids_json,
+		severity = EXCLUDED.severity,
+		status = EXCLUDED.status,
+		dedup_hash = EXCLUDED.dedup_hash;
 	`
 
 	_, err := s.db.ExecContext(ctx, query,
@@ -206,9 +235,83 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		node.PrevHash,
 		node.Hash,
 		expiresAtNano,
+		node.Derived,
+		node.SourceLens,
+		parentsJSON,
+		node.Severity,
+		node.Status,
+		node.DedupHash,
 	)
 
 	return err
+}
+
+func scanPostgresNode(scanner interface {
+	Scan(dest ...interface{}) error
+}, scoreDest *float32) (*brain.MemoryNode, error) {
+	var (
+		id, sid, category, content, vecText, provStr, prevHash, hash string
+		metaJSON, parentIDsJSON                                      []byte
+		taintScore                                                   float64
+		createdAtNano, updatedAtNano                                 int64
+		expiresAtNano                                                sql.NullInt64
+		derived                                                      bool
+		sourceLens, severity, status, dedupHash                      string
+	)
+
+	dests := []interface{}{
+		&id, &sid, &category, &content, &vecText, &provStr, &taintScore, &metaJSON,
+		&createdAtNano, &updatedAtNano, &prevHash, &hash, &expiresAtNano,
+		&derived, &sourceLens, &parentIDsJSON, &severity, &status, &dedupHash,
+	}
+	if scoreDest != nil {
+		dests = append(dests, scoreDest)
+	}
+
+	err := scanner.Scan(dests...)
+	if err != nil {
+		return nil, err
+	}
+
+	var metadata map[string]string
+	if len(metaJSON) > 0 {
+		_ = json.Unmarshal(metaJSON, &metadata)
+	}
+
+	var parentIDs []string
+	if len(parentIDsJSON) > 0 {
+		_ = json.Unmarshal(parentIDsJSON, &parentIDs)
+	}
+
+	var expiresAt *time.Time
+	if expiresAtNano.Valid {
+		exp := time.Unix(0, expiresAtNano.Int64)
+		expiresAt = &exp
+	}
+
+	parsedVec, _ := ParseVector(vecText)
+
+	return &brain.MemoryNode{
+		ID:         id,
+		SessionID:  sid,
+		Category:   category,
+		Content:    content,
+		Vector:     parsedVec,
+		Provenance: brain.ProvenanceTier(provStr),
+		TaintScore: taintScore,
+		Metadata:   metadata,
+		PrevHash:   prevHash,
+		Hash:       hash,
+		CreatedAt:  time.Unix(0, createdAtNano),
+		UpdatedAt:  time.Unix(0, updatedAtNano),
+		ExpiresAt:  expiresAt,
+		Derived:    derived,
+		SourceLens: sourceLens,
+		ParentIDs:  parentIDs,
+		Severity:   severity,
+		Status:     status,
+		DedupHash:  dedupHash,
+	}, nil
 }
 
 // RecallSemantic searches memories via cosine similarity against a query vector.
@@ -218,6 +321,7 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 
 	query := `
 	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
+	       derived, source_lens, parent_ids_json, severity, status, dedup_hash,
 	       1.0 - (vector_data <=> $1) AS score
 	FROM memory_nodes
 	WHERE (expires_at IS NULL OR expires_at > $2)
@@ -240,6 +344,26 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 		args = append(args, string(filter.Provenance))
 		idx++
 	}
+	if filter.Derived != nil {
+		query += fmt.Sprintf(" AND derived = $%d", idx)
+		args = append(args, *filter.Derived)
+		idx++
+	}
+	if filter.SourceLens != "" {
+		query += fmt.Sprintf(" AND source_lens = $%d", idx)
+		args = append(args, filter.SourceLens)
+		idx++
+	}
+	if filter.Severity != "" {
+		query += fmt.Sprintf(" AND severity = $%d", idx)
+		args = append(args, filter.Severity)
+		idx++
+	}
+	if filter.Status != "" {
+		query += fmt.Sprintf(" AND status = $%d", idx)
+		args = append(args, filter.Status)
+		idx++
+	}
 
 	query += fmt.Sprintf(" ORDER BY vector_data <=> $1 ASC LIMIT $%d", idx)
 	limit := filter.Limit
@@ -256,60 +380,41 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 
 	var results []*brain.SearchResult
 	for rows.Next() {
-		var (
-			id, sid, category, content, vecText, provStr, prevHash, hash string
-			metaJSON                                                     []byte
-			taintScore, score                                            float64
-			createdAtNano, updatedAtNano                                 int64
-			expiresAtNano                                                sql.NullInt64
-		)
-
-		if err := rows.Scan(&id, &sid, &category, &content, &vecText, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash, &expiresAtNano, &score); err != nil {
+		var score float32
+		node, err := scanPostgresNode(rows, &score)
+		if err != nil {
 			return nil, err
 		}
 
-		if float32(score) < filter.MinScore {
+		if score < filter.MinScore {
 			continue
-		}
-
-		var metadata map[string]string
-		if len(metaJSON) > 0 {
-			_ = json.Unmarshal(metaJSON, &metadata)
 		}
 
 		// Git repository and branch filtering if requested
-		if filter.GitRepo != "" && (metadata == nil || metadata["git_repo"] != filter.GitRepo) {
+		if filter.GitRepo != "" && (node.Metadata == nil || node.Metadata["git_repo"] != filter.GitRepo) {
 			continue
 		}
-		if filter.GitBranch != "" && (metadata == nil || metadata["git_branch"] != filter.GitBranch) {
+		if filter.GitBranch != "" && (node.Metadata == nil || node.Metadata["git_branch"] != filter.GitBranch) {
 			continue
 		}
 
-		var expiresAt *time.Time
-		if expiresAtNano.Valid {
-			exp := time.Unix(0, expiresAtNano.Int64)
-			expiresAt = &exp
+		// Filter by parent ID if requested
+		if filter.ParentID != "" {
+			matches := false
+			for _, pid := range node.ParentIDs {
+				if pid == filter.ParentID {
+					matches = true
+					break
+				}
+			}
+			if !matches {
+				continue
+			}
 		}
-
-		parsedVec, _ := ParseVector(vecText)
 
 		results = append(results, &brain.SearchResult{
-			Node: &brain.MemoryNode{
-				ID:         id,
-				SessionID:  sid,
-				Category:   category,
-				Content:    content,
-				Vector:     parsedVec,
-				Provenance: brain.ProvenanceTier(provStr),
-				TaintScore: taintScore,
-				Metadata:   metadata,
-				PrevHash:   prevHash,
-				Hash:       hash,
-				CreatedAt:  time.Unix(0, createdAtNano),
-				UpdatedAt:  time.Unix(0, updatedAtNano),
-				ExpiresAt:  expiresAt,
-			},
-			Score: float32(score),
+			Node:  node,
+			Score: score,
 		})
 	}
 
@@ -335,7 +440,8 @@ func (s *PostgresStore) RecallHybrid(ctx context.Context, query string, queryVec
 
 	// 2. Full text search
 	ftsSQL := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at
+	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
+	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
 	FROM memory_nodes
 	WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)
 	LIMIT 50;
@@ -346,42 +452,12 @@ func (s *PostgresStore) RecallHybrid(ctx context.Context, query string, queryVec
 		defer rows.Close()
 		rankIdx := 0
 		for rows.Next() {
-			var (
-				id, sid, category, content, vecText, provStr, prevHash, hash string
-				metaJSON                                                     []byte
-				taintScore                                                   float64
-				createdAtNano, updatedAtNano                                 int64
-				expiresAtNano                                                sql.NullInt64
-			)
-			if err := rows.Scan(&id, &sid, &category, &content, &vecText, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash, &expiresAtNano); err == nil {
-				ftsRanks[id] = rankIdx
+			node, err := scanPostgresNode(rows, nil)
+			if err == nil {
+				ftsRanks[node.ID] = rankIdx
 				rankIdx++
-				if _, exists := nodesByID[id]; !exists {
-					var metadata map[string]string
-					if len(metaJSON) > 0 {
-						_ = json.Unmarshal(metaJSON, &metadata)
-					}
-					var expiresAt *time.Time
-					if expiresAtNano.Valid {
-						exp := time.Unix(0, expiresAtNano.Int64)
-						expiresAt = &exp
-					}
-					parsedVec, _ := ParseVector(vecText)
-					nodesByID[id] = &brain.MemoryNode{
-						ID:         id,
-						SessionID:  sid,
-						Category:   category,
-						Content:    content,
-						Vector:     parsedVec,
-						Provenance: brain.ProvenanceTier(provStr),
-						TaintScore: taintScore,
-						Metadata:   metadata,
-						PrevHash:   prevHash,
-						Hash:       hash,
-						CreatedAt:  time.Unix(0, createdAtNano),
-						UpdatedAt:  time.Unix(0, updatedAtNano),
-						ExpiresAt:  expiresAt,
-					}
+				if _, exists := nodesByID[node.ID]; !exists {
+					nodesByID[node.ID] = node
 				}
 			}
 		}
@@ -410,6 +486,30 @@ func (s *PostgresStore) RecallHybrid(ctx context.Context, query string, queryVec
 		}
 		if filter.GitBranch != "" && (node.Metadata == nil || node.Metadata["git_branch"] != filter.GitBranch) {
 			continue
+		}
+		if filter.Derived != nil && node.Derived != *filter.Derived {
+			continue
+		}
+		if filter.SourceLens != "" && node.SourceLens != filter.SourceLens {
+			continue
+		}
+		if filter.Severity != "" && !strings.EqualFold(node.Severity, filter.Severity) {
+			continue
+		}
+		if filter.Status != "" && !strings.EqualFold(node.Status, filter.Status) {
+			continue
+		}
+		if filter.ParentID != "" {
+			matches := false
+			for _, pid := range node.ParentIDs {
+				if pid == filter.ParentID {
+					matches = true
+					break
+				}
+			}
+			if !matches {
+				continue
+			}
 		}
 
 		var score float32
@@ -447,7 +547,8 @@ func (s *PostgresStore) RecallEpisodic(ctx context.Context, sessionID string, li
 		limit = 20
 	}
 	query := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at
+	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
+	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
 	FROM memory_nodes
 	WHERE session_id = $1
 	ORDER BY created_at ASC
@@ -462,52 +563,156 @@ func (s *PostgresStore) RecallEpisodic(ctx context.Context, sessionID string, li
 	nowNano := time.Now().UnixNano()
 	var nodes []*brain.MemoryNode
 	for rows.Next() {
-		var (
-			id, sid, category, content, vecText, provStr, prevHash, hash string
-			metaJSON                                                     []byte
-			taintScore                                                   float64
-			createdAtNano, updatedAtNano                                 int64
-			expiresAtNano                                                sql.NullInt64
-		)
-		if err := rows.Scan(&id, &sid, &category, &content, &vecText, &provStr, &taintScore, &metaJSON, &createdAtNano, &updatedAtNano, &prevHash, &hash, &expiresAtNano); err != nil {
+		node, err := scanPostgresNode(rows, nil)
+		if err != nil {
 			return nil, err
 		}
-
-		if expiresAtNano.Valid && expiresAtNano.Int64 < nowNano {
+		if node.ExpiresAt != nil && node.ExpiresAt.UnixNano() < nowNano {
 			continue
 		}
-
-		var metadata map[string]string
-		if len(metaJSON) > 0 {
-			_ = json.Unmarshal(metaJSON, &metadata)
-		}
-
-		var expiresAt *time.Time
-		if expiresAtNano.Valid {
-			exp := time.Unix(0, expiresAtNano.Int64)
-			expiresAt = &exp
-		}
-
-		parsedVec, _ := ParseVector(vecText)
-
-		nodes = append(nodes, &brain.MemoryNode{
-			ID:         id,
-			SessionID:  sid,
-			Category:   category,
-			Content:    content,
-			Vector:     parsedVec,
-			Provenance: brain.ProvenanceTier(provStr),
-			TaintScore: taintScore,
-			Metadata:   metadata,
-			PrevHash:   prevHash,
-			Hash:       hash,
-			CreatedAt:  time.Unix(0, createdAtNano),
-			UpdatedAt:  time.Unix(0, updatedAtNano),
-			ExpiresAt:  expiresAt,
-		})
+		nodes = append(nodes, node)
 	}
 
 	return nodes, rows.Err()
+}
+
+// GetByID retrieves a memory node by its ID.
+func (s *PostgresStore) GetByID(ctx context.Context, id string) (*brain.MemoryNode, error) {
+	query := `
+	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
+	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	FROM memory_nodes WHERE id = $1
+	`
+	return scanPostgresNode(s.db.QueryRowContext(ctx, query, id), nil)
+}
+
+// GetByDedupHash retrieves an unresolved observation by its deterministic dedup hash.
+func (s *PostgresStore) GetByDedupHash(ctx context.Context, dedupHash string) (*brain.MemoryNode, error) {
+	if dedupHash == "" {
+		return nil, sql.ErrNoRows
+	}
+	query := `
+	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
+	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	FROM memory_nodes
+	WHERE dedup_hash = $1 AND status != 'resolved'
+	LIMIT 1
+	`
+	return scanPostgresNode(s.db.QueryRowContext(ctx, query, dedupHash), nil)
+}
+
+// GetObservationsForParents retrieves all active observations linked to the given parent memory IDs.
+func (s *PostgresStore) GetObservationsForParents(ctx context.Context, parentIDs []string) ([]*brain.MemoryNode, error) {
+	if len(parentIDs) == 0 {
+		return nil, nil
+	}
+	query := `
+	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
+	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	FROM memory_nodes
+	WHERE derived = TRUE AND status != 'resolved'
+	ORDER BY created_at DESC
+	`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	parentSet := make(map[string]struct{}, len(parentIDs))
+	for _, pid := range parentIDs {
+		parentSet[pid] = struct{}{}
+	}
+
+	var results []*brain.MemoryNode
+	for rows.Next() {
+		node, err := scanPostgresNode(rows, nil)
+		if err != nil {
+			return nil, err
+		}
+		matches := false
+		for _, pid := range node.ParentIDs {
+			if _, ok := parentSet[pid]; ok {
+				matches = true
+				break
+			}
+		}
+		if matches {
+			results = append(results, node)
+		}
+	}
+	return results, rows.Err()
+}
+
+// ResolveObservation marks an observation as resolved.
+func (s *PostgresStore) ResolveObservation(ctx context.Context, id string) error {
+	query := `UPDATE memory_nodes SET status = 'resolved', updated_at = $1 WHERE id = $2 AND derived = TRUE`
+	_, err := s.db.ExecContext(ctx, query, time.Now().UnixNano(), id)
+	return err
+}
+
+// ListObservations retrieves observations filtered by session, lens, status, and minSeverity.
+func (s *PostgresStore) ListObservations(ctx context.Context, sessionID string, lensName string, status string, minSeverity string, limit int) ([]*brain.MemoryNode, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
+	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	FROM memory_nodes
+	WHERE derived = TRUE
+	`
+	var args []interface{}
+	idx := 1
+	if sessionID != "" {
+		query += fmt.Sprintf(" AND session_id = $%d", idx)
+		args = append(args, sessionID)
+		idx++
+	}
+	if lensName != "" && lensName != "all" {
+		query += fmt.Sprintf(" AND source_lens = $%d", idx)
+		args = append(args, lensName)
+		idx++
+	}
+	if status != "" {
+		query += fmt.Sprintf(" AND status = $%d", idx)
+		args = append(args, status)
+		idx++
+	}
+	query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d", idx)
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var nodes []*brain.MemoryNode
+	for rows.Next() {
+		node, err := scanPostgresNode(rows, nil)
+		if err != nil {
+			return nil, err
+		}
+		if minSeverity != "" && !severityGTE(node.Severity, minSeverity) {
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, rows.Err()
+}
+
+func severityGTE(a, b string) bool {
+	rank := map[string]int{
+		"info":     1,
+		"low":      2,
+		"medium":   3,
+		"high":     4,
+		"critical": 5,
+	}
+	ra := rank[strings.ToLower(a)]
+	rb := rank[strings.ToLower(b)]
+	return ra >= rb
 }
 
 // Delete removes a node by ID.

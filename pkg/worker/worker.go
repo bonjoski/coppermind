@@ -9,6 +9,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/indexer"
+	"github.com/bonjoski/coppermind/pkg/lenses"
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/router"
 )
@@ -25,6 +26,7 @@ type CognitiveWorker struct {
 	broker     queue.Broker
 	manager    *brain.Manager
 	router     router.ModelRouter
+	lensEngine *lenses.Engine
 	metrics    WorkerMetrics
 	mu         sync.RWMutex
 	wg         sync.WaitGroup
@@ -40,6 +42,11 @@ func NewCognitiveWorker(broker queue.Broker, manager *brain.Manager, modelRouter
 		router:  modelRouter,
 		stopCh:  make(chan struct{}),
 	}
+}
+
+// SetLensEngine sets the optional lenses engine on the worker.
+func (w *CognitiveWorker) SetLensEngine(le *lenses.Engine) {
+	w.lensEngine = le
 }
 
 // Start registers subscriptions on the message broker and processes incoming tasks.
@@ -76,6 +83,8 @@ func (w *CognitiveWorker) processTask(ctx context.Context, task *queue.TaskEnvel
 		err = w.handleIndexGitTree(ctx, task)
 	case queue.TaskDefragMemory:
 		err = w.handleDefrag(ctx)
+	case queue.TaskReflectLens:
+		err = w.handleReflectLens(ctx, task)
 	default:
 		err = fmt.Errorf("unsupported task type: %s", task.Type)
 	}
@@ -87,6 +96,26 @@ func (w *CognitiveWorker) processTask(ctx context.Context, task *queue.TaskEnvel
 
 	atomic.AddUint64(&w.metrics.TasksProcessed, 1)
 	return nil
+}
+
+func (w *CognitiveWorker) handleReflectLens(ctx context.Context, task *queue.TaskEnvelope) error {
+	if w.lensEngine == nil {
+		return fmt.Errorf("lens engine is not initialized on worker")
+	}
+	lensName := "all"
+	var crossVault bool
+	if task.Payload != nil {
+		if l, ok := task.Payload["lens"].(string); ok && l != "" {
+			lensName = l
+		}
+		crossVault, _ = task.Payload["cross_vault"].(bool)
+	}
+	_, err := w.lensEngine.Reflect(ctx, lenses.ReflectRequest{
+		Lens:       lensName,
+		SessionID:  task.SessionID,
+		CrossVault: crossVault,
+	})
+	return err
 }
 
 func (w *CognitiveWorker) handleReflection(ctx context.Context, task *queue.TaskEnvelope) error {

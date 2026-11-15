@@ -18,7 +18,7 @@ const (
 type MemoryNode struct {
 	ID         string            `json:"id"`
 	SessionID  string            `json:"session_id"`
-	Category   string            `json:"category"` // e.g. "architecture", "convention", "decision", "runbook"
+	Category   string            `json:"category"` // e.g. "architecture", "convention", "decision", "runbook", "observation"
 	Content    string            `json:"content"`
 	Vector     []float32         `json:"vector,omitempty"`
 	Provenance ProvenanceTier    `json:"provenance"`
@@ -29,24 +29,39 @@ type MemoryNode struct {
 	CreatedAt  time.Time         `json:"created_at"`
 	UpdatedAt  time.Time         `json:"updated_at"`
 	ExpiresAt  *time.Time        `json:"expires_at,omitempty"`
+
+	// Cognitive Lenses extensions
+	Derived    bool     `json:"derived"`               // If true, derived from a cognitive lens (anti-recursion invariant)
+	SourceLens string   `json:"source_lens,omitempty"` // Name of the originating lens (e.g. "security-architect")
+	ParentIDs  []string `json:"parent_ids,omitempty"`  // Linked canonical memories analyzed by the lens
+	Severity   string   `json:"severity,omitempty"`    // "info", "low", "medium", "high", "critical"
+	Status     string   `json:"status,omitempty"`      // "open", "resolved"
+	DedupHash  string   `json:"dedup_hash,omitempty"`  // Deterministic deduplication hash
 }
 
 // MemoryFilter specifies search criteria for recall operations.
 type MemoryFilter struct {
-	SessionID  string         `json:"session_id,omitempty"`
-	Category   string         `json:"category,omitempty"`
-	Provenance ProvenanceTier `json:"provenance,omitempty"`
-	MinScore   float32        `json:"min_score,omitempty"`
-	Limit      int            `json:"limit,omitempty"`
-	Hybrid     bool           `json:"hybrid,omitempty"`
-	GitRepo    string         `json:"git_repo,omitempty"`
-	GitBranch  string         `json:"git_branch,omitempty"`
+	SessionID           string         `json:"session_id,omitempty"`
+	Category            string         `json:"category,omitempty"`
+	Provenance          ProvenanceTier `json:"provenance,omitempty"`
+	MinScore            float32        `json:"min_score,omitempty"`
+	Limit               int            `json:"limit,omitempty"`
+	Hybrid              bool           `json:"hybrid,omitempty"`
+	GitRepo             string         `json:"git_repo,omitempty"`
+	GitBranch           string         `json:"git_branch,omitempty"`
+	Derived             *bool          `json:"derived,omitempty"`
+	SourceLens          string         `json:"source_lens,omitempty"`
+	Severity            string         `json:"severity,omitempty"`
+	Status              string         `json:"status,omitempty"`
+	IncludeObservations bool           `json:"include_observations,omitempty"`
+	ParentID            string         `json:"parent_id,omitempty"`
 }
 
 // SearchResult contains a retrieved memory node and its relevance score.
 type SearchResult struct {
-	Node  *MemoryNode `json:"node"`
-	Score float32     `json:"score"` // Cosine similarity: [0.0, 1.0]
+	Node         *MemoryNode   `json:"node"`
+	Score        float32       `json:"score"` // Cosine similarity: [0.0, 1.0]
+	Observations []*MemoryNode `json:"observations,omitempty"`
 }
 
 // MemoryStore defines the persistent storage layer for cognitive memories.
@@ -78,6 +93,21 @@ type MemoryStore interface {
 	// VerifySessionChain audits the cryptographic Merkle chain for a given session.
 	// Returns true and the verified count if intact, or false with the offending node ID and error if tampered.
 	VerifySessionChain(ctx context.Context, sessionID string) (bool, int, string, error)
+
+	// GetByID retrieves a memory node by its ID.
+	GetByID(ctx context.Context, id string) (*MemoryNode, error)
+
+	// GetByDedupHash retrieves an unresolved observation by its deterministic dedup hash.
+	GetByDedupHash(ctx context.Context, dedupHash string) (*MemoryNode, error)
+
+	// GetObservationsForParents retrieves all active observations linked to the given parent memory IDs.
+	GetObservationsForParents(ctx context.Context, parentIDs []string) ([]*MemoryNode, error)
+
+	// ResolveObservation marks an observation as resolved.
+	ResolveObservation(ctx context.Context, id string) error
+
+	// ListObservations retrieves observations filtered by session, lens, status, and minSeverity.
+	ListObservations(ctx context.Context, sessionID string, lensName string, status string, minSeverity string, limit int) ([]*MemoryNode, error)
 
 	// Close releases any database connections or locks.
 	Close() error

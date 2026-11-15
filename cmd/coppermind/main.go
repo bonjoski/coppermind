@@ -20,6 +20,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/hook"
 	"github.com/bonjoski/coppermind/pkg/indexer"
 	"github.com/bonjoski/coppermind/pkg/keystore"
+	"github.com/bonjoski/coppermind/pkg/lenses"
 	"github.com/bonjoski/coppermind/pkg/mcp"
 	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/queue"
@@ -295,10 +296,34 @@ func runMCP(args []string) {
 	rtr := initRouter()
 	cw := worker.NewCognitiveWorker(broker, mgr, rtr)
 	ctx := context.Background()
+
+	// Initialize and start Cognitive Lenses engine
+	lensCfg, _ := lenses.LoadConfig("")
+	if lensCfg == nil {
+		lensCfg = lenses.DefaultConfig()
+	}
+	lensEngine := lenses.NewEngine(lensCfg, broker, mgr, rtr, activeProj, nil)
+	_ = lensEngine.Start(ctx)
+	defer lensEngine.Stop()
+	cw.SetLensEngine(lensEngine)
+
 	if err := cw.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start cognitive worker: %v\n", err)
 	}
 	defer cw.Stop()
+
+	// Seed Working Memory scratchpad with top 3 unresolved high/critical observations for active project vault
+	if mgr != nil {
+		topObs, err := mgr.ListObservations(ctx, "", "", "open", "high", 3)
+		if err == nil && len(topObs) > 0 {
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("Active High-Priority Observations for %q (%d):\n", activeProj, len(topObs)))
+			for i, obs := range topObs {
+				sb.WriteString(fmt.Sprintf("%d. [%s] (%s): %s\n", i+1, strings.ToUpper(obs.Severity), obs.SourceLens, obs.Content))
+			}
+			_ = mgr.Scratchpad().Set(ctx, "active_observations", sb.String(), 24*time.Hour)
+		}
+	}
 
 	server := mcp.NewServer(mgr, os.Stdout)
 	server.SetWorker(broker, cw)
@@ -363,11 +388,13 @@ func runRecall(args []string) {
 	limit := fs.Int("limit", 5, "Maximum results to retrieve")
 	minScore := fs.Float64("min-score", 0.0, "Minimum cosine score threshold")
 	hybrid := fs.Bool("hybrid", true, "Use hybrid FTS5 BM25 + vector RRF search (default true)")
+	lensName := fs.String("lens", "", "Filter recall to observations from a specific lens (e.g. security-architect, systems-architect)")
+	includeObs := fs.Bool("include-observations", true, "Auto-attach linked cognitive lens observations to primary recalled memories")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: search query is required\nUsage: coppermind recall [--limit 5] <query>\n")
+		fmt.Fprintf(os.Stderr, "Error: search query is required\nUsage: coppermind recall [--limit 5] [--lens <name>] [--include-observations] <query>\n")
 		os.Exit(1)
 	}
 	query := strings.Join(rest, " ")
@@ -380,14 +407,16 @@ func runRecall(args []string) {
 	defer mgr.Close()
 
 	results, err := mgr.Recall(context.Background(), brain.RecallRequest{
-		SessionID: *session,
-		Category:  *category,
-		Query:     query,
-		Limit:     *limit,
-		MinScore:  float32(*minScore),
-		Hybrid:    *hybrid,
-		GitRepo:   *repo,
-		GitBranch: *branch,
+		SessionID:           *session,
+		Category:            *category,
+		Query:               query,
+		Limit:               *limit,
+		MinScore:            float32(*minScore),
+		Hybrid:              *hybrid,
+		GitRepo:             *repo,
+		GitBranch:           *branch,
+		SourceLens:          *lensName,
+		IncludeObservations: *includeObs,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error recalling memory: %v\n", err)
@@ -405,8 +434,16 @@ func runRecall(args []string) {
 	}
 	fmt.Printf("Found %d matching memories (%s) in vault %q for %q:\n\n", len(results), mode, activeProj, query)
 	for i, r := range results {
-		fmt.Printf("%d. [Score: %.3f] [%s | %s]\n   %s\n\n",
+		fmt.Printf("%d. [Score: %.3f] [%s | %s]\n   %s\n",
 			i+1, r.Score, r.Node.Category, r.Node.SessionID, r.Node.Content)
+		if len(r.Observations) > 0 {
+			fmt.Printf("   ↳ Linked Observations (%d):\n", len(r.Observations))
+			for _, obs := range r.Observations {
+				fmt.Printf("     • [%s] (%s): %s\n",
+					strings.ToUpper(obs.Severity), obs.SourceLens, obs.Content)
+			}
+		}
+		fmt.Println()
 	}
 }
 
@@ -465,12 +502,12 @@ func runDispatch(args []string) {
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: task_type is required\nUsage: coppermind dispatch [--session <sess>] <summarize_session|deep_reflect|extract_decisions|defrag_memory|index_git_tree>\n")
+		fmt.Fprintf(os.Stderr, "Error: task_type is required\nUsage: coppermind dispatch [--session <sess>] <reflect|summarize_session|deep_reflect|extract_decisions|defrag_memory|index_git_tree>\n")
 		os.Exit(1)
 	}
 	taskType := queue.TaskType(rest[0])
 
-	mgr, _, err := initManager(*dataDir, *project)
+	mgr, activeProj, err := initManager(*dataDir, *project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -487,6 +524,58 @@ func runDispatch(args []string) {
 	rtr := initRouter()
 	cw := worker.NewCognitiveWorker(broker, mgr, rtr)
 	ctx := context.Background()
+
+	// Special handling for dispatch reflect
+	if taskType == "reflect" {
+		rfs := flag.NewFlagSet("reflect", flag.ExitOnError)
+		lensName := rfs.String("lens", "all", "Target lens to execute (e.g. security-architect, systems-architect, drift-auditor, synthesizer, or all)")
+		sinceStr := rfs.String("since", "24h", "Time window for candidate memories (e.g. 1h, 24h, 7d)")
+		crossVault := rfs.Bool("cross-vault", false, "Execute across project vaults")
+		_ = rfs.Parse(rest[1:])
+
+		var sinceDur time.Duration
+		if *sinceStr != "" {
+			sinceDur, _ = time.ParseDuration(*sinceStr)
+			if sinceDur == 0 && strings.HasSuffix(*sinceStr, "d") {
+				days, _ := strconv.Atoi(strings.TrimSuffix(*sinceStr, "d"))
+				sinceDur = time.Duration(days) * 24 * time.Hour
+			}
+		}
+
+		lensCfg, err := lenses.LoadConfig("")
+		if err != nil {
+			lensCfg = lenses.DefaultConfig()
+		}
+		engine := lenses.NewEngine(lensCfg, broker, mgr, rtr, activeProj, nil)
+		cw.SetLensEngine(engine)
+
+		if err := cw.Start(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error starting worker: %v\n", err)
+			os.Exit(1)
+		}
+		defer cw.Stop()
+
+		fmt.Printf("Executing Cognitive Lens reflection (--lens %s, --since %s) in vault %q...\n", *lensName, *sinceStr, activeProj)
+		res, err := engine.Reflect(ctx, lenses.ReflectRequest{
+			Lens:       *lensName,
+			Since:      sinceDur,
+			CrossVault: *crossVault,
+			Project:    activeProj,
+			SessionID:  *session,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Reflection failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("✓ Reflection completed: %d candidates evaluated, %d skipped by pre-filter, %d observations generated\n\n",
+			res.EvaluatedCount, res.SkippedCount, len(res.Observations))
+		for i, obs := range res.Observations {
+			fmt.Printf("%d. [%s] (%s): %s\n", i+1, strings.ToUpper(obs.Severity), obs.SourceLens, obs.Content)
+		}
+		return
+	}
+
 	if err := cw.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting worker: %v\n", err)
 		os.Exit(1)

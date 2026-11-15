@@ -191,7 +191,7 @@ func (m *ProgressMeter) renderNonTTY(p IndexProgress) {
 
 	if p.Phase == PhaseIndexing {
 		m.lastPhase = PhaseIndexing
-		currPctBucket := int(p.Percentage / 10.0) * 10
+		currPctBucket := int(p.Percentage/10.0) * 10
 		if currPctBucket > m.lastLogPct {
 			m.lastLogPct = currPctBucket
 			fmt.Fprintf(m.out, "[index] Progress: %5.1f%% (%d/%d files, %d chunks stored, %d redactions)\n",

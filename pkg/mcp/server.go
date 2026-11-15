@@ -170,7 +170,7 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_recall",
-			Description: "Perform semantic and hybrid search over stored memories in a project vault.",
+			Description: "Perform semantic and hybrid search over stored memories in a project vault, optionally filtering by cognitive lens or auto-attaching observations.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
@@ -179,7 +179,9 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"category": { "type": "string", "description": "Optional category filter." },
 					"session_id": { "type": "string", "description": "Optional session filter." },
 					"limit": { "type": "integer", "description": "Max results to return (default 5)." },
-					"min_score": { "type": "number", "description": "Minimum similarity score threshold (default 0.0)." }
+					"min_score": { "type": "number", "description": "Minimum similarity score threshold (default 0.0)." },
+					"lens": { "type": "string", "description": "Optional cognitive lens filter to retrieve observations from a specific persona (e.g. security-architect, systems-architect, drift-auditor, synthesizer)." },
+					"include_observations": { "type": "boolean", "description": "Whether to auto-attach linked cognitive lens observations to recalled memories (default true)." }
 				},
 				"required": ["query"]
 			}`),
@@ -220,13 +222,13 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_dispatch_task",
-			Description: "Dispatch an asynchronous cognitive workflow onto the RabbitMQ/AMQP message bus (e.g. session reflection, memory defragmentation).",
+			Description: "Dispatch an asynchronous cognitive workflow onto the RabbitMQ/AMQP message bus (e.g. session reflection, memory defragmentation, or analytical lens reflection).",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
-					"task_type": { "type": "string", "enum": ["summarize_session", "deep_reflect", "defrag_memory"], "description": "Type of cognitive task to execute in the background." },
+					"task_type": { "type": "string", "enum": ["summarize_session", "deep_reflect", "defrag_memory", "reflect"], "description": "Type of cognitive task to execute in the background." },
 					"session_id": { "type": "string", "description": "Target session/worktree identifier." },
-					"payload": { "type": "object", "description": "Optional arbitrary JSON parameters for the task." }
+					"payload": { "type": "object", "description": "Optional arbitrary JSON parameters for the task (e.g. {'lens': 'security-architect'})." }
 				},
 				"required": ["task_type"]
 			}`),
@@ -345,12 +347,14 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 
 func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
 	var input struct {
-		Project   string  `json:"project"`
-		Query     string  `json:"query"`
-		Category  string  `json:"category"`
-		SessionID string  `json:"session_id"`
-		Limit     int     `json:"limit"`
-		MinScore  float32 `json:"min_score"`
+		Project             string  `json:"project"`
+		Query               string  `json:"query"`
+		Category            string  `json:"category"`
+		SessionID           string  `json:"session_id"`
+		Limit               int     `json:"limit"`
+		MinScore            float32 `json:"min_score"`
+		Lens                string  `json:"lens"`
+		IncludeObservations *bool   `json:"include_observations"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -366,13 +370,20 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		input.Limit = 5
 	}
 
+	includeObs := true
+	if input.IncludeObservations != nil {
+		includeObs = *input.IncludeObservations
+	}
+
 	results, err := mgr.Recall(ctx, brain.RecallRequest{
-		SessionID: input.SessionID,
-		Category:  input.Category,
-		Query:     input.Query,
-		Limit:     input.Limit,
-		MinScore:  input.MinScore,
-		Hybrid:    true,
+		SessionID:           input.SessionID,
+		Category:            input.Category,
+		Query:               input.Query,
+		Limit:               input.Limit,
+		MinScore:            input.MinScore,
+		Hybrid:              true,
+		SourceLens:          input.Lens,
+		IncludeObservations: includeObs,
 	})
 	if err != nil {
 		return nil, err
@@ -391,8 +402,16 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Found %d relevant memories in project vault %q:\n\n", len(results), targetProj))
 	for i, r := range results {
-		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] [%s | %s]\n   %s\n\n",
+		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] [%s | %s]\n   %s\n",
 			i+1, r.Score, r.Node.Category, r.Node.Provenance, r.Node.Content))
+		if len(r.Observations) > 0 {
+			sb.WriteString(fmt.Sprintf("   ↳ Linked Observations (%d):\n", len(r.Observations)))
+			for _, obs := range r.Observations {
+				sb.WriteString(fmt.Sprintf("     • [%s] (%s): %s\n",
+					strings.ToUpper(obs.Severity), obs.SourceLens, obs.Content))
+			}
+		}
+		sb.WriteString("\n")
 	}
 
 	return &ToolCallResult{

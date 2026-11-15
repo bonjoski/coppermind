@@ -31,7 +31,7 @@ flowchart TD
         end
     end
 
-    Agents <-->|MCP Tools (coppermind_*)| MCP
+    Agents <-->|"MCP Tools (coppermind_*)"| MCP
     MCP --> CognitiveTiers
     CognitiveTiers --> StorageCore
 ```
@@ -47,6 +47,65 @@ flowchart TD
 5. **Absolute Secret & Credential Quarantine**: Strict fail-closed defense scanning for private keys, AWS/OpenAI/Anthropic/GitHub API keys, and high-entropy tokens. Raw keys are rejected with typed security errors, and embedded tokens are redacted (`[REDACTED_*]`) before reaching SQLite or vector embeddings.
 6. **Asynchronous AMQP / RabbitMQ Task Engine**: Dispatches background cognitive workflows (`deep_reflect`, `summarize_session`, `defrag_memory`) onto an embedded topic bus or external RabbitMQ cluster (`COPPERMIND_RABBITMQ_URL`).
 7. **LiteLLM Model Router**: Autonomous reflection and synthesis engine with outbound API key scrubbing on upstream HTTP error frames.
+8. **Cognitive Lenses**: Asynchronous, event-driven analytical personas (`security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`) that subscribe to bus events, evaluate memories across cognitive tiers, and synthesize structured observations back into project vaults without recursive loops.
+
+---
+
+## 🔍 Cognitive Lenses Subsystem
+
+Cognitive Lenses provide continuous analytical evaluation of project memories via configurable personas:
+
+* **`security-architect`**: Audits code diffs, command executions, and configuration changes for OWASP vulnerabilities, credential exposure, unsafe syscalls, and privilege escalation vectors.
+* **`systems-architect`**: Analyzes architectural coherence, modularity, single-responsibility invariants, and multi-agent concurrency bottlenecks.
+* **`drift-auditor`**: Detects drift between architectural specifications/docs and live implementations, flagging regressions and configuration drift.
+* **`synthesizer`**: Cross-correlates memories across sessions, distilling high-level decisions, patterns, and overarching system state.
+
+### Key Architectural Invariants
+* **Zero-Cost Pre-Filter Gates**: Fast regex/AST matching (e.g. scanning for `exec`, `syscall`, `unsafe`, credentials) skips 85%+ of candidate memories before invoking LLMs, preserving local VRAM and CPU.
+* **OWASP LLM01 Prompt Injection Defense**: Candidate memories and code diffs are fenced inside `<untrusted_artifact id="...">...</untrusted_artifact>` tags with strict system directives instructing the model to treat contents strictly as data, never directives.
+* **Loop Prevention (`derived=true`)**: Lenses write observations with `derived=true`. The brain manager and topic bus guarantee that derived records never emit `ingest.*` or `episodic.*` events, making recursive trigger cascades structurally impossible.
+* **Deterministic Deduplication**: Computes `SHA256(project + ":" + lens_name + ":" + target_hash + ":" + summary)` to skip duplicate observations and eliminate alert fatigue.
+* **Append-Only Authority**: Lenses create observations and resolve existing observations from the same lens; they can never alter or delete canonical memories.
+
+### Configuration (`~/.coppermind/lenses.yaml`)
+Lenses are declaratively configured with sensible embedded defaults when the file is absent:
+
+```yaml
+version: "1"
+lenses:
+  - name: "security-architect"
+    model: "local-coder"
+    subscribe:
+      - "episodic.commit"
+      - "ingest.code"
+      - "dispatch.deep_reflect"
+    recall_categories:
+      - "architecture"
+      - "security"
+      - "invariant"
+    prefilter_regex: "(?i)(exec|unsafe|syscall|os\\.Open|crypto|socket|eval|password|secret|token|api_key|auth|chmod|chown)"
+    system_prompt: |
+      You are the Lead Security Architect. Analyze the provided untrusted artifact for vulnerabilities.
+      Respond strictly in JSON: {"findings": [{"severity": "high", "category": "security", "summary": "...", "evidence": "..."}]}
+```
+
+### CLI & MCP Usage
+
+```bash
+# Trigger deep reflection using a specific lens or all lenses
+coppermind dispatch reflect --lens security-architect --since 24h
+
+# Recall memories and filter strictly to observations from a specific lens
+coppermind recall --lens security-architect "command execution"
+
+# Recall canonical memories with linked cognitive lens observations automatically attached (default)
+coppermind recall --include-observations "sandbox configuration"
+```
+
+In MCP:
+* `coppermind_recall` accepts optional `lens` (string filter) and `include_observations` (bool, default `true`).
+* `coppermind_dispatch_task` accepts `task="reflect"` with optional `lens` argument.
+* On `coppermind mcp` startup, the active project's scratchpad is automatically seeded with the top 3 unresolved `high`/`critical` observations.
 
 ---
 

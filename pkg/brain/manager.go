@@ -23,26 +23,43 @@ type RememberRequest struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	TTL         time.Duration     `json:"ttl,omitempty"`
 	Deduplicate bool              `json:"deduplicate,omitempty"`
+
+	// Cognitive Lenses fields
+	Derived    bool     `json:"derived,omitempty"`
+	SourceLens string   `json:"source_lens,omitempty"`
+	ParentIDs  []string `json:"parent_ids,omitempty"`
+	Severity   string   `json:"severity,omitempty"`
+	Status     string   `json:"status,omitempty"`
+	DedupHash  string   `json:"dedup_hash,omitempty"`
 }
 
 // RecallRequest specifies query parameters for retrieving memories.
 type RecallRequest struct {
-	SessionID  string         `json:"session_id,omitempty"`
-	Category   string         `json:"category,omitempty"`
-	Query      string         `json:"query"`
-	Limit      int            `json:"limit,omitempty"`
-	MinScore   float32        `json:"min_score,omitempty"`
-	Provenance ProvenanceTier `json:"provenance,omitempty"`
-	Hybrid     bool           `json:"hybrid,omitempty"`
-	GitRepo    string         `json:"git_repo,omitempty"`
-	GitBranch  string         `json:"git_branch,omitempty"`
+	SessionID           string         `json:"session_id,omitempty"`
+	Category            string         `json:"category,omitempty"`
+	Query               string         `json:"query"`
+	Limit               int            `json:"limit,omitempty"`
+	MinScore            float32        `json:"min_score,omitempty"`
+	Provenance          ProvenanceTier `json:"provenance,omitempty"`
+	Hybrid              bool           `json:"hybrid,omitempty"`
+	GitRepo             string         `json:"git_repo,omitempty"`
+	GitBranch           string         `json:"git_branch,omitempty"`
+	Derived             *bool          `json:"derived,omitempty"`
+	SourceLens          string         `json:"source_lens,omitempty"`
+	Severity            string         `json:"severity,omitempty"`
+	Status              string         `json:"status,omitempty"`
+	IncludeObservations bool           `json:"include_observations,omitempty"`
 }
+
+// EventHook is invoked when a canonical memory is successfully stored.
+type EventHook func(ctx context.Context, topic string, node *MemoryNode)
 
 // Manager orchestrates the cognitive memory store, embedder, and scratchpad.
 type Manager struct {
 	store      MemoryStore
 	embedder   Embedder
 	scratchpad Scratchpad
+	eventHook  EventHook
 }
 
 // NewManager creates a new brain manager.
@@ -52,6 +69,16 @@ func NewManager(store MemoryStore, embedder Embedder, scratchpad Scratchpad) *Ma
 		embedder:   embedder,
 		scratchpad: scratchpad,
 	}
+}
+
+// SetEventHook registers an event listener for memory lifecycle events.
+func (m *Manager) SetEventHook(hook EventHook) {
+	m.eventHook = hook
+}
+
+// Store returns the underlying memory store.
+func (m *Manager) Store() MemoryStore {
+	return m.store
 }
 
 // Remember sanitizes, embeds, and stores a new memory node.
@@ -161,6 +188,11 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		expiresAt = &exp
 	}
 
+	status := req.Status
+	if req.Derived && status == "" {
+		status = "open"
+	}
+
 	node := &MemoryNode{
 		ID:         id,
 		SessionID:  req.SessionID,
@@ -173,10 +205,24 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		CreatedAt:  now,
 		UpdatedAt:  now,
 		ExpiresAt:  expiresAt,
+		Derived:    req.Derived,
+		SourceLens: req.SourceLens,
+		ParentIDs:  req.ParentIDs,
+		Severity:   req.Severity,
+		Status:     status,
+		DedupHash:  req.DedupHash,
 	}
 
 	if err := m.store.Store(ctx, node); err != nil {
 		return nil, fmt.Errorf("failed to persist memory node: %w", err)
+	}
+
+	// Loop Prevention Invariant: Records with derived=true MUST NOT emit ingest.* or episodic.* events
+	if !node.Derived && m.eventHook != nil {
+		m.eventHook(ctx, fmt.Sprintf("ingest.%s", node.Category), node)
+		if node.Category == "commit" || (metadata != nil && metadata["git_commit"] != "") {
+			m.eventHook(ctx, "episodic.commit", node)
+		}
 	}
 
 	return node, nil
@@ -195,21 +241,69 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 	}
 
 	filter := MemoryFilter{
-		SessionID:  req.SessionID,
-		Category:   req.Category,
-		Provenance: req.Provenance,
-		MinScore:   req.MinScore,
-		Limit:      req.Limit,
-		Hybrid:     req.Hybrid,
-		GitRepo:    req.GitRepo,
-		GitBranch:  req.GitBranch,
+		SessionID:           req.SessionID,
+		Category:            req.Category,
+		Provenance:          req.Provenance,
+		MinScore:            req.MinScore,
+		Limit:               req.Limit,
+		Hybrid:              req.Hybrid,
+		GitRepo:             req.GitRepo,
+		GitBranch:           req.GitBranch,
+		Derived:             req.Derived,
+		SourceLens:          req.SourceLens,
+		Severity:            req.Severity,
+		Status:              req.Status,
+		IncludeObservations: req.IncludeObservations,
 	}
 
+	var results []*SearchResult
 	if req.Hybrid {
-		return m.store.RecallHybrid(ctx, normalizedQuery, queryVec, filter)
+		results, err = m.store.RecallHybrid(ctx, normalizedQuery, queryVec, filter)
+	} else {
+		results, err = m.store.RecallSemantic(ctx, queryVec, filter)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	return m.store.RecallSemantic(ctx, queryVec, filter)
+	// Auto-attach observations if requested
+	if req.IncludeObservations && len(results) > 0 {
+		parentIDs := make([]string, len(results))
+		for i, r := range results {
+			parentIDs[i] = r.Node.ID
+		}
+		observations, err := m.store.GetObservationsForParents(ctx, parentIDs)
+		if err == nil && len(observations) > 0 {
+			obsByParent := make(map[string][]*MemoryNode)
+			for _, obs := range observations {
+				for _, pID := range obs.ParentIDs {
+					obsByParent[pID] = append(obsByParent[pID], obs)
+				}
+			}
+			for _, r := range results {
+				if obsList, ok := obsByParent[r.Node.ID]; ok {
+					r.Observations = obsList
+				}
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// GetByDedupHash finds an existing observation by its deterministic hash.
+func (m *Manager) GetByDedupHash(ctx context.Context, dedupHash string) (*MemoryNode, error) {
+	return m.store.GetByDedupHash(ctx, dedupHash)
+}
+
+// ResolveObservation marks a derived observation as resolved.
+func (m *Manager) ResolveObservation(ctx context.Context, id string) error {
+	return m.store.ResolveObservation(ctx, id)
+}
+
+// ListObservations returns observations matching criteria.
+func (m *Manager) ListObservations(ctx context.Context, sessionID string, lensName string, status string, minSeverity string, limit int) ([]*MemoryNode, error) {
+	return m.store.ListObservations(ctx, sessionID, lensName, status, minSeverity, limit)
 }
 
 // Vacuum compacts database files, checkpoints the WAL, and cleans expired TTL memories.

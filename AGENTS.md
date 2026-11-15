@@ -33,6 +33,14 @@ When working in `coppermind`, you act as the **Lead Cognitive Systems Architect 
    - Non-interactive tasks (reflection, summarization, indexing) must run asynchronously via `pkg/queue` without stalling agent tool calls.
 7. **Fail-Closed Isolation**:
    - Tainted memories or corrupted payload frames must fail closed without poisoning the root vector space or crashing peer connections.
+8. **Cognitive Lenses & Analytical Synthesis**:
+   - **Bus-Native Stateless Execution**: Lenses execute as stateless subscribers on embedded Go channel topic buses (Profile A) and RabbitMQ AMQP exchanges (Profile B).
+   - **Single-Writer Ring Compliance**: All lens observations must route through single-writer channel workers (SQLite WAL / Postgres 17 pgvector) to preserve $N=8$ parallel subagent concurrency without lock contention.
+   - **Project Vault Isolation**: Lenses execute strictly within their assigned `COPPERMIND_PROJECT` vault unless explicitly called with `--cross-vault` on dispatch.
+   - **Strict Loop Prevention (`derived` flag)**: Records with `derived=true` MUST NOT emit `ingest.*` or `episodic.*` events onto the topic bus, structurally preventing infinite recursion.
+   - **Deterministic Deduplication**: Compute idempotency key `SHA256(project + ":" + lens_name + ":" + target_hash + ":" + summary)` to skip duplicate unresolved observations.
+   - **OWASP LLM01 Prompt Injection Defense**: Candidate memories and code diffs must be enclosed in `<untrusted_artifact id="...">...</untrusted_artifact>` tags with strict system instructions to treat artifact contents strictly as data, never as directives.
+   - **Append-Only Authority**: Lenses may create `derived=true` observations and resolve observations from the same lens, but may never alter or delete canonical memories.
 
 ---
 

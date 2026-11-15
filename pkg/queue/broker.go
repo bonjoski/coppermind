@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ const (
 	TaskIndexGitTree     TaskType = "index_git_tree"
 	TaskDefragMemory     TaskType = "defrag_memory"
 	TaskExtractDecisions TaskType = "extract_decisions"
+	TaskReflectLens      TaskType = "reflect"
 )
 
 // TaskEnvelope carries metadata, payload, and traceability for background execution.
@@ -79,17 +81,15 @@ func (b *EmbeddedBroker) dispatcher() {
 		select {
 		case item := <-b.taskCh:
 			b.mu.RLock()
-			handlers := append([]TaskHandler(nil), b.subscribers[item.topic]...)
-			// Also notify wildcard "#" subscribers
-			wildcards := append([]TaskHandler(nil), b.subscribers["#"]...)
+			var matchedHandlers []TaskHandler
+			for subPattern, handlers := range b.subscribers {
+				if matchTopic(subPattern, item.topic) {
+					matchedHandlers = append(matchedHandlers, handlers...)
+				}
+			}
 			b.mu.RUnlock()
 
-			for _, h := range handlers {
-				go func(handler TaskHandler, task *TaskEnvelope) {
-					_ = handler(context.Background(), task)
-				}(h, item.task)
-			}
-			for _, h := range wildcards {
+			for _, h := range matchedHandlers {
 				go func(handler TaskHandler, task *TaskEnvelope) {
 					_ = handler(context.Background(), task)
 				}(h, item.task)
@@ -98,6 +98,47 @@ func (b *EmbeddedBroker) dispatcher() {
 			return
 		}
 	}
+}
+
+// matchTopic implements AMQP 0-9-1 topic pattern matching:
+// '*' matches exactly one word; '#' matches zero or more words.
+func matchTopic(pattern, topic string) bool {
+	if pattern == "#" || pattern == topic {
+		return true
+	}
+	pParts := strings.Split(pattern, ".")
+	tParts := strings.Split(topic, ".")
+	return matchTopicParts(pParts, tParts)
+}
+
+func matchTopicParts(pattern, topic []string) bool {
+	for len(pattern) > 0 {
+		switch pattern[0] {
+		case "#":
+			if len(pattern) == 1 {
+				return true
+			}
+			for i := 0; i <= len(topic); i++ {
+				if matchTopicParts(pattern[1:], topic[i:]) {
+					return true
+				}
+			}
+			return false
+		case "*":
+			if len(topic) == 0 {
+				return false
+			}
+			pattern = pattern[1:]
+			topic = topic[1:]
+		default:
+			if len(topic) == 0 || pattern[0] != topic[0] {
+				return false
+			}
+			pattern = pattern[1:]
+			topic = topic[1:]
+		}
+	}
+	return len(topic) == 0
 }
 
 // Publish queues a task onto the topic.

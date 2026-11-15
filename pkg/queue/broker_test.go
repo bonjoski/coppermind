@@ -80,3 +80,42 @@ func TestEmbeddedBroker_PublishAndSubscribe(t *testing.T) {
 		t.Errorf("expected both TaskDeepReflect and TaskSummarizeSession, got: %v and %v", receivedTasks[0].Type, receivedTasks[1].Type)
 	}
 }
+
+func TestEmbeddedBroker_TopicWildcards(t *testing.T) {
+	ctx := context.Background()
+	broker := NewEmbeddedBroker(64)
+	defer broker.Close()
+
+	var starCount, hashCount int
+	var mu sync.Mutex
+
+	// Subscribe with wildcard patterns
+	_ = broker.Subscribe(ctx, "ingest.*", func(_ context.Context, task *TaskEnvelope) error {
+		mu.Lock()
+		starCount++
+		mu.Unlock()
+		return nil
+	})
+	_ = broker.Subscribe(ctx, "events.#", func(_ context.Context, task *TaskEnvelope) error {
+		mu.Lock()
+		hashCount++
+		mu.Unlock()
+		return nil
+	})
+
+	_ = broker.Publish(ctx, "ingest.code", &TaskEnvelope{ID: "t1"})
+	_ = broker.Publish(ctx, "ingest.architecture", &TaskEnvelope{ID: "t2"})
+	_ = broker.Publish(ctx, "ingest.sub.category", &TaskEnvelope{ID: "t3"})          // Should NOT match ingest.*
+	_ = broker.Publish(ctx, "events.user.signup.confirmed", &TaskEnvelope{ID: "t4"}) // Should match events.#
+
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if starCount != 2 {
+		t.Errorf("expected 2 tasks for ingest.*, got %d", starCount)
+	}
+	if hashCount != 1 {
+		t.Errorf("expected 1 task for events.#, got %d", hashCount)
+	}
+}
