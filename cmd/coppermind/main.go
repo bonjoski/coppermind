@@ -149,7 +149,7 @@ Commands:
   vacuum       Purge expired TTL memories and compact SQLite storage
   project      Manage isolated vaults (list, use, create, delete)
   config       Display or update persistent configuration (provider, model, endpoint)
-  doctor       Execute the 10-pillar diagnostic inspection suite
+  doctor       Execute the 11-pillar diagnostic inspection suite
   hook         Manage Git post-commit capture and lens hooks (install, uninstall, status, check)
   observations List, filter, and resolve cognitive lens observations (alias: obs)
   proposals    Review, approve, or reject quarantined memory proposals
@@ -1019,7 +1019,7 @@ func runDoctor(args []string) {
 		}
 	}
 
-	fmt.Println("🏥 Running Coppermind 10-Pillar Diagnostic Inspection...")
+	fmt.Println("🏥 Running Coppermind 11-Pillar Diagnostic Inspection...")
 	fmt.Printf("• Target Data Directory: %s\n\n", dir)
 
 	results := doctor.RunDiagnostics(context.Background(), dir)

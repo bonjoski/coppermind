@@ -18,10 +18,18 @@ if command -v coppermind >/dev/null 2>&1; then
     REPO_NAME=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
     BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
     DIFF_SUMMARY=$(git diff-tree --no-commit-id --name-status -r HEAD 2>/dev/null | head -n 20)
+    SIGNER_KEY=$(git log -1 --pretty=%GK 2>/dev/null)
+    SIG_VALID=$(git log -1 --pretty=%G? 2>/dev/null)
+    AUTHOR_ROLE="developer"
+    if [ "$SIG_VALID" = "G" ] || [ "$SIG_VALID" = "U" ]; then
+        AUTHOR_ROLE="architect"
+    fi
     if [ -n "$COMMIT_HASH" ]; then
         coppermind remember \
             --session "$REPO_NAME" \
             --category "git_commit" \
+            --author "$COMMIT_AUTHOR" \
+            --role "$AUTHOR_ROLE" \
             "Git commit $COMMIT_HASH on branch '$BRANCH_NAME' by $COMMIT_AUTHOR: $COMMIT_MSG
 Changed files:
 $DIFF_SUMMARY" >/dev/null 2>&1 &

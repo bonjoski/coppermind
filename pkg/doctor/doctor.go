@@ -249,6 +249,76 @@ func RunDiagnostics(ctx context.Context, dataDir string) []PillarResult {
 		Latency: time.Since(start),
 	})
 
+	// Pillar 11: Epistemic Authority & Supersession DAG Integrity
+	start = time.Now()
+	if db != nil {
+		var supTable string
+		err := db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_supersessions'").Scan(&supTable)
+		if err != nil {
+			// Auto-provision table and indexes if running against pre-existing database
+			_, _ = db.ExecContext(ctx, `
+				CREATE TABLE IF NOT EXISTS memory_supersessions (
+					id TEXT PRIMARY KEY,
+					superseding_id TEXT NOT NULL,
+					superseded_id TEXT NOT NULL,
+					rationale TEXT NOT NULL,
+					advisory_ref TEXT NOT NULL DEFAULT '',
+					author_identity TEXT NOT NULL DEFAULT '',
+					author_role TEXT NOT NULL DEFAULT '',
+					created_at INTEGER NOT NULL
+				);
+				CREATE INDEX IF NOT EXISTS idx_supersessions_superseded ON memory_supersessions(superseded_id);
+				CREATE INDEX IF NOT EXISTS idx_supersessions_superseding ON memory_supersessions(superseding_id);
+			`)
+			err = db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_supersessions'").Scan(&supTable)
+		}
+		if err != nil {
+			results = append(results, PillarResult{
+				Name:    "11. Epistemic Authority & DAG Integrity",
+				Status:  StatusWarn,
+				Message: fmt.Sprintf("memory_supersessions audit table missing: %v", err),
+				Latency: time.Since(start),
+			})
+		} else {
+			var activeCount, proposedCount, supersededCount int
+			_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM memory_nodes WHERE lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL").Scan(&activeCount)
+			_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM memory_nodes WHERE lifecycle_status = 'PROPOSED'").Scan(&proposedCount)
+			_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM memory_nodes WHERE lifecycle_status = 'SUPERSEDED'").Scan(&supersededCount)
+
+			// Check for direct cyclic supersession references
+			var cycleCount int
+			_ = db.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM memory_nodes a
+				JOIN memory_nodes b ON a.supersedes_id = b.id AND b.supersedes_id = a.id
+				WHERE a.id != '' AND b.id != ''
+			`).Scan(&cycleCount)
+
+			if cycleCount > 0 {
+				results = append(results, PillarResult{
+					Name:    "11. Epistemic Authority & DAG Integrity",
+					Status:  StatusFail,
+					Message: fmt.Sprintf("Integrity failure: detected %d cyclic supersessions in memory graph", cycleCount),
+					Latency: time.Since(start),
+				})
+			} else {
+				statusMsg := fmt.Sprintf("Graph intact: %d active, %d superseded, %d proposed", activeCount, supersededCount, proposedCount)
+				results = append(results, PillarResult{
+					Name:    "11. Epistemic Authority & DAG Integrity",
+					Status:  StatusPass,
+					Message: statusMsg,
+					Latency: time.Since(start),
+				})
+			}
+		}
+	} else {
+		results = append(results, PillarResult{
+			Name:    "11. Epistemic Authority & DAG Integrity",
+			Status:  StatusWarn,
+			Message: "Database offline; authority graph check skipped",
+			Latency: time.Since(start),
+		})
+	}
+
 	return results
 }
 
@@ -501,6 +571,68 @@ func runClusterDiagnostics(ctx context.Context) []PillarResult {
 		Message: "JSON-RPC 2.0 STDIO / SSE transport and tool schema declarations compliant",
 		Latency: time.Since(start),
 	})
+
+	// Pillar 11: Epistemic Authority & Supersession DAG Integrity
+	start = time.Now()
+	if db != nil {
+		var supTable sql.NullString
+		qCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err := db.QueryRowContext(qCtx, "SELECT to_regclass('public.memory_supersessions')::text").Scan(&supTable)
+		cancel()
+		if err != nil || !supTable.Valid || supTable.String == "" {
+			results = append(results, PillarResult{
+				Name:    "11. Epistemic Authority & DAG Integrity",
+				Status:  StatusWarn,
+				Message: "memory_supersessions audit table not found in cluster database",
+				Latency: time.Since(start),
+			})
+		} else {
+			var activeCount, proposedCount, supersededCount int
+			qCtx2, cancel2 := context.WithTimeout(ctx, 2*time.Second)
+			_ = db.QueryRowContext(qCtx2, "SELECT COUNT(*) FROM memory_nodes WHERE lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL").Scan(&activeCount)
+			cancel2()
+			qCtx3, cancel3 := context.WithTimeout(ctx, 2*time.Second)
+			_ = db.QueryRowContext(qCtx3, "SELECT COUNT(*) FROM memory_nodes WHERE lifecycle_status = 'PROPOSED'").Scan(&proposedCount)
+			cancel3()
+			qCtx4, cancel4 := context.WithTimeout(ctx, 2*time.Second)
+			_ = db.QueryRowContext(qCtx4, "SELECT COUNT(*) FROM memory_nodes WHERE lifecycle_status = 'SUPERSEDED'").Scan(&supersededCount)
+			cancel4()
+
+			// Check for direct cyclic supersession references
+			var cycleCount int
+			qCtx5, cancel5 := context.WithTimeout(ctx, 2*time.Second)
+			_ = db.QueryRowContext(qCtx5, `
+				SELECT COUNT(*) FROM memory_nodes a
+				JOIN memory_nodes b ON a.supersedes_id = b.id AND b.supersedes_id = a.id
+				WHERE a.id != '' AND b.id != ''
+			`).Scan(&cycleCount)
+			cancel5()
+
+			if cycleCount > 0 {
+				results = append(results, PillarResult{
+					Name:    "11. Epistemic Authority & DAG Integrity",
+					Status:  StatusFail,
+					Message: fmt.Sprintf("Integrity failure: detected %d cyclic supersessions in cluster memory graph", cycleCount),
+					Latency: time.Since(start),
+				})
+			} else {
+				statusMsg := fmt.Sprintf("Cluster graph intact: %d active, %d superseded, %d proposed", activeCount, supersededCount, proposedCount)
+				results = append(results, PillarResult{
+					Name:    "11. Epistemic Authority & DAG Integrity",
+					Status:  StatusPass,
+					Message: statusMsg,
+					Latency: time.Since(start),
+				})
+			}
+		}
+	} else {
+		results = append(results, PillarResult{
+			Name:    "11. Epistemic Authority & DAG Integrity",
+			Status:  StatusWarn,
+			Message: "Cluster database offline; authority graph check skipped",
+			Latency: time.Since(start),
+		})
+	}
 
 	return results
 }

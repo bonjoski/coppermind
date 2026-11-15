@@ -8,7 +8,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 )
 
-func TestDoctor_10Pillars(t *testing.T) {
+func TestDoctor_11Pillars(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 
@@ -20,8 +20,8 @@ func TestDoctor_10Pillars(t *testing.T) {
 	defer store.Close()
 
 	results := RunDiagnostics(ctx, tmpDir)
-	if len(results) != 10 {
-		t.Fatalf("expected 10 diagnostic pillars, got %d", len(results))
+	if len(results) != 11 {
+		t.Fatalf("expected 11 diagnostic pillars, got %d", len(results))
 	}
 
 	for _, p := range results {
