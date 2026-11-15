@@ -12,9 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	_ "github.com/lib/pq"
 )
+
+const postgresMemoryColumns = `id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash, authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref`
 
 // PostgresStore implements brain.MemoryStore backed by PostgreSQL 17 + pgvector.
 type PostgresStore struct {
@@ -84,8 +87,32 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		parent_ids_json JSONB DEFAULT '[]'::jsonb,
 		severity VARCHAR(32) DEFAULT '',
 		status VARCHAR(32) DEFAULT '',
-		dedup_hash VARCHAR(64) DEFAULT ''
+		dedup_hash VARCHAR(64) DEFAULT '',
+		authority_tier VARCHAR(32) DEFAULT 'TIER_3_EPISODIC',
+		lifecycle_status VARCHAR(32) DEFAULT 'ACTIVE',
+		author_identity VARCHAR(256) DEFAULT '',
+		author_role VARCHAR(64) DEFAULT '',
+		superseded_by_id VARCHAR(64) DEFAULT '',
+		supersedes_id VARCHAR(64) DEFAULT '',
+		rationale TEXT DEFAULT '',
+		advisory_ref VARCHAR(128) DEFAULT ''
 	);
+
+	-- Run ALTER TABLE statements FIRST so that missing columns on existing tables are added before indices
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS derived BOOLEAN NOT NULL DEFAULT FALSE;
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS source_lens VARCHAR(64) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS parent_ids_json JSONB DEFAULT '[]'::jsonb;
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS severity VARCHAR(32) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS status VARCHAR(32) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS dedup_hash VARCHAR(64) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS authority_tier VARCHAR(32) DEFAULT 'TIER_3_EPISODIC';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS lifecycle_status VARCHAR(32) DEFAULT 'ACTIVE';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS author_identity VARCHAR(256) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS author_role VARCHAR(64) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS superseded_by_id VARCHAR(64) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS supersedes_id VARCHAR(64) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS rationale TEXT DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS advisory_ref VARCHAR(128) DEFAULT '';
 
 	CREATE INDEX IF NOT EXISTS idx_pg_session_id ON memory_nodes(session_id);
 	CREATE INDEX IF NOT EXISTS idx_pg_category ON memory_nodes(category);
@@ -95,14 +122,23 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_pg_source_lens ON memory_nodes(source_lens);
 	CREATE INDEX IF NOT EXISTS idx_pg_dedup_hash ON memory_nodes(dedup_hash);
 	CREATE INDEX IF NOT EXISTS idx_pg_severity_status ON memory_nodes(severity, status);
+	CREATE INDEX IF NOT EXISTS idx_pg_authority_tier ON memory_nodes(authority_tier);
+	CREATE INDEX IF NOT EXISTS idx_pg_lifecycle_status ON memory_nodes(lifecycle_status);
+	CREATE INDEX IF NOT EXISTS idx_pg_superseded_by ON memory_nodes(superseded_by_id);
 	CREATE INDEX IF NOT EXISTS idx_pg_content_fts ON memory_nodes USING gin(to_tsvector('english', content));
 
-	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS derived BOOLEAN NOT NULL DEFAULT FALSE;
-	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS source_lens VARCHAR(64) DEFAULT '';
-	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS parent_ids_json JSONB DEFAULT '[]'::jsonb;
-	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS severity VARCHAR(32) DEFAULT '';
-	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS status VARCHAR(32) DEFAULT '';
-	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS dedup_hash VARCHAR(64) DEFAULT '';
+	CREATE TABLE IF NOT EXISTS memory_supersessions (
+		id VARCHAR(64) PRIMARY KEY,
+		superseding_id VARCHAR(64) NOT NULL,
+		superseded_id VARCHAR(64) NOT NULL,
+		rationale TEXT NOT NULL,
+		advisory_ref VARCHAR(128) DEFAULT '',
+		author_identity VARCHAR(256) DEFAULT '',
+		author_role VARCHAR(64) DEFAULT '',
+		created_at BIGINT NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_pg_supersessions_superseded ON memory_supersessions(superseded_id);
+	CREATE INDEX IF NOT EXISTS idx_pg_supersessions_superseding ON memory_supersessions(superseding_id);
 	`, s.dimension)
 
 	_, err := s.db.ExecContext(ctx, schema)
@@ -197,12 +233,25 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		parentsJSON = []byte("[]")
 	}
 
+	authorityTier := node.AuthorityTier
+	if authorityTier == "" {
+		authorityTier = authz.TierToString(authz.CategoryToDefaultTier(node.Category))
+	}
+	lifecycleStatus := node.LifecycleStatus
+	if lifecycleStatus == "" {
+		lifecycleStatus = string(authz.StatusActive)
+	}
+	node.AuthorityTier = authorityTier
+	node.LifecycleStatus = lifecycleStatus
+
 	query := `
 	INSERT INTO memory_nodes (
 		id, session_id, category, content, vector_data, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-		derived, source_lens, parent_ids_json, severity, status, dedup_hash
+		derived, source_lens, parent_ids_json, severity, status, dedup_hash,
+		authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref
 	) VALUES (
-		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+		$20, $21, $22, $23, $24, $25, $26, $27
 	)
 	ON CONFLICT (id) DO UPDATE SET
 		category = EXCLUDED.category,
@@ -218,7 +267,15 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		parent_ids_json = EXCLUDED.parent_ids_json,
 		severity = EXCLUDED.severity,
 		status = EXCLUDED.status,
-		dedup_hash = EXCLUDED.dedup_hash;
+		dedup_hash = EXCLUDED.dedup_hash,
+		authority_tier = EXCLUDED.authority_tier,
+		lifecycle_status = EXCLUDED.lifecycle_status,
+		author_identity = EXCLUDED.author_identity,
+		author_role = EXCLUDED.author_role,
+		superseded_by_id = EXCLUDED.superseded_by_id,
+		supersedes_id = EXCLUDED.supersedes_id,
+		rationale = EXCLUDED.rationale,
+		advisory_ref = EXCLUDED.advisory_ref;
 	`
 
 	_, err := s.db.ExecContext(ctx, query,
@@ -241,6 +298,14 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		node.Severity,
 		node.Status,
 		node.DedupHash,
+		authorityTier,
+		lifecycleStatus,
+		node.AuthorIdentity,
+		node.AuthorRole,
+		node.SupersededByID,
+		node.SupersedesID,
+		node.Rationale,
+		node.AdvisoryRef,
 	)
 
 	return err
@@ -257,12 +322,18 @@ func scanPostgresNode(scanner interface {
 		expiresAtNano                                                sql.NullInt64
 		derived                                                      bool
 		sourceLens, severity, status, dedupHash                      string
+		authorityTier, lifecycleStatus                               sql.NullString
+		authorIdentity, authorRole                                   sql.NullString
+		supersededByID, supersedesID                                 sql.NullString
+		rationale, advisoryRef                                       sql.NullString
 	)
 
 	dests := []interface{}{
 		&id, &sid, &category, &content, &vecText, &provStr, &taintScore, &metaJSON,
 		&createdAtNano, &updatedAtNano, &prevHash, &hash, &expiresAtNano,
 		&derived, &sourceLens, &parentIDsJSON, &severity, &status, &dedupHash,
+		&authorityTier, &lifecycleStatus, &authorIdentity, &authorRole,
+		&supersededByID, &supersedesID, &rationale, &advisoryRef,
 	}
 	if scoreDest != nil {
 		dests = append(dests, scoreDest)
@@ -291,26 +362,43 @@ func scanPostgresNode(scanner interface {
 
 	parsedVec, _ := ParseVector(vecText)
 
+	tierVal := authorityTier.String
+	if tierVal == "" {
+		tierVal = authz.TierToString(authz.CategoryToDefaultTier(category))
+	}
+	statusVal := lifecycleStatus.String
+	if statusVal == "" {
+		statusVal = string(authz.StatusActive)
+	}
+
 	return &brain.MemoryNode{
-		ID:         id,
-		SessionID:  sid,
-		Category:   category,
-		Content:    content,
-		Vector:     parsedVec,
-		Provenance: brain.ProvenanceTier(provStr),
-		TaintScore: taintScore,
-		Metadata:   metadata,
-		PrevHash:   prevHash,
-		Hash:       hash,
-		CreatedAt:  time.Unix(0, createdAtNano),
-		UpdatedAt:  time.Unix(0, updatedAtNano),
-		ExpiresAt:  expiresAt,
-		Derived:    derived,
-		SourceLens: sourceLens,
-		ParentIDs:  parentIDs,
-		Severity:   severity,
-		Status:     status,
-		DedupHash:  dedupHash,
+		ID:              id,
+		SessionID:       sid,
+		Category:        category,
+		Content:         content,
+		Vector:          parsedVec,
+		Provenance:      brain.ProvenanceTier(provStr),
+		TaintScore:      taintScore,
+		Metadata:        metadata,
+		PrevHash:        prevHash,
+		Hash:            hash,
+		CreatedAt:       time.Unix(0, createdAtNano),
+		UpdatedAt:       time.Unix(0, updatedAtNano),
+		ExpiresAt:       expiresAt,
+		Derived:         derived,
+		SourceLens:      sourceLens,
+		ParentIDs:       parentIDs,
+		Severity:        severity,
+		Status:          status,
+		DedupHash:       dedupHash,
+		AuthorityTier:   tierVal,
+		LifecycleStatus: statusVal,
+		AuthorIdentity:  authorIdentity.String,
+		AuthorRole:      authorRole.String,
+		SupersededByID:  supersededByID.String,
+		SupersedesID:    supersedesID.String,
+		Rationale:       rationale.String,
+		AdvisoryRef:     advisoryRef.String,
 	}, nil
 }
 
@@ -319,13 +407,12 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 	vecStr := FormatVector(queryVector)
 	nowNano := time.Now().UnixNano()
 
-	query := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash,
+	query := fmt.Sprintf(`
+	SELECT %s,
 	       1.0 - (vector_data <=> $1) AS score
 	FROM memory_nodes
 	WHERE (expires_at IS NULL OR expires_at > $2)
-	`
+	`, postgresMemoryColumns)
 	args := []interface{}{vecStr, nowNano}
 	idx := 3
 
@@ -362,6 +449,26 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 	if filter.Status != "" {
 		query += fmt.Sprintf(" AND status = $%d", idx)
 		args = append(args, filter.Status)
+		idx++
+	}
+
+	if !filter.IncludeSuperseded {
+		if filter.LifecycleStatus != "" {
+			query += fmt.Sprintf(" AND lifecycle_status = $%d", idx)
+			args = append(args, filter.LifecycleStatus)
+			idx++
+		} else {
+			query += " AND (lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL)"
+		}
+	} else if filter.LifecycleStatus != "" {
+		query += fmt.Sprintf(" AND lifecycle_status = $%d", idx)
+		args = append(args, filter.LifecycleStatus)
+		idx++
+	}
+
+	if filter.AuthorityTier != "" {
+		query += fmt.Sprintf(" AND authority_tier = $%d", idx)
+		args = append(args, filter.AuthorityTier)
 		idx++
 	}
 
@@ -412,6 +519,22 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 			}
 		}
 
+		if !filter.IncludeSuperseded {
+			if filter.LifecycleStatus != "" {
+				if !strings.EqualFold(node.LifecycleStatus, filter.LifecycleStatus) {
+					continue
+				}
+			} else if node.LifecycleStatus != "" && !strings.EqualFold(node.LifecycleStatus, "ACTIVE") {
+				continue
+			}
+		} else if filter.LifecycleStatus != "" && !strings.EqualFold(node.LifecycleStatus, filter.LifecycleStatus) {
+			continue
+		}
+
+		if filter.AuthorityTier != "" && !strings.EqualFold(node.AuthorityTier, filter.AuthorityTier) {
+			continue
+		}
+
 		results = append(results, &brain.SearchResult{
 			Node:  node,
 			Score: score,
@@ -439,13 +562,12 @@ func (s *PostgresStore) RecallHybrid(ctx context.Context, query string, queryVec
 	}
 
 	// 2. Full text search
-	ftsSQL := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	ftsSQL := fmt.Sprintf(`
+	SELECT %s
 	FROM memory_nodes
 	WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)
 	LIMIT 50;
-	`
+	`, postgresMemoryColumns)
 	ftsRanks := make(map[string]int)
 	rows, err := s.db.QueryContext(ctx, ftsSQL, query)
 	if err == nil {
@@ -512,6 +634,22 @@ func (s *PostgresStore) RecallHybrid(ctx context.Context, query string, queryVec
 			}
 		}
 
+		if !filter.IncludeSuperseded {
+			if filter.LifecycleStatus != "" {
+				if !strings.EqualFold(node.LifecycleStatus, filter.LifecycleStatus) {
+					continue
+				}
+			} else if node.LifecycleStatus != "" && !strings.EqualFold(node.LifecycleStatus, "ACTIVE") {
+				continue
+			}
+		} else if filter.LifecycleStatus != "" && !strings.EqualFold(node.LifecycleStatus, filter.LifecycleStatus) {
+			continue
+		}
+
+		if filter.AuthorityTier != "" && !strings.EqualFold(node.AuthorityTier, filter.AuthorityTier) {
+			continue
+		}
+
 		var score float32
 		if rank, ok := vecRanks[id]; ok {
 			score += float32(1.0 / (k + float64(rank)))
@@ -546,14 +684,13 @@ func (s *PostgresStore) RecallEpisodic(ctx context.Context, sessionID string, li
 	if limit <= 0 {
 		limit = 20
 	}
-	query := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	query := fmt.Sprintf(`
+	SELECT %s
 	FROM memory_nodes
 	WHERE session_id = $1
 	ORDER BY created_at ASC
 	LIMIT $2;
-	`
+	`, postgresMemoryColumns)
 	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
 	if err != nil {
 		return nil, err
@@ -578,11 +715,10 @@ func (s *PostgresStore) RecallEpisodic(ctx context.Context, sessionID string, li
 
 // GetByID retrieves a memory node by its ID.
 func (s *PostgresStore) GetByID(ctx context.Context, id string) (*brain.MemoryNode, error) {
-	query := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	query := fmt.Sprintf(`
+	SELECT %s
 	FROM memory_nodes WHERE id = $1
-	`
+	`, postgresMemoryColumns)
 	return scanPostgresNode(s.db.QueryRowContext(ctx, query, id), nil)
 }
 
@@ -591,13 +727,12 @@ func (s *PostgresStore) GetByDedupHash(ctx context.Context, dedupHash string) (*
 	if dedupHash == "" {
 		return nil, sql.ErrNoRows
 	}
-	query := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	query := fmt.Sprintf(`
+	SELECT %s
 	FROM memory_nodes
 	WHERE dedup_hash = $1 AND status != 'resolved'
 	LIMIT 1
-	`
+	`, postgresMemoryColumns)
 	return scanPostgresNode(s.db.QueryRowContext(ctx, query, dedupHash), nil)
 }
 
@@ -606,13 +741,12 @@ func (s *PostgresStore) GetObservationsForParents(ctx context.Context, parentIDs
 	if len(parentIDs) == 0 {
 		return nil, nil
 	}
-	query := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	query := fmt.Sprintf(`
+	SELECT %s
 	FROM memory_nodes
 	WHERE derived = TRUE AND status != 'resolved'
 	ORDER BY created_at DESC
-	`
+	`, postgresMemoryColumns)
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -656,12 +790,11 @@ func (s *PostgresStore) ListObservations(ctx context.Context, sessionID string, 
 	if limit <= 0 {
 		limit = 50
 	}
-	query := `
-	SELECT id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
+	query := fmt.Sprintf(`
+	SELECT %s
 	FROM memory_nodes
 	WHERE derived = TRUE
-	`
+	`, postgresMemoryColumns)
 	var args []interface{}
 	idx := 1
 	if sessionID != "" {

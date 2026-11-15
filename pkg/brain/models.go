@@ -37,6 +37,16 @@ type MemoryNode struct {
 	Severity   string   `json:"severity,omitempty"`    // "info", "low", "medium", "high", "critical"
 	Status     string   `json:"status,omitempty"`      // "open", "resolved"
 	DedupHash  string   `json:"dedup_hash,omitempty"`  // Deterministic deduplication hash
+
+	// Epistemic Authority & Profile B Lifecycle extensions (RFC-2026-11-15-33)
+	AuthorityTier   string `json:"authority_tier,omitempty"`   // "TIER_0_SOVEREIGN", "TIER_1_ARCHITECTURE", "TIER_2_PRODUCT", "TIER_3_EPISODIC", "TIER_4_SCRATCHPAD"
+	LifecycleStatus string `json:"lifecycle_status,omitempty"` // "ACTIVE", "SUPERSEDED", "PROPOSED", "REJECTED", "DEPRECATED"
+	AuthorIdentity  string `json:"author_identity,omitempty"`
+	AuthorRole      string `json:"author_role,omitempty"`
+	SupersededByID  string `json:"superseded_by_id,omitempty"`
+	SupersedesID    string `json:"supersedes_id,omitempty"`
+	Rationale       string `json:"rationale,omitempty"`
+	AdvisoryRef     string `json:"advisory_ref,omitempty"`
 }
 
 // MemoryFilter specifies search criteria for recall operations.
@@ -55,6 +65,11 @@ type MemoryFilter struct {
 	Status              string         `json:"status,omitempty"`
 	IncludeObservations bool           `json:"include_observations,omitempty"`
 	ParentID            string         `json:"parent_id,omitempty"`
+
+	// Epistemic Authority & Lifecycle filters
+	AuthorityTier     string `json:"authority_tier,omitempty"`
+	LifecycleStatus   string `json:"lifecycle_status,omitempty"`
+	IncludeSuperseded bool   `json:"include_superseded,omitempty"`
 }
 
 // SearchResult contains a retrieved memory node and its relevance score.
