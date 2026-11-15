@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 )
 
@@ -50,12 +51,16 @@ func IngestFile(ctx context.Context, mgr *brain.Manager, filePath string, defaul
 			continue
 		}
 
+		tier := authz.TierToString(authz.CategoryToDefaultTier(chunk.Category))
 		_, err := mgr.Remember(ctx, brain.RememberRequest{
-			SessionID:  chunk.SessionID,
-			Category:   chunk.Category,
-			Content:    chunk.Content,
-			Provenance: brain.ProvenanceLocalWorkspace,
-			Metadata:   chunk.Metadata,
+			SessionID:       chunk.SessionID,
+			Category:        chunk.Category,
+			Content:         chunk.Content,
+			Provenance:      brain.ProvenanceLocalWorkspace,
+			Metadata:        chunk.Metadata,
+			AuthorityTier:   tier,
+			AuthorRole:      "architect",
+			LifecycleStatus: string(authz.StatusActive),
 		})
 		if err != nil {
 			return ingested, fmt.Errorf("failed to ingest chunk %q from %s: %w", chunk.Title, filePath, err)
