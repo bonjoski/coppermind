@@ -331,3 +331,165 @@ func TestSQLiteStore_TTLAndVacuum(t *testing.T) {
 	}
 	t.Log("✓ Vacuum completed successfully")
 }
+
+func TestSQLiteStore_EpistemicAuthorityAndSupersession(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "authority_test.db")
+
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	embedder := embedding.NewLocalHashEmbedder(128)
+	now := time.Now()
+
+	// 1. Ingest original rule (Tier 1 Architecture)
+	origContent := "All distributed RPCs must use gRPC with mTLS and SPIFFE identity"
+	origVec, _ := embedder.Embed(ctx, origContent)
+	origNode := &brain.MemoryNode{
+		ID:              "rule-rpc-v1",
+		SessionID:       "arch-guidelines",
+		Category:        "architecture",
+		Content:         origContent,
+		Vector:          origVec,
+		Provenance:      brain.ProvenanceLocalWorkspace,
+		AuthorityTier:   "TIER_1_ARCHITECTURE",
+		LifecycleStatus: "ACTIVE",
+		AuthorIdentity:  "lead-architect@corp.local",
+		AuthorRole:      "architect",
+		CreatedAt:       now.Add(-24 * time.Hour),
+		UpdatedAt:       now.Add(-24 * time.Hour),
+	}
+	if err := store.Store(ctx, origNode); err != nil {
+		t.Fatalf("failed to store original node: %v", err)
+	}
+
+	// 2. Ingest a proposed memory (e.g. from an unauthorized role)
+	propContent := "We should switch all RPCs to HTTP/JSON without mTLS for simplicity"
+	propVec, _ := embedder.Embed(ctx, propContent)
+	propNode := &brain.MemoryNode{
+		ID:              "prop-rpc-unsafe",
+		SessionID:       "arch-guidelines",
+		Category:        "architecture",
+		Content:         propContent,
+		Vector:          propVec,
+		Provenance:      brain.ProvenanceLocalWorkspace,
+		AuthorityTier:   "TIER_2_PRODUCT",
+		LifecycleStatus: "PROPOSED",
+		AuthorIdentity:  "po@corp.local",
+		AuthorRole:      "product_owner",
+		CreatedAt:       now.Add(-12 * time.Hour),
+		UpdatedAt:       now.Add(-12 * time.Hour),
+	}
+	if err := store.Store(ctx, propNode); err != nil {
+		t.Fatalf("failed to store proposed node: %v", err)
+	}
+
+	// 3. Verify that normal RecallSemantic ignores PROPOSED
+	queryVec, _ := embedder.Embed(ctx, "What RPC protocol and identity standard do we use?")
+	results, err := store.RecallSemantic(ctx, queryVec, brain.MemoryFilter{})
+	if err != nil {
+		t.Fatalf("RecallSemantic failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 active result, got %d", len(results))
+	}
+	if results[0].Node.ID != "rule-rpc-v1" {
+		t.Errorf("expected rule-rpc-v1, got %s", results[0].Node.ID)
+	}
+
+	// 4. Supersede rule-rpc-v1 with rule-rpc-v2 (Tier 1 Architect)
+	v2Content := "All distributed RPCs must use gRPC with mTLS, SPIFFE identity, and Conjoiner Ed25519 DPoP tokens"
+	v2Vec, _ := embedder.Embed(ctx, v2Content)
+	v2Node := &brain.MemoryNode{
+		ID:         "rule-rpc-v2",
+		SessionID:  "arch-guidelines",
+		Category:   "architecture",
+		Content:    v2Content,
+		Vector:     v2Vec,
+		Provenance: brain.ProvenanceLocalWorkspace,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+
+	rationale := "Upgrade security baseline to enforce Conjoiner Ed25519 DPoP cryptographic proof-of-possession tokens"
+	advisory := "ADVISORY-2026-004"
+	err = store.Supersede(ctx, v2Node, "rule-rpc-v1", rationale, advisory, "lead-architect@corp.local", "architect")
+	if err != nil {
+		t.Fatalf("Supersede failed: %v", err)
+	}
+
+	// 5. Verify rule-rpc-v1 is now SUPERSEDED and rule-rpc-v2 is ACTIVE
+	v1After, err := store.GetByID(ctx, "rule-rpc-v1")
+	if err != nil {
+		t.Fatalf("GetByID failed: %v", err)
+	}
+	if v1After.LifecycleStatus != "SUPERSEDED" {
+		t.Errorf("expected v1 to be SUPERSEDED, got %s", v1After.LifecycleStatus)
+	}
+	if v1After.SupersededByID != "rule-rpc-v2" {
+		t.Errorf("expected v1 SupersededByID to be rule-rpc-v2, got %s", v1After.SupersededByID)
+	}
+
+	v2After, err := store.GetByID(ctx, "rule-rpc-v2")
+	if err != nil {
+		t.Fatalf("GetByID v2 failed: %v", err)
+	}
+	if v2After.LifecycleStatus != "ACTIVE" {
+		t.Errorf("expected v2 to be ACTIVE, got %s", v2After.LifecycleStatus)
+	}
+	if v2After.SupersedesID != "rule-rpc-v1" {
+		t.Errorf("expected v2 SupersedesID to be rule-rpc-v1, got %s", v2After.SupersedesID)
+	}
+	if v2After.AuthorityTier != "TIER_1_ARCHITECTURE" {
+		t.Errorf("expected v2 AuthorityTier to inherit TIER_1_ARCHITECTURE, got %s", v2After.AuthorityTier)
+	}
+
+	// 6. Verify default RecallSemantic only returns ACTIVE v2
+	activeResults, err := store.RecallSemantic(ctx, queryVec, brain.MemoryFilter{})
+	if err != nil {
+		t.Fatalf("RecallSemantic failed: %v", err)
+	}
+	if len(activeResults) != 1 {
+		t.Fatalf("expected exactly 1 active result, got %d", len(activeResults))
+	}
+	if activeResults[0].Node.ID != "rule-rpc-v2" {
+		t.Errorf("expected active result to be rule-rpc-v2, got %s", activeResults[0].Node.ID)
+	}
+
+	// 7. Verify IncludeSuperseded returns both v1 and v2
+	allResults, err := store.RecallSemantic(ctx, queryVec, brain.MemoryFilter{IncludeSuperseded: true})
+	if err != nil {
+		t.Fatalf("RecallSemantic with IncludeSuperseded failed: %v", err)
+	}
+	if len(allResults) < 2 {
+		t.Errorf("expected at least 2 results with IncludeSuperseded, got %d", len(allResults))
+	}
+
+	// 8. Verify DAG traversal via GetAncestors
+	ancestors, err := store.GetAncestors(ctx, "rule-rpc-v2")
+	if err != nil {
+		t.Fatalf("GetAncestors failed: %v", err)
+	}
+	if len(ancestors) != 2 {
+		t.Fatalf("expected 2 ancestors in lineage (v2 -> v1), got %d", len(ancestors))
+	}
+	if ancestors[0].ID != "rule-rpc-v2" || ancestors[1].ID != "rule-rpc-v1" {
+		t.Errorf("unexpected ancestor chain: %s -> %s", ancestors[0].ID, ancestors[1].ID)
+	}
+
+	// 9. Verify audit trail retrieval
+	auditRecords, err := store.GetAuditTrail(ctx, "rule-rpc-v2")
+	if err != nil {
+		t.Fatalf("GetAuditTrail failed: %v", err)
+	}
+	if len(auditRecords) != 1 {
+		t.Fatalf("expected 1 audit record, got %d", len(auditRecords))
+	}
+	if auditRecords[0].Rationale != rationale || auditRecords[0].AdvisoryRef != advisory {
+		t.Errorf("unexpected audit record values: %+v", auditRecords[0])
+	}
+}

@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/gitscope"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"golang.org/x/text/unicode/norm"
@@ -31,6 +33,15 @@ type RememberRequest struct {
 	Severity   string   `json:"severity,omitempty"`
 	Status     string   `json:"status,omitempty"`
 	DedupHash  string   `json:"dedup_hash,omitempty"`
+
+	// Epistemic Authority & Supersession fields (RFC-2026-11-15-33)
+	AuthorityTier   string `json:"authority_tier,omitempty"`
+	LifecycleStatus string `json:"lifecycle_status,omitempty"`
+	AuthorIdentity  string `json:"author_identity,omitempty"`
+	AuthorRole      string `json:"author_role,omitempty"`
+	SupersedesID    string `json:"supersedes_id,omitempty"`
+	Rationale       string `json:"rationale,omitempty"`
+	AdvisoryRef     string `json:"advisory_ref,omitempty"`
 }
 
 // RecallRequest specifies query parameters for retrieving memories.
@@ -49,6 +60,11 @@ type RecallRequest struct {
 	Severity            string         `json:"severity,omitempty"`
 	Status              string         `json:"status,omitempty"`
 	IncludeObservations bool           `json:"include_observations,omitempty"`
+
+	// Epistemic Authority & Lifecycle filters
+	AuthorityTier     string `json:"authority_tier,omitempty"`
+	LifecycleStatus   string `json:"lifecycle_status,omitempty"`
+	IncludeSuperseded bool   `json:"include_superseded,omitempty"`
 }
 
 // EventHook is invoked when a canonical memory is successfully stored.
@@ -193,28 +209,66 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		status = "open"
 	}
 
-	node := &MemoryNode{
-		ID:         id,
-		SessionID:  req.SessionID,
-		Category:   req.Category,
-		Content:    normalized,
-		Vector:     vec,
-		Provenance: req.Provenance,
-		TaintScore: threatRes.TaintScore,
-		Metadata:   metadata,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		ExpiresAt:  expiresAt,
-		Derived:    req.Derived,
-		SourceLens: req.SourceLens,
-		ParentIDs:  req.ParentIDs,
-		Severity:   req.Severity,
-		Status:     status,
-		DedupHash:  req.DedupHash,
+	tier := req.AuthorityTier
+	if tier == "" {
+		tier = authz.TierToString(authz.CategoryToDefaultTier(req.Category))
+	}
+	lifecycleStatus := req.LifecycleStatus
+	if lifecycleStatus == "" {
+		lifecycleStatus = string(authz.StatusActive)
 	}
 
-	if err := m.store.Store(ctx, node); err != nil {
-		return nil, fmt.Errorf("failed to persist memory node: %w", err)
+	node := &MemoryNode{
+		ID:              id,
+		SessionID:       req.SessionID,
+		Category:        req.Category,
+		Content:         normalized,
+		Vector:          vec,
+		Provenance:      req.Provenance,
+		TaintScore:      threatRes.TaintScore,
+		Metadata:        metadata,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		ExpiresAt:       expiresAt,
+		Derived:         req.Derived,
+		SourceLens:      req.SourceLens,
+		ParentIDs:       req.ParentIDs,
+		Severity:        req.Severity,
+		Status:          status,
+		DedupHash:       req.DedupHash,
+		AuthorityTier:   tier,
+		LifecycleStatus: lifecycleStatus,
+		AuthorIdentity:  req.AuthorIdentity,
+		AuthorRole:      req.AuthorRole,
+		SupersedesID:    req.SupersedesID,
+		Rationale:       req.Rationale,
+		AdvisoryRef:     req.AdvisoryRef,
+	}
+
+	type superseder interface {
+		Supersede(ctx context.Context, supersedingNode *MemoryNode, targetID string, rationale, advisoryRef string, authorIdentity, authorRole string) error
+	}
+
+	if req.SupersedesID != "" {
+		if s, ok := m.store.(superseder); ok {
+			if err := s.Supersede(ctx, node, req.SupersedesID, req.Rationale, req.AdvisoryRef, req.AuthorIdentity, req.AuthorRole); err != nil {
+				return nil, fmt.Errorf("supersession failed: %w", err)
+			}
+		} else {
+			if err := m.store.Store(ctx, node); err != nil {
+				return nil, fmt.Errorf("failed to persist memory node: %w", err)
+			}
+			if target, err := m.store.GetByID(ctx, req.SupersedesID); err == nil && target != nil {
+				target.LifecycleStatus = string(authz.StatusSuperseded)
+				target.SupersededByID = node.ID
+				target.UpdatedAt = time.Now()
+				_ = m.store.Store(ctx, target)
+			}
+		}
+	} else {
+		if err := m.store.Store(ctx, node); err != nil {
+			return nil, fmt.Errorf("failed to persist memory node: %w", err)
+		}
 	}
 
 	// Loop Prevention Invariant: Records with derived=true MUST NOT emit ingest.* or episodic.* events
@@ -254,6 +308,9 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 		Severity:            req.Severity,
 		Status:              req.Status,
 		IncludeObservations: req.IncludeObservations,
+		AuthorityTier:       req.AuthorityTier,
+		LifecycleStatus:     req.LifecycleStatus,
+		IncludeSuperseded:   req.IncludeSuperseded,
 	}
 
 	var results []*SearchResult
@@ -265,6 +322,25 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 	if err != nil {
 		return nil, err
 	}
+
+	// Apply Epistemic Authority tier weighting boost (RFC-2026-11-15-33)
+	for _, r := range results {
+		weight := float32(1.0)
+		switch r.Node.AuthorityTier {
+		case "TIER_0_SOVEREIGN":
+			weight = 1.25
+		case "TIER_1_ARCHITECTURE", "TIER_2_PRODUCT":
+			weight = 1.00
+		case "TIER_3_EPISODIC":
+			weight = 0.75
+		case "TIER_4_SCRATCHPAD":
+			weight = 0.50
+		}
+		r.Score *= weight
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
 
 	// Auto-attach observations if requested
 	if req.IncludeObservations && len(results) > 0 {

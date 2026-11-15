@@ -163,7 +163,11 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"category": { "type": "string", "description": "Category (e.g. architecture, convention, bug_fix, runbook, personal)." },
 					"project": { "type": "string", "description": "Optional isolated project vault name (e.g. github, personal, work)." },
 					"session_id": { "type": "string", "description": "Optional session/worktree identifier." },
-					"provenance": { "type": "string", "enum": ["TRUST_LOCAL_WORKSPACE", "TAINT_EXTERNAL_USER", "TAINT_UNTRUSTED_WEB"] }
+					"provenance": { "type": "string", "enum": ["TRUST_LOCAL_WORKSPACE", "TAINT_EXTERNAL_USER", "TAINT_UNTRUSTED_WEB"] },
+					"supersedes": { "type": "string", "description": "Optional UUID of previous memory to supersede and tombstone." },
+					"rationale": { "type": "string", "description": "Mandatory rationale when superseding an existing memory." },
+					"advisory_ref": { "type": "string", "description": "Optional advisory reference (e.g. ADR-042)." },
+					"author_role": { "type": "string", "description": "Optional author role (e.g. architect, product_owner, developer)." }
 				},
 				"required": ["content"]
 			}`),
@@ -181,7 +185,9 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"limit": { "type": "integer", "description": "Max results to return (default 5)." },
 					"min_score": { "type": "number", "description": "Minimum similarity score threshold (default 0.0)." },
 					"lens": { "type": "string", "description": "Optional cognitive lens filter to retrieve observations from a specific persona (e.g. security-architect, systems-architect, drift-auditor, synthesizer)." },
-					"include_observations": { "type": "boolean", "description": "Whether to auto-attach linked cognitive lens observations to recalled memories (default true)." }
+					"include_observations": { "type": "boolean", "description": "Whether to auto-attach linked cognitive lens observations to recalled memories (default true)." },
+					"include_superseded": { "type": "boolean", "description": "Whether to include superseded historical memories in results (default false)." },
+					"tier": { "type": "string", "description": "Optional authority tier filter (e.g. TIER_1_ARCHITECTURE)." }
 				},
 				"required": ["query"]
 			}`),
@@ -304,11 +310,16 @@ func (s *Server) getManagerForProject(projectName string) (*brain.Manager, func(
 
 func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
 	var input struct {
-		Project    string `json:"project"`
-		Content    string `json:"content"`
-		Category   string `json:"category"`
-		SessionID  string `json:"session_id"`
-		Provenance string `json:"provenance"`
+		Project     string `json:"project"`
+		Content     string `json:"content"`
+		Category    string `json:"category"`
+		SessionID   string `json:"session_id"`
+		Provenance  string `json:"provenance"`
+		Supersedes  string `json:"supersedes"`
+		Rationale   string `json:"rationale"`
+		AdvisoryRef string `json:"advisory_ref"`
+		AuthorRole  string `json:"author_role"`
+		AuthorID    string `json:"author_identity"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -326,10 +337,15 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 	}
 
 	node, err := mgr.Remember(ctx, brain.RememberRequest{
-		SessionID:  input.SessionID,
-		Category:   input.Category,
-		Content:    input.Content,
-		Provenance: prov,
+		SessionID:      input.SessionID,
+		Category:       input.Category,
+		Content:        input.Content,
+		Provenance:     prov,
+		SupersedesID:   input.Supersedes,
+		Rationale:      input.Rationale,
+		AdvisoryRef:    input.AdvisoryRef,
+		AuthorRole:     input.AuthorRole,
+		AuthorIdentity: input.AuthorID,
 	})
 	if err != nil {
 		return nil, err
@@ -340,6 +356,9 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 		targetProj = "active"
 	}
 	msg := fmt.Sprintf("Stored memory %s in vault %q [%s] (%s): %s", node.ID, targetProj, node.Category, node.Provenance, node.Content)
+	if node.SupersedesID != "" {
+		msg = fmt.Sprintf("Stored memory %s in vault %q (superseded %s, status: %s): %s", node.ID, targetProj, node.SupersedesID, node.LifecycleStatus, node.Content)
+	}
 	return &ToolCallResult{
 		Content: []TextContent{{Type: "text", Text: msg}},
 	}, nil
@@ -355,6 +374,8 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		MinScore            float32 `json:"min_score"`
 		Lens                string  `json:"lens"`
 		IncludeObservations *bool   `json:"include_observations"`
+		IncludeSuperseded   bool    `json:"include_superseded"`
+		Tier                string  `json:"tier"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -384,6 +405,8 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		Hybrid:              true,
 		SourceLens:          input.Lens,
 		IncludeObservations: includeObs,
+		IncludeSuperseded:   input.IncludeSuperseded,
+		AuthorityTier:       input.Tier,
 	})
 	if err != nil {
 		return nil, err

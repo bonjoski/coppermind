@@ -17,23 +17,37 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	_ "modernc.org/sqlite"
 )
+
+const sqliteMemoryColumns = "id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash, authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref"
 
 type writeOpType int
 
 const (
 	opStore writeOpType = iota
 	opDelete
+	opSupersede
 )
 
+type supersedeReq struct {
+	node           *brain.MemoryNode
+	targetID       string
+	rationale      string
+	advisoryRef    string
+	authorIdentity string
+	authorRole     string
+}
+
 type writeRequest struct {
-	op     writeOpType
-	node   *brain.MemoryNode
-	nodeID string
-	errCh  chan error
+	op           writeOpType
+	node         *brain.MemoryNode
+	nodeID       string
+	supersedeReq *supersedeReq
+	errCh        chan error
 }
 
 // SQLiteStore implements brain.MemoryStore backed by pure-Go SQLite with WAL mode and a non-blocking write worker.
@@ -94,7 +108,15 @@ func initSchema(db *sql.DB) error {
 		parent_ids_json TEXT NOT NULL DEFAULT '[]',
 		severity TEXT NOT NULL DEFAULT '',
 		status TEXT NOT NULL DEFAULT '',
-		dedup_hash TEXT NOT NULL DEFAULT ''
+		dedup_hash TEXT NOT NULL DEFAULT '',
+		authority_tier TEXT NOT NULL DEFAULT 'TIER_3_EPISODIC',
+		lifecycle_status TEXT NOT NULL DEFAULT 'ACTIVE',
+		author_identity TEXT NOT NULL DEFAULT '',
+		author_role TEXT NOT NULL DEFAULT '',
+		superseded_by_id TEXT NOT NULL DEFAULT '',
+		supersedes_id TEXT NOT NULL DEFAULT '',
+		rationale TEXT NOT NULL DEFAULT '',
+		advisory_ref TEXT NOT NULL DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS idx_memory_session ON memory_nodes(session_id);
 	CREATE INDEX IF NOT EXISTS idx_memory_category ON memory_nodes(category);
@@ -107,6 +129,19 @@ func initSchema(db *sql.DB) error {
 		content,
 		tokenize = 'porter unicode61'
 	);
+
+	CREATE TABLE IF NOT EXISTS memory_supersessions (
+		id TEXT PRIMARY KEY,
+		superseding_id TEXT NOT NULL,
+		superseded_id TEXT NOT NULL,
+		rationale TEXT NOT NULL,
+		advisory_ref TEXT NOT NULL DEFAULT '',
+		author_identity TEXT NOT NULL DEFAULT '',
+		author_role TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_supersessions_superseded ON memory_supersessions(superseded_id);
+	CREATE INDEX IF NOT EXISTS idx_supersessions_superseding ON memory_supersessions(superseding_id);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return err
@@ -122,11 +157,21 @@ func initSchema(db *sql.DB) error {
 	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN severity TEXT NOT NULL DEFAULT ''")
 	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN status TEXT NOT NULL DEFAULT ''")
 	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN dedup_hash TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN authority_tier TEXT NOT NULL DEFAULT 'TIER_3_EPISODIC'")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'ACTIVE'")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN author_identity TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN author_role TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN superseded_by_id TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN supersedes_id TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN rationale TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN advisory_ref TEXT NOT NULL DEFAULT ''")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_expires_at ON memory_nodes(expires_at)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_derived ON memory_nodes(derived)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_source_lens ON memory_nodes(source_lens)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_dedup_hash ON memory_nodes(dedup_hash)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_severity_status ON memory_nodes(severity, status)")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_authority_tier ON memory_nodes(authority_tier)")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_lifecycle_status ON memory_nodes(lifecycle_status)")
 
 	// Backfill FTS5 index if empty
 	var ftsCount int
@@ -165,6 +210,8 @@ func (s *SQLiteStore) writeWorker() {
 				err = s.execStore(req.node)
 			case opDelete:
 				err = s.execDelete(req.nodeID)
+			case opSupersede:
+				err = s.execSupersede(req.supersedeReq)
 			}
 			req.errCh <- err
 		case <-s.stopCh:
@@ -176,6 +223,8 @@ func (s *SQLiteStore) writeWorker() {
 					err = s.execStore(req.node)
 				case opDelete:
 					err = s.execDelete(req.nodeID)
+				case opSupersede:
+					err = s.execSupersede(req.supersedeReq)
 				}
 				req.errCh <- err
 			}
@@ -184,14 +233,14 @@ func (s *SQLiteStore) writeWorker() {
 	}
 }
 
-func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
+func (s *SQLiteStore) storeNodeTx(tx *sql.Tx, node *brain.MemoryNode) error {
 	vecBlob := encodeVector(node.Vector)
 	metaJSON, _ := json.Marshal(node.Metadata)
 
 	// Ensure Merkle hash chaining
 	if node.Hash == "" {
 		var prevHash string
-		row := s.db.QueryRow("SELECT hash FROM memory_nodes WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", node.SessionID)
+		row := tx.QueryRow("SELECT hash FROM memory_nodes WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", node.SessionID)
 		_ = row.Scan(&prevHash)
 		if prevHash == "" {
 			prevHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -215,11 +264,23 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 		parentsJSON = []byte("[]")
 	}
 
+	authorityTier := node.AuthorityTier
+	if authorityTier == "" {
+		authorityTier = authz.TierToString(authz.CategoryToDefaultTier(node.Category))
+	}
+	lifecycleStatus := node.LifecycleStatus
+	if lifecycleStatus == "" {
+		lifecycleStatus = string(authz.StatusActive)
+	}
+	node.AuthorityTier = authorityTier
+	node.LifecycleStatus = lifecycleStatus
+
 	query := `
 	INSERT INTO memory_nodes (
 		id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-		derived, source_lens, parent_ids_json, severity, status, dedup_hash
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		derived, source_lens, parent_ids_json, severity, status, dedup_hash,
+		authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		category=excluded.category,
 		content=excluded.content,
@@ -236,9 +297,17 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 		parent_ids_json=excluded.parent_ids_json,
 		severity=excluded.severity,
 		status=excluded.status,
-		dedup_hash=excluded.dedup_hash;
+		dedup_hash=excluded.dedup_hash,
+		authority_tier=excluded.authority_tier,
+		lifecycle_status=excluded.lifecycle_status,
+		author_identity=excluded.author_identity,
+		author_role=excluded.author_role,
+		superseded_by_id=excluded.superseded_by_id,
+		supersedes_id=excluded.supersedes_id,
+		rationale=excluded.rationale,
+		advisory_ref=excluded.advisory_ref;
 	`
-	_, err := s.db.Exec(query,
+	_, err := tx.Exec(query,
 		node.ID,
 		node.SessionID,
 		node.Category,
@@ -258,16 +327,101 @@ func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
 		node.Severity,
 		node.Status,
 		node.DedupHash,
+		authorityTier,
+		lifecycleStatus,
+		node.AuthorIdentity,
+		node.AuthorRole,
+		node.SupersededByID,
+		node.SupersedesID,
+		node.Rationale,
+		node.AdvisoryRef,
 	)
 	if err != nil {
 		return err
 	}
 
 	// Synchronize FTS5 virtual table
-	_, _ = s.db.Exec("DELETE FROM memory_fts WHERE id = ?", node.ID)
-	_, err = s.db.Exec("INSERT INTO memory_fts(id, session_id, category, content) VALUES (?, ?, ?, ?)",
+	_, _ = tx.Exec("DELETE FROM memory_fts WHERE id = ?", node.ID)
+	_, err = tx.Exec("INSERT INTO memory_fts(id, session_id, category, content) VALUES (?, ?, ?, ?)",
 		node.ID, node.SessionID, node.Category, node.Content)
 	return err
+}
+
+func (s *SQLiteStore) execStore(node *brain.MemoryNode) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.storeNodeTx(tx, node); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) execSupersede(req *supersedeReq) error {
+	if req.targetID == "" {
+		return fmt.Errorf("target node ID cannot be empty")
+	}
+	if req.rationale == "" {
+		return authz.ErrMissingRationale
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var targetTier string
+	row := tx.QueryRow("SELECT authority_tier FROM memory_nodes WHERE id = ?", req.targetID)
+	if err := row.Scan(&targetTier); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("target memory node %q not found: %w", req.targetID, err)
+		}
+		return fmt.Errorf("failed to query target memory node: %w", err)
+	}
+
+	nowNano := time.Now().UnixNano()
+	_, err = tx.Exec(`
+		UPDATE memory_nodes
+		SET lifecycle_status = ?, superseded_by_id = ?, updated_at = ?
+		WHERE id = ?
+	`, string(authz.StatusSuperseded), req.node.ID, nowNano, req.targetID)
+	if err != nil {
+		return fmt.Errorf("failed to update target memory node: %w", err)
+	}
+
+	req.node.SupersedesID = req.targetID
+	req.node.Rationale = req.rationale
+	req.node.AdvisoryRef = req.advisoryRef
+	req.node.AuthorIdentity = req.authorIdentity
+	req.node.AuthorRole = req.authorRole
+	req.node.LifecycleStatus = string(authz.StatusActive)
+	if req.node.AuthorityTier == "" {
+		req.node.AuthorityTier = targetTier
+	}
+
+	if err := s.storeNodeTx(tx, req.node); err != nil {
+		return fmt.Errorf("failed to store superseding memory node: %w", err)
+	}
+
+	supersessionID := fmt.Sprintf("sup-%s-%s", req.node.ID, req.targetID)
+	if len(supersessionID) > 64 {
+		supersessionID = supersessionID[:64]
+	}
+	_, err = tx.Exec(`
+		INSERT INTO memory_supersessions (
+			id, superseding_id, superseded_id, rationale, advisory_ref, author_identity, author_role, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO NOTHING
+	`, supersessionID, req.node.ID, req.targetID, req.rationale, req.advisoryRef, req.authorIdentity, req.authorRole, nowNano)
+	if err != nil {
+		return fmt.Errorf("failed to record memory supersession audit: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 func scanNode(scanner interface {
@@ -281,12 +435,18 @@ func scanNode(scanner interface {
 		expiresAtNano                                                       sql.NullInt64
 		derivedInt                                                          int
 		sourceLens, parentIDsJSON, severity, status, dedupHash              string
+		authorityTier, lifecycleStatus                                      sql.NullString
+		authorIdentity, authorRole                                          sql.NullString
+		supersededByID, supersedesID                                        sql.NullString
+		rationale, advisoryRef                                              sql.NullString
 	)
 
 	err := scanner.Scan(
 		&id, &sessionID, &category, &content, &vecBlob, &provStr, &taintScore, &metaJSON,
 		&createdAtNano, &updatedAtNano, &prevHash, &hash, &expiresAtNano,
 		&derivedInt, &sourceLens, &parentIDsJSON, &severity, &status, &dedupHash,
+		&authorityTier, &lifecycleStatus, &authorIdentity, &authorRole,
+		&supersededByID, &supersedesID, &rationale, &advisoryRef,
 	)
 	if err != nil {
 		return nil, err
@@ -308,26 +468,43 @@ func scanNode(scanner interface {
 		expiresAt = &exp
 	}
 
+	tierVal := authorityTier.String
+	if tierVal == "" {
+		tierVal = authz.TierToString(authz.CategoryToDefaultTier(category))
+	}
+	statusVal := lifecycleStatus.String
+	if statusVal == "" {
+		statusVal = string(authz.StatusActive)
+	}
+
 	return &brain.MemoryNode{
-		ID:         id,
-		SessionID:  sessionID,
-		Category:   category,
-		Content:    content,
-		Vector:     decodeVector(vecBlob),
-		Provenance: brain.ProvenanceTier(provStr),
-		TaintScore: taintScore,
-		Metadata:   metadata,
-		PrevHash:   prevHash,
-		Hash:       hash,
-		CreatedAt:  time.Unix(0, createdAtNano),
-		UpdatedAt:  time.Unix(0, updatedAtNano),
-		ExpiresAt:  expiresAt,
-		Derived:    derivedInt == 1,
-		SourceLens: sourceLens,
-		ParentIDs:  parentIDs,
-		Severity:   severity,
-		Status:     status,
-		DedupHash:  dedupHash,
+		ID:              id,
+		SessionID:       sessionID,
+		Category:        category,
+		Content:         content,
+		Vector:          decodeVector(vecBlob),
+		Provenance:      brain.ProvenanceTier(provStr),
+		TaintScore:      taintScore,
+		Metadata:        metadata,
+		PrevHash:        prevHash,
+		Hash:            hash,
+		CreatedAt:       time.Unix(0, createdAtNano),
+		UpdatedAt:       time.Unix(0, updatedAtNano),
+		ExpiresAt:       expiresAt,
+		Derived:         derivedInt == 1,
+		SourceLens:      sourceLens,
+		ParentIDs:       parentIDs,
+		Severity:        severity,
+		Status:          status,
+		DedupHash:       dedupHash,
+		AuthorityTier:   tierVal,
+		LifecycleStatus: statusVal,
+		AuthorIdentity:  authorIdentity.String,
+		AuthorRole:      authorRole.String,
+		SupersededByID:  supersededByID.String,
+		SupersedesID:    supersedesID.String,
+		Rationale:       rationale.String,
+		AdvisoryRef:     advisoryRef.String,
 	}, nil
 }
 
@@ -395,9 +572,131 @@ func (s *SQLiteStore) Delete(ctx context.Context, id string) error {
 	}
 }
 
+// SupersessionRecord models an immutable audit entry when a memory node is superseded.
+type SupersessionRecord struct {
+	ID             string    `json:"id"`
+	SupersedingID  string    `json:"superseding_id"`
+	SupersededID   string    `json:"superseded_id"`
+	Rationale      string    `json:"rationale"`
+	AdvisoryRef    string    `json:"advisory_ref"`
+	AuthorIdentity string    `json:"author_identity"`
+	AuthorRole     string    `json:"author_role"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// Supersede atomically persists a new memory node that supersedes an existing node in SQLite.
+func (s *SQLiteStore) Supersede(
+	ctx context.Context,
+	supersedingNode *brain.MemoryNode,
+	targetID string,
+	rationale, advisoryRef string,
+	authorIdentity, authorRole string,
+) error {
+	if supersedingNode.ID == "" {
+		return fmt.Errorf("node ID cannot be empty")
+	}
+	if supersedingNode.CreatedAt.IsZero() {
+		supersedingNode.CreatedAt = time.Now()
+	}
+	if supersedingNode.UpdatedAt.IsZero() {
+		supersedingNode.UpdatedAt = time.Now()
+	}
+
+	errCh := make(chan error, 1)
+	req := writeRequest{
+		op: opSupersede,
+		supersedeReq: &supersedeReq{
+			node:           supersedingNode,
+			targetID:       targetID,
+			rationale:      rationale,
+			advisoryRef:    advisoryRef,
+			authorIdentity: authorIdentity,
+			authorRole:     authorRole,
+		},
+		errCh: errCh,
+	}
+
+	select {
+	case s.writeCh <- req:
+		select {
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.stopCh:
+		return fmt.Errorf("store is closed")
+	}
+}
+
+// GetAncestors traverses the supersession DAG backwards from startID.
+func (s *SQLiteStore) GetAncestors(ctx context.Context, startID string) ([]*brain.MemoryNode, error) {
+	var ancestors []*brain.MemoryNode
+	currentID := startID
+	visited := make(map[string]struct{})
+
+	for currentID != "" {
+		if _, seen := visited[currentID]; seen {
+			break
+		}
+		visited[currentID] = struct{}{}
+
+		node, err := s.getNodeByID(ctx, currentID)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				break
+			}
+			return nil, err
+		}
+		ancestors = append(ancestors, node)
+		currentID = node.SupersedesID
+	}
+
+	return ancestors, nil
+}
+
+// GetAuditTrail retrieves all supersession events involving a given memory node ID.
+func (s *SQLiteStore) GetAuditTrail(ctx context.Context, nodeID string) ([]*SupersessionRecord, error) {
+	query := `
+		SELECT id, superseding_id, superseded_id, rationale, advisory_ref, author_identity, author_role, created_at
+		FROM memory_supersessions
+		WHERE superseding_id = ? OR superseded_id = ?
+		ORDER BY created_at ASC
+	`
+	rows, err := s.db.QueryContext(ctx, query, nodeID, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []*SupersessionRecord
+	for rows.Next() {
+		var (
+			id, supersedingID, supersededID, rationale, advisoryRef, authorIdent, authorRole string
+			createdAtNano                                                                    int64
+		)
+		if err := rows.Scan(&id, &supersedingID, &supersededID, &rationale, &advisoryRef, &authorIdent, &authorRole, &createdAtNano); err != nil {
+			return nil, err
+		}
+		records = append(records, &SupersessionRecord{
+			ID:             id,
+			SupersedingID:  supersedingID,
+			SupersededID:   supersededID,
+			Rationale:      rationale,
+			AdvisoryRef:    advisoryRef,
+			AuthorIdentity: authorIdent,
+			AuthorRole:     authorRole,
+			CreatedAt:      time.Unix(0, createdAtNano),
+		})
+	}
+	return records, rows.Err()
+}
+
 // RecallSemantic performs vector similarity search over stored memory nodes.
 func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32, filter brain.MemoryFilter) ([]*brain.SearchResult, error) {
-	query := `SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash FROM memory_nodes WHERE 1=1`
+	query := "SELECT " + sqliteMemoryColumns + " FROM memory_nodes WHERE 1=1"
 	var args []interface{}
 
 	if filter.SessionID != "" {
@@ -430,6 +729,23 @@ func (s *SQLiteStore) RecallSemantic(ctx context.Context, queryVector []float32,
 	if filter.Status != "" {
 		query += " AND status = ?"
 		args = append(args, filter.Status)
+	}
+
+	// Epistemic Authority and Lifecycle Filters
+	if !filter.IncludeSuperseded {
+		if filter.LifecycleStatus != "" {
+			query += " AND lifecycle_status = ?"
+			args = append(args, filter.LifecycleStatus)
+		} else {
+			query += " AND (lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL)"
+		}
+	} else if filter.LifecycleStatus != "" {
+		query += " AND lifecycle_status = ?"
+		args = append(args, filter.LifecycleStatus)
+	}
+	if filter.AuthorityTier != "" {
+		query += " AND authority_tier = ?"
+		args = append(args, filter.AuthorityTier)
 	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -509,14 +825,7 @@ func (s *SQLiteStore) RecallEpisodic(ctx context.Context, sessionID string, limi
 	if limit <= 0 {
 		limit = 20
 	}
-	query := `
-	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
-	FROM memory_nodes
-	WHERE session_id = ?
-	ORDER BY created_at ASC
-	LIMIT ?;
-	`
+	query := "SELECT " + sqliteMemoryColumns + " FROM memory_nodes WHERE session_id = ? ORDER BY created_at ASC LIMIT ?;"
 	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
 	if err != nil {
 		return nil, err
@@ -632,6 +941,26 @@ func (s *SQLiteStore) RecallHybrid(ctx context.Context, query string, queryVecto
 			}
 		}
 
+		// Epistemic Authority and Lifecycle Filters
+		if !filter.IncludeSuperseded {
+			if filter.LifecycleStatus != "" {
+				if node.LifecycleStatus != filter.LifecycleStatus {
+					continue
+				}
+			} else {
+				if node.LifecycleStatus != "ACTIVE" && node.LifecycleStatus != "" {
+					continue
+				}
+			}
+		} else if filter.LifecycleStatus != "" {
+			if node.LifecycleStatus != filter.LifecycleStatus {
+				continue
+			}
+		}
+		if filter.AuthorityTier != "" && node.AuthorityTier != filter.AuthorityTier {
+			continue
+		}
+
 		var score float32
 		if rank, ok := vecRanks[id]; ok {
 			score += float32(1.0 / (k + float64(rank)))
@@ -662,11 +991,7 @@ func (s *SQLiteStore) RecallHybrid(ctx context.Context, query string, queryVecto
 }
 
 func (s *SQLiteStore) getNodeByID(ctx context.Context, id string) (*brain.MemoryNode, error) {
-	query := `
-	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
-	FROM memory_nodes WHERE id = ?
-	`
+	query := "SELECT " + sqliteMemoryColumns + " FROM memory_nodes WHERE id = ?"
 	return scanNode(s.db.QueryRowContext(ctx, query, id))
 }
 
@@ -680,13 +1005,7 @@ func (s *SQLiteStore) GetByDedupHash(ctx context.Context, dedupHash string) (*br
 	if dedupHash == "" {
 		return nil, sql.ErrNoRows
 	}
-	query := `
-	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
-	FROM memory_nodes
-	WHERE dedup_hash = ? AND status != 'resolved'
-	LIMIT 1
-	`
+	query := "SELECT " + sqliteMemoryColumns + " FROM memory_nodes WHERE dedup_hash = ? AND status != 'resolved' LIMIT 1"
 	return scanNode(s.db.QueryRowContext(ctx, query, dedupHash))
 }
 
@@ -695,13 +1014,7 @@ func (s *SQLiteStore) GetObservationsForParents(ctx context.Context, parentIDs [
 	if len(parentIDs) == 0 {
 		return nil, nil
 	}
-	query := `
-	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
-	FROM memory_nodes
-	WHERE derived = 1 AND status != 'resolved'
-	ORDER BY created_at DESC
-	`
+	query := "SELECT " + sqliteMemoryColumns + " FROM memory_nodes WHERE derived = 1 AND status != 'resolved' ORDER BY created_at DESC"
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -745,12 +1058,7 @@ func (s *SQLiteStore) ListObservations(ctx context.Context, sessionID string, le
 	if limit <= 0 {
 		limit = 50
 	}
-	query := `
-	SELECT id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
-	       derived, source_lens, parent_ids_json, severity, status, dedup_hash
-	FROM memory_nodes
-	WHERE derived = 1
-	`
+	query := "SELECT " + sqliteMemoryColumns + " FROM memory_nodes WHERE derived = 1"
 	var args []interface{}
 	if sessionID != "" {
 		query += " AND session_id = ?"

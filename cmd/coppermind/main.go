@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/capsule"
 	"github.com/bonjoski/coppermind/pkg/daemon"
@@ -112,6 +113,8 @@ func main() {
 		runHook(cmdArgs)
 	case "observations", "obs":
 		runObservations(cmdArgs)
+	case "proposals", "proposal":
+		runProposals(cmdArgs)
 	case "status":
 		runStatus(cmdArgs)
 	case "version", "--version", "-v":
@@ -149,6 +152,7 @@ Commands:
   doctor       Execute the 10-pillar diagnostic inspection suite
   hook         Manage Git post-commit capture and lens hooks (install, uninstall, status, check)
   observations List, filter, and resolve cognitive lens observations (alias: obs)
+  proposals    Review, approve, or reject quarantined memory proposals
   status       Display brain health metrics and stored memory counts
   version      Print version information
 
@@ -410,11 +414,16 @@ func runRemember(args []string) {
 	category := fs.String("category", "general", "Category (architecture, convention, decision, runbook)")
 	session := fs.String("session", "default", "Session or worktree identifier")
 	ttl := fs.Duration("ttl", 0, "Optional TTL (e.g. 24h, 30m) after which the memory expires")
+	supersedes := fs.String("supersedes", "", "UUID of previous memory node to supersede and tombstone")
+	rationale := fs.String("rationale", "", "Mandatory rationale when superseding an existing memory")
+	advisory := fs.String("advisory", "", "Advisory reference (e.g. ADR-042)")
+	role := fs.String("role", "", "Author role for epistemic validation (e.g. architect, product_owner, developer)")
+	author := fs.String("author", "", "Author identity (email, handle, or key thumbprint)")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: content is required\nUsage: coppermind remember [--category <cat>] <content>\n")
+		fmt.Fprintf(os.Stderr, "Error: content is required\nUsage: coppermind remember [--category <cat>] [--supersedes <id>] <content>\n")
 		os.Exit(1)
 	}
 	content := strings.Join(rest, " ")
@@ -426,12 +435,60 @@ func runRemember(args []string) {
 	}
 	defer mgr.Close()
 
+	authorRole := strings.TrimSpace(*role)
+	if authorRole == "" {
+		if *category == "architecture" || *category == "convention" {
+			authorRole = "developer"
+		} else {
+			authorRole = "contributor"
+		}
+	}
+	authorID := strings.TrimSpace(*author)
+	if authorID == "" {
+		authorID = os.Getenv("USER")
+		if authorID == "" {
+			authorID = "local-operator"
+		}
+	}
+
+	enforcer := authz.NewDefaultPolicyEnforcer()
+	claims := authz.SubjectClaims{
+		Subject: authorID,
+		Role:    authorRole,
+	}
+
+	writeReq := authz.MemoryWriteRequest{
+		Category:     *category,
+		Content:      content,
+		SupersedesID: supersedes,
+		Rationale:    *rationale,
+		AdvisoryRef:  *advisory,
+	}
+
+	tier, status, authErr := enforcer.AuthorizeWrite(context.Background(), claims, writeReq)
+	if authErr != nil && status == authz.StatusRejected {
+		fmt.Fprintf(os.Stderr, "Error: %v (role %q cannot write category %q)\n", authErr, authorRole, *category)
+		os.Exit(43)
+	}
+
+	if *supersedes != "" && *rationale == "" {
+		fmt.Fprintf(os.Stderr, "Error: --rationale is required when superseding an existing memory node\n")
+		os.Exit(1)
+	}
+
 	node, err := mgr.Remember(context.Background(), brain.RememberRequest{
-		SessionID:  *session,
-		Category:   *category,
-		Content:    content,
-		Provenance: brain.ProvenanceLocalWorkspace,
-		TTL:        *ttl,
+		SessionID:       *session,
+		Category:        *category,
+		Content:         content,
+		Provenance:      brain.ProvenanceLocalWorkspace,
+		TTL:             *ttl,
+		AuthorityTier:   authz.TierToString(tier),
+		LifecycleStatus: string(status),
+		AuthorIdentity:  authorID,
+		AuthorRole:      authorRole,
+		SupersedesID:    *supersedes,
+		Rationale:       *rationale,
+		AdvisoryRef:     *advisory,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error storing memory: %v\n", err)
@@ -442,7 +499,17 @@ func runRemember(args []string) {
 	if node.ExpiresAt != nil {
 		expMsg = fmt.Sprintf(" (expires %s)", node.ExpiresAt.Format("2006-01-02 15:04"))
 	}
-	fmt.Printf("✓ Stored memory [%s] in vault %q [%s]%s: %s\n", node.ID, activeProj, node.Category, expMsg, node.Content)
+
+	if status == authz.StatusProposed {
+		fmt.Printf("⚠ Write intercepted: role %q lacks authority for %s. Quarantined as PROPOSED observation [%s] in vault %q: %s\n",
+			authorRole, node.AuthorityTier, node.ID, activeProj, node.Content)
+	} else if *supersedes != "" {
+		fmt.Printf("✓ Stored memory [%s] in vault %q (superseded [%s], %s)%s: %s\n",
+			node.ID, activeProj, *supersedes, node.AuthorityTier, expMsg, node.Content)
+	} else {
+		fmt.Printf("✓ Stored memory [%s] in vault %q [%s | %s]%s: %s\n",
+			node.ID, activeProj, node.AuthorityTier, node.Category, expMsg, node.Content)
+	}
 }
 
 func runRecall(args []string) {
@@ -458,6 +525,8 @@ func runRecall(args []string) {
 	hybrid := fs.Bool("hybrid", true, "Use hybrid FTS5 BM25 + vector RRF search (default true)")
 	lensName := fs.String("lens", "", "Filter recall to observations from a specific lens (e.g. security-architect, systems-architect)")
 	includeObs := fs.Bool("include-observations", true, "Auto-attach linked cognitive lens observations to primary recalled memories")
+	includeSuperseded := fs.Bool("include-superseded", false, "Include superseded historical memories in query results")
+	tier := fs.String("tier", "", "Filter by specific authority tier (e.g. TIER_1_ARCHITECTURE)")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
@@ -485,6 +554,8 @@ func runRecall(args []string) {
 		GitBranch:           *branch,
 		SourceLens:          *lensName,
 		IncludeObservations: *includeObs,
+		IncludeSuperseded:   *includeSuperseded,
+		AuthorityTier:       *tier,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error recalling memory: %v\n", err)
@@ -502,8 +573,8 @@ func runRecall(args []string) {
 	}
 	fmt.Printf("Found %d matching memories (%s) in vault %q for %q:\n\n", len(results), mode, activeProj, query)
 	for i, r := range results {
-		fmt.Printf("%d. [Score: %.3f] [%s | %s]\n   %s\n",
-			i+1, r.Score, r.Node.Category, r.Node.SessionID, r.Node.Content)
+		fmt.Printf("%d. [Score: %.3f] [%s | %s | %s]\n   %s\n",
+			i+1, r.Score, r.Node.AuthorityTier, r.Node.Category, r.Node.SessionID, r.Node.Content)
 		if len(r.Observations) > 0 {
 			fmt.Printf("   ↳ Linked Observations (%d):\n", len(r.Observations))
 			for _, obs := range r.Observations {
@@ -1317,6 +1388,126 @@ func runConfig(args []string) {
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown config subcommand: %s. Use 'get', 'set', or no arguments to list.\n", rest[0])
+		os.Exit(1)
+	}
+}
+
+func runProposals(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage: coppermind proposals <list|approve|reject> [id]")
+		os.Exit(1)
+	}
+
+	action := args[0]
+	fs := flag.NewFlagSet("proposals "+action, flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Target project vault")
+	category := fs.String("category", "", "Optional category filter")
+	_ = fs.Parse(args[1:])
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	switch action {
+	case "list", "ls":
+		results, err := mgr.Recall(ctx, brain.RecallRequest{
+			Query:             "*",
+			Category:          *category,
+			IncludeSuperseded: true,
+			LifecycleStatus:   string(authz.StatusProposed),
+			Limit:             50,
+			MinScore:          0.0,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error listing proposals: %v\n", err)
+			os.Exit(1)
+		}
+		if len(results) == 0 {
+			fmt.Printf("No pending memory proposals found in vault %q.\n", activeProj)
+			return
+		}
+		fmt.Printf("Pending Memory Proposals in vault %q (%d):\n\n", activeProj, len(results))
+		for i, r := range results {
+			author := r.Node.AuthorIdentity
+			if author == "" {
+				author = "anonymous"
+			}
+			role := r.Node.AuthorRole
+			if role == "" {
+				role = "unknown"
+			}
+			supMsg := ""
+			if r.Node.SupersedesID != "" {
+				supMsg = fmt.Sprintf(" [Supersedes: %s]", r.Node.SupersedesID)
+			}
+			fmt.Printf("%d. [%s] [%s | %s]%s\n   Author: %s (%s)\n   Content: %s\n",
+				i+1, r.Node.ID, r.Node.AuthorityTier, r.Node.Category, supMsg, author, role, r.Node.Content)
+			if r.Node.Rationale != "" {
+				fmt.Printf("   Rationale: %s\n", r.Node.Rationale)
+			}
+			fmt.Println()
+		}
+
+	case "approve":
+		rest := fs.Args()
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: proposal ID required\nUsage: coppermind proposals approve <id>\n")
+			os.Exit(1)
+		}
+		id := rest[0]
+		node, err := mgr.Store().GetByID(ctx, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error fetching proposal %q: %v\n", id, err)
+			os.Exit(1)
+		}
+		if node.LifecycleStatus != string(authz.StatusProposed) && node.LifecycleStatus != "PROPOSED" {
+			fmt.Fprintf(os.Stderr, "Warning: node %s has status %q (not PROPOSED)\n", id, node.LifecycleStatus)
+		}
+		node.LifecycleStatus = string(authz.StatusActive)
+		node.UpdatedAt = time.Now()
+		if err := mgr.Store().Store(ctx, node); err != nil {
+			fmt.Fprintf(os.Stderr, "Error approving proposal: %v\n", err)
+			os.Exit(1)
+		}
+		if node.SupersedesID != "" {
+			target, err := mgr.Store().GetByID(ctx, node.SupersedesID)
+			if err == nil && target != nil {
+				target.LifecycleStatus = string(authz.StatusSuperseded)
+				target.SupersededByID = node.ID
+				target.UpdatedAt = time.Now()
+				_ = mgr.Store().Store(ctx, target)
+			}
+		}
+		fmt.Printf("✓ Approved proposal [%s] in vault %q (promoted to ACTIVE %s)\n", node.ID, activeProj, node.AuthorityTier)
+
+	case "reject":
+		rest := fs.Args()
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: proposal ID required\nUsage: coppermind proposals reject <id>\n")
+			os.Exit(1)
+		}
+		id := rest[0]
+		node, err := mgr.Store().GetByID(ctx, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error fetching proposal %q: %v\n", id, err)
+			os.Exit(1)
+		}
+		node.LifecycleStatus = string(authz.StatusRejected)
+		node.UpdatedAt = time.Now()
+		if err := mgr.Store().Store(ctx, node); err != nil {
+			fmt.Fprintf(os.Stderr, "Error rejecting proposal: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Rejected proposal [%s] in vault %q (status: REJECTED)\n", node.ID, activeProj)
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown proposals subcommand %q. Usage: coppermind proposals <list|approve|reject> [id]\n", action)
 		os.Exit(1)
 	}
 }
