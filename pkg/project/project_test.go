@@ -215,3 +215,41 @@ func TestADV_ProjectVaultCrossContaminationIsolation(t *testing.T) {
 		}
 	}
 }
+
+func TestConfig_PersistenceAndPreservation(t *testing.T) {
+	tmpDir := t.TempDir()
+	pm := project.NewManager(tmpDir)
+
+	initialCfg := project.Config{
+		Provider: "gemini",
+		Model:    "gemini-3.5-flash-lite",
+		Endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
+	}
+
+	if err := pm.SaveConfig(initialCfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	// Update current project
+	if err := pm.SetCurrentProject("github"); err != nil {
+		t.Fatalf("SetCurrentProject failed: %v", err)
+	}
+
+	loaded, err := pm.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	if loaded.CurrentProject != "github" {
+		t.Errorf("expected CurrentProject 'github', got %q", loaded.CurrentProject)
+	}
+	if loaded.Provider != "gemini" {
+		t.Errorf("expected Provider 'gemini' preserved, got %q", loaded.Provider)
+	}
+	if loaded.Model != "gemini-3.5-flash-lite" {
+		t.Errorf("expected Model 'gemini-3.5-flash-lite' preserved, got %q", loaded.Model)
+	}
+	if loaded.Endpoint != "https://generativelanguage.googleapis.com/v1beta/openai" {
+		t.Errorf("expected Endpoint preserved, got %q", loaded.Endpoint)
+	}
+}

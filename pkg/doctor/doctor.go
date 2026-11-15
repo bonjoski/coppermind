@@ -193,10 +193,32 @@ func RunDiagnostics(ctx context.Context, dataDir string) []PillarResult {
 
 	// Pillar 8: LiteLLM Model Router
 	start = time.Now()
+	pm := project.NewManager(os.Getenv("COPPERMIND_DATA_DIR"))
+	cfg, _ := pm.LoadConfig()
+
+	activeProvider := strings.ToLower(strings.TrimSpace(os.Getenv("COPPERMIND_PROVIDER")))
+	if activeProvider == "" {
+		activeProvider = strings.ToLower(strings.TrimSpace(cfg.Provider))
+	}
+	activeModel := os.Getenv("COPPERMIND_MODEL")
+	if activeModel == "" {
+		activeModel = cfg.Model
+	}
+
+	routerMsg := "Multi-provider model gateway operational (with offline fallback reflection)"
+	if activeProvider == "gemini" {
+		if activeModel == "" {
+			activeModel = "gemini-3.5-flash-lite"
+		}
+		routerMsg = fmt.Sprintf("Gemini model router operational (%s via Google Generative AI)", activeModel)
+	} else if activeModel != "" {
+		routerMsg = fmt.Sprintf("Model router operational (model: %s)", activeModel)
+	}
+
 	results = append(results, PillarResult{
 		Name:    "8. LiteLLM Model Router",
 		Status:  StatusPass,
-		Message: "Multi-provider model gateway operational (with offline fallback reflection)",
+		Message: routerMsg,
 		Latency: time.Since(start),
 	})
 
@@ -424,10 +446,32 @@ func runClusterDiagnostics(ctx context.Context) []PillarResult {
 
 	// Pillar 8: LiteLLM Model Router
 	start = time.Now()
+	pm := project.NewManager(os.Getenv("COPPERMIND_DATA_DIR"))
+	cfg, _ := pm.LoadConfig()
+
+	activeProvider := strings.ToLower(strings.TrimSpace(os.Getenv("COPPERMIND_PROVIDER")))
+	if activeProvider == "" {
+		activeProvider = strings.ToLower(strings.TrimSpace(cfg.Provider))
+	}
+	activeModel := os.Getenv("COPPERMIND_MODEL")
+	if activeModel == "" {
+		activeModel = cfg.Model
+	}
+
+	routerMsg := "Multi-provider model gateway operational (with offline fallback reflection)"
+	if activeProvider == "gemini" {
+		if activeModel == "" {
+			activeModel = "gemini-3.5-flash-lite"
+		}
+		routerMsg = fmt.Sprintf("Gemini model router operational (%s via Google Generative AI)", activeModel)
+	} else if activeModel != "" {
+		routerMsg = fmt.Sprintf("Model router operational (model: %s)", activeModel)
+	}
+
 	results = append(results, PillarResult{
 		Name:    "8. LiteLLM Model Router",
 		Status:  StatusPass,
-		Message: "Multi-provider model gateway operational (with offline fallback reflection)",
+		Message: routerMsg,
 		Latency: time.Since(start),
 	})
 

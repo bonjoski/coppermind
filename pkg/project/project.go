@@ -16,7 +16,11 @@ var validProjectNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]{1,64}$`)
 
 // Config models the top-level Coppermind user configuration.
 type Config struct {
-	CurrentProject string `json:"current_project"`
+	CurrentProject string `json:"current_project,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	Endpoint       string `json:"endpoint,omitempty"`
+	APIKey         string `json:"api_key,omitempty"`
 }
 
 // ProjectInfo provides metadata regarding an isolated cognitive vault.
@@ -192,12 +196,17 @@ func (m *Manager) SetCurrentProject(name string) error {
 	// Ensure vault directory exists
 	_, _ = m.CreateProject(name)
 
-	cfg := Config{CurrentProject: name}
+	cfg, _ := m.LoadConfig()
+	cfg.CurrentProject = name
+	return m.SaveConfig(cfg)
+}
+
+// SaveConfig writes config.json preserving file mode 0600.
+func (m *Manager) SaveConfig(cfg Config) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-
 	return os.WriteFile(filepath.Join(m.rootDataDir, "config.json"), data, 0600)
 }
 
@@ -207,6 +216,9 @@ func (m *Manager) LoadConfig() (Config, error) {
 	cfgPath := filepath.Join(m.rootDataDir, "config.json")
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
 		return cfg, err
 	}
 	err = json.Unmarshal(data, &cfg)

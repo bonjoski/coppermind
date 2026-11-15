@@ -104,6 +104,8 @@ func main() {
 		runVacuum(cmdArgs)
 	case "project", "projects":
 		runProject(cmdArgs)
+	case "config":
+		runConfig(cmdArgs)
 	case "doctor":
 		runDoctor(cmdArgs)
 	case "hook":
@@ -143,6 +145,7 @@ Commands:
   verify       Audit cryptographic Merkle chain integrity for a session
   vacuum       Purge expired TTL memories and compact SQLite storage
   project      Manage isolated vaults (list, use, create, delete)
+  config       Display or update persistent configuration (provider, model, endpoint)
   doctor       Execute the 10-pillar diagnostic inspection suite
   hook         Manage Git post-commit capture and lens hooks (install, uninstall, status, check)
   observations List, filter, and resolve cognitive lens observations (alias: obs)
@@ -241,11 +244,59 @@ func initBroker() (queue.Broker, error) {
 }
 
 func initRouter() router.ModelRouter {
-	endpoint := os.Getenv("COPPERMIND_LITELLM_URL")
-	model := os.Getenv("COPPERMIND_MODEL")
-	apiKey := os.Getenv("COPPERMIND_API_KEY")
+	dataDir := os.Getenv("COPPERMIND_DATA_DIR")
+	pm := project.NewManager(dataDir)
+	cfg, _ := pm.LoadConfig()
 
-	// If OpenAI / Gemini keys are in ambient environment
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("COPPERMIND_PROVIDER")))
+	if provider == "" && cfg.Provider != "" {
+		provider = strings.ToLower(strings.TrimSpace(cfg.Provider))
+	}
+
+	endpoint := os.Getenv("COPPERMIND_LITELLM_URL")
+	if endpoint == "" && cfg.Endpoint != "" {
+		endpoint = cfg.Endpoint
+	}
+
+	model := os.Getenv("COPPERMIND_MODEL")
+	if model == "" && cfg.Model != "" {
+		model = cfg.Model
+	}
+
+	apiKey := os.Getenv("COPPERMIND_API_KEY")
+	if apiKey == "" && cfg.APIKey != "" {
+		apiKey = cfg.APIKey
+	}
+
+	ks := keystore.NewLocksmithKeystore()
+
+	// If Gemini is explicitly configured or selected
+	if provider == "gemini" {
+		if apiKey == "" {
+			apiKey = os.Getenv("GEMINI_API_KEY")
+			if apiKey == "" {
+				apiKey = os.Getenv("GEMINI-API-KEY")
+			}
+		}
+		if apiKey == "" {
+			apiKey, _ = ks.GetSecret(context.Background(), "GEMINI-API-KEY")
+			if apiKey == "" {
+				apiKey, _ = ks.GetSecret(context.Background(), "GEMINI_API_KEY")
+			}
+		}
+		if endpoint == "" {
+			endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
+		}
+		if model == "" {
+			model = "gemini-3.5-flash-lite"
+		}
+		if apiKey == "" && endpoint == "" {
+			return router.NewLiteLLMRouter("", "")
+		}
+		return router.NewLiteLLMRouterWithModel(endpoint, apiKey, model)
+	}
+
+	// Multi-provider ambient / fallback:
 	if apiKey == "" {
 		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
@@ -267,19 +318,18 @@ func initRouter() router.ModelRouter {
 	}
 
 	if apiKey == "" {
-		ks := keystore.NewLocksmithKeystore()
-		apiKey, _ = ks.GetSecret(context.Background(), "OPENAI_API_KEY")
+		// Prioritize Gemini in Locksmith to leverage active biometric lease and avoid prompt stalls
+		apiKey, _ = ks.GetSecret(context.Background(), "GEMINI-API-KEY")
 		if apiKey == "" {
-			apiKey, _ = ks.GetSecret(context.Background(), "GEMINI-API-KEY")
-			if apiKey == "" {
-				apiKey, _ = ks.GetSecret(context.Background(), "GEMINI_API_KEY")
+			apiKey, _ = ks.GetSecret(context.Background(), "GEMINI_API_KEY")
+		}
+		if apiKey != "" && endpoint == "" {
+			endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
+			if model == "" {
+				model = "gemini-3.5-flash-lite"
 			}
-			if apiKey != "" && endpoint == "" {
-				endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
-				if model == "" {
-					model = "gemini-3.5-flash-lite"
-				}
-			}
+		} else if apiKey == "" {
+			apiKey, _ = ks.GetSecret(context.Background(), "OPENAI_API_KEY")
 		}
 	}
 
@@ -1176,4 +1226,97 @@ func runStatus(args []string) {
 	fmt.Printf("• Total Stored Memories: %s\n", strconv.Itoa(total))
 	fmt.Println("• Embedding Engine: 128-dim FastText-style Subword/N-Gram Hashing")
 	fmt.Println("• Interface: Model Context Protocol (MCP) over STDIO")
+}
+
+func runConfig(args []string) {
+	fs := flag.NewFlagSet("config", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	_ = fs.Parse(args)
+
+	rest := fs.Args()
+	pm := project.NewManager(*dataDir)
+
+	if len(rest) == 0 || rest[0] == "list" || (rest[0] == "get" && len(rest) == 1) {
+		cfg, err := pm.LoadConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Coppermind Configuration:")
+		proj := cfg.CurrentProject
+		if proj == "" {
+			proj = "github (default)"
+		}
+		fmt.Printf("  Active Project : %s\n", proj)
+		provider := cfg.Provider
+		if provider == "" {
+			provider = "gemini (default)"
+		}
+		fmt.Printf("  Model Provider : %s\n", provider)
+		model := cfg.Model
+		if model == "" {
+			model = "gemini-3.5-flash-lite (default)"
+		}
+		fmt.Printf("  Model Name     : %s\n", model)
+		endpoint := cfg.Endpoint
+		if endpoint == "" {
+			endpoint = "https://generativelanguage.googleapis.com/v1beta/openai (default)"
+		}
+		fmt.Printf("  Endpoint       : %s\n", endpoint)
+		return
+	}
+
+	switch rest[0] {
+	case "get":
+		if len(rest) < 2 {
+			fmt.Println("Usage: coppermind config get <key>")
+			os.Exit(1)
+		}
+		cfg, _ := pm.LoadConfig()
+		key := strings.ToLower(strings.TrimSpace(rest[1]))
+		switch key {
+		case "provider":
+			fmt.Println(cfg.Provider)
+		case "model":
+			fmt.Println(cfg.Model)
+		case "endpoint":
+			fmt.Println(cfg.Endpoint)
+		case "project", "current_project":
+			fmt.Println(cfg.CurrentProject)
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown configuration key: %s\n", key)
+			os.Exit(1)
+		}
+
+	case "set":
+		if len(rest) < 3 {
+			fmt.Println("Usage: coppermind config set <key> <value>")
+			os.Exit(1)
+		}
+		cfg, _ := pm.LoadConfig()
+		key := strings.ToLower(strings.TrimSpace(rest[1]))
+		val := strings.TrimSpace(rest[2])
+		switch key {
+		case "provider":
+			cfg.Provider = val
+		case "model":
+			cfg.Model = val
+		case "endpoint":
+			cfg.Endpoint = val
+		case "project", "current_project":
+			cfg.CurrentProject = val
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown configuration key: %s\n", key)
+			os.Exit(1)
+		}
+		if err := pm.SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to save configuration: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Set %s = %s in config.json\n", key, val)
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown config subcommand: %s. Use 'get', 'set', or no arguments to list.\n", rest[0])
+		os.Exit(1)
+	}
 }
