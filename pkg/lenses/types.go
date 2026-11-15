@@ -27,6 +27,7 @@ type ReflectRequest struct {
 	CrossVault     bool                `json:"cross_vault"`
 	Project        string              `json:"project"`
 	SessionID      string              `json:"session_id"`
+	Limit          int                 `json:"limit,omitempty"`
 	CandidateNodes []*brain.MemoryNode `json:"candidate_nodes,omitempty"`
 }
 

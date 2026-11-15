@@ -270,26 +270,50 @@ func (e *Engine) Reflect(ctx context.Context, req ReflectRequest) (*ReflectResul
 	// Fetch candidates if not provided
 	candidates := req.CandidateNodes
 	if len(candidates) == 0 && e.manager != nil {
-		// Recall recent canonical memories
-		limit := 25
+		limit := req.Limit
+		if limit <= 0 {
+			limit = 100
+		}
 		falseDerived := false
+
+		// 1. Episodic recall across memories
+		episodic, err := e.manager.Store().RecallEpisodic(ctx, req.SessionID, limit)
+		if err == nil {
+			now := time.Now()
+			for _, n := range episodic {
+				if n.Derived {
+					continue
+				}
+				if req.Since > 0 && now.Sub(n.CreatedAt) > req.Since {
+					continue
+				}
+				candidates = append(candidates, n)
+			}
+		}
+
+		// 2. Semantic recall across key architectural and security concepts
 		recalled, err := e.manager.Recall(ctx, brain.RecallRequest{
 			SessionID: req.SessionID,
-			Query:     "architecture security pattern convention decision",
+			Query:     "architecture security pattern convention decision vulnerability failure invariant",
 			Limit:     limit,
 			Derived:   &falseDerived,
 			MinScore:  0.0,
 		})
 		if err == nil {
+			seen := make(map[string]bool)
+			for _, c := range candidates {
+				seen[c.ID] = true
+			}
 			now := time.Now()
 			for _, r := range recalled {
-				if r.Node.Derived {
+				if r.Node.Derived || seen[r.Node.ID] {
 					continue
 				}
 				if req.Since > 0 && now.Sub(r.Node.CreatedAt) > req.Since {
 					continue
 				}
 				candidates = append(candidates, r.Node)
+				seen[r.Node.ID] = true
 			}
 		}
 	}

@@ -251,10 +251,13 @@ func initRouter() router.ModelRouter {
 	}
 	if apiKey == "" {
 		apiKey = os.Getenv("GEMINI_API_KEY")
+		if apiKey == "" {
+			apiKey = os.Getenv("GEMINI-API-KEY")
+		}
 		if apiKey != "" && endpoint == "" {
 			endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
 			if model == "" {
-				model = "gemini-2.5-flash"
+				model = "gemini-3.5-flash-lite"
 			}
 		}
 	}
@@ -263,14 +266,26 @@ func initRouter() router.ModelRouter {
 		endpoint = os.Getenv("OPENAI_BASE_URL")
 	}
 
-	if endpoint == "" && apiKey == "" {
-		// Offline fallback reflection mode; does not query keystore or prompt Touch ID
-		return router.NewLiteLLMRouter("", "")
-	}
-
 	if apiKey == "" {
 		ks := keystore.NewLocksmithKeystore()
 		apiKey, _ = ks.GetSecret(context.Background(), "OPENAI_API_KEY")
+		if apiKey == "" {
+			apiKey, _ = ks.GetSecret(context.Background(), "GEMINI-API-KEY")
+			if apiKey == "" {
+				apiKey, _ = ks.GetSecret(context.Background(), "GEMINI_API_KEY")
+			}
+			if apiKey != "" && endpoint == "" {
+				endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
+				if model == "" {
+					model = "gemini-3.5-flash-lite"
+				}
+			}
+		}
+	}
+
+	if endpoint == "" && apiKey == "" {
+		// Offline fallback reflection mode; does not query keystore or prompt Touch ID
+		return router.NewLiteLLMRouter("", "")
 	}
 
 	return router.NewLiteLLMRouterWithModel(endpoint, apiKey, model)
@@ -498,7 +513,7 @@ func runScratchpad(args []string) {
 
 func runDispatch(args []string) {
 	fs := flag.NewFlagSet("dispatch", flag.ExitOnError)
-	session := fs.String("session", "default", "Target session or worktree")
+	session := fs.String("session", "", "Target session or worktree (default all)")
 	dataDir := fs.String("data-dir", "", "Data directory")
 	project := fs.String("project", "", "Target project vault")
 	_ = fs.Parse(args)
@@ -531,13 +546,14 @@ func runDispatch(args []string) {
 	// Special handling for dispatch reflect
 	if taskType == "reflect" {
 		rfs := flag.NewFlagSet("reflect", flag.ExitOnError)
-		lensName := rfs.String("lens", "all", "Target lens to execute (e.g. security-architect, systems-architect, drift-auditor, synthesizer, or all)")
-		sinceStr := rfs.String("since", "24h", "Time window for candidate memories (e.g. 1h, 24h, 7d)")
+		lensName := rfs.String("lens", "all", "Target lens to execute (e.g. security-architect, systems-architect, drift-auditor, synthesizer, devils-advocate, or all)")
+		sinceStr := rfs.String("since", "0", "Time window for candidate memories (e.g. 1h, 24h, 7d, or 0 for all)")
+		limit := rfs.Int("limit", 100, "Maximum candidate memories to evaluate")
 		crossVault := rfs.Bool("cross-vault", false, "Execute across project vaults")
 		_ = rfs.Parse(rest[1:])
 
 		var sinceDur time.Duration
-		if *sinceStr != "" {
+		if *sinceStr != "" && *sinceStr != "0" && *sinceStr != "all" {
 			sinceDur, _ = time.ParseDuration(*sinceStr)
 			if sinceDur == 0 && strings.HasSuffix(*sinceStr, "d") {
 				days, _ := strconv.Atoi(strings.TrimSuffix(*sinceStr, "d"))
@@ -558,13 +574,14 @@ func runDispatch(args []string) {
 		}
 		defer cw.Stop()
 
-		fmt.Printf("Executing Cognitive Lens reflection (--lens %s, --since %s) in vault %q...\n", *lensName, *sinceStr, activeProj)
+		fmt.Printf("Executing Cognitive Lens reflection (--lens %s, --since %s, limit=%d) in vault %q...\n", *lensName, *sinceStr, *limit, activeProj)
 		res, err := engine.Reflect(ctx, lenses.ReflectRequest{
 			Lens:       *lensName,
 			Since:      sinceDur,
 			CrossVault: *crossVault,
 			Project:    activeProj,
 			SessionID:  *session,
+			Limit:      *limit,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Reflection failed: %v\n", err)

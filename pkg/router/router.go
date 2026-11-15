@@ -78,12 +78,15 @@ func NewLiteLLMRouterWithModel(endpoint, apiKey, defaultModel string) *LiteLLMRo
 
 // Complete dispatches a completion request with outbound credential error scrubbing.
 func (r *LiteLLMRouter) Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
-	if req.Model == "" {
-		req.Model = "default"
+	modelToUse := req.Model
+	if r.defaultModel != "" && r.defaultModel != "default" {
+		modelToUse = r.defaultModel
+	} else if modelToUse == "" {
+		modelToUse = "default"
 	}
 
 	payload := map[string]interface{}{
-		"model":       req.Model,
+		"model":       modelToUse,
 		"messages":    req.Messages,
 		"temperature": req.Temperature,
 	}
