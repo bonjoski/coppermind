@@ -569,3 +569,93 @@ func TestLenses_EndToEnd_ReflectAndRecall(t *testing.T) {
 		t.Errorf("expected status 'resolved', got %s", updatedObs.Status)
 	}
 }
+
+// TestLenses_DevilsAdvocate verifies that the devils-advocate lens properly
+// triggers on architectural decision memories and produces counterargument observations.
+func TestLenses_DevilsAdvocate(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "devils_advocate.db")
+
+	store, err := sqlite.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer store.Close()
+
+	embedder := embedding.NewLocalHashEmbedder(128)
+	sp := scratchpad.NewMemoryScratchpad()
+	mgr := brain.NewManager(store, embedder, sp)
+
+	cfg := lenses.DefaultConfig()
+	lens, ok := cfg.GetLens("devils-advocate")
+	if !ok || lens == nil {
+		t.Fatalf("devils-advocate lens not found in DefaultConfig")
+	}
+
+	// 1. Verify prefilter regex matches architectural decisions and assumptions
+	decisionContent := "Decision: We assume network partition latency will always be <5ms with zero failover node needed."
+	if !lens.MatchesPrefilter(decisionContent) {
+		t.Fatalf("expected prefilter to match decision content")
+	}
+
+	benignCode := "x := 1 + 2"
+	if lens.MatchesPrefilter(benignCode) {
+		t.Fatalf("expected prefilter to skip benign non-decision code")
+	}
+
+	// 2. Mock model router returning counterargument
+	mockR := &mockRouter{
+		completeFunc: func(ctx context.Context, req *router.CompletionRequest) (*router.CompletionResponse, error) {
+			return &router.CompletionResponse{
+				Content: `{
+					"findings": [
+						{
+							"severity": "high",
+							"category": "counterargument",
+							"summary": "Single point of failure and partition vulnerability: zero failover guarantee violates high availability SLAs",
+							"evidence": "We assume network partition latency will always be <5ms with zero failover node needed."
+						}
+					]
+				}`,
+			}, nil
+		},
+	}
+
+	broker := queue.NewEmbeddedBroker(100)
+	defer broker.Close()
+
+	engine := lenses.NewEngine(cfg, broker, mgr, mockR, "default", nil)
+
+	// Ingest decision memory
+	node, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID: "adr-session",
+		Category:  "decision",
+		Content:   decisionContent,
+	})
+	if err != nil {
+		t.Fatalf("failed to remember decision: %v", err)
+	}
+
+	// Run reflection for devils-advocate lens
+	res, err := engine.Reflect(ctx, lenses.ReflectRequest{
+		Lens:       "devils-advocate",
+		Project:    "default",
+		CrossVault: false,
+	})
+	if err != nil {
+		t.Fatalf("reflect failed: %v", err)
+	}
+
+	if len(res.Observations) != 1 {
+		t.Fatalf("expected 1 observation from devils-advocate, got %d", len(res.Observations))
+	}
+
+	obs := res.Observations[0]
+	if obs.SourceLens != "devils-advocate" || obs.Severity != "high" {
+		t.Errorf("observation mismatch: lens=%s, sev=%s", obs.SourceLens, obs.Severity)
+	}
+	if len(obs.ParentIDs) == 0 || obs.ParentIDs[0] != node.ID {
+		t.Errorf("expected parent ID %s, got %v", node.ID, obs.ParentIDs)
+	}
+}

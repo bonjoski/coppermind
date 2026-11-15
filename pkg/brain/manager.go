@@ -220,7 +220,7 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 	// Loop Prevention Invariant: Records with derived=true MUST NOT emit ingest.* or episodic.* events
 	if !node.Derived && m.eventHook != nil {
 		m.eventHook(ctx, fmt.Sprintf("ingest.%s", node.Category), node)
-		if node.Category == "commit" || (metadata != nil && metadata["git_commit"] != "") {
+		if node.Category == "commit" || node.Category == "git_commit" || (metadata != nil && metadata["git_commit"] != "") {
 			m.eventHook(ctx, "episodic.commit", node)
 		}
 	}

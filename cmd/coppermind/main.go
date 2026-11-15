@@ -108,6 +108,8 @@ func main() {
 		runDoctor(cmdArgs)
 	case "hook":
 		runHook(cmdArgs)
+	case "observations", "obs":
+		runObservations(cmdArgs)
 	case "status":
 		runStatus(cmdArgs)
 	case "version", "--version", "-v":
@@ -142,7 +144,8 @@ Commands:
   vacuum       Purge expired TTL memories and compact SQLite storage
   project      Manage isolated vaults (list, use, create, delete)
   doctor       Execute the 10-pillar diagnostic inspection suite
-  hook         Install automated git hooks (e.g. post-commit episodic capture)
+  hook         Manage Git post-commit capture and lens hooks (install, uninstall, status, check)
+  observations List, filter, and resolve cognitive lens observations (alias: obs)
   status       Display brain health metrics and stored memory counts
   version      Print version information
 
@@ -908,7 +911,7 @@ func runDoctor(args []string) {
 
 func runHook(args []string) {
 	if len(args) < 1 {
-		fmt.Println("Usage: coppermind hook <install|uninstall|status> [--repo <path>]")
+		fmt.Println("Usage: coppermind hook <install|uninstall|status|check> [--repo <path>]")
 		os.Exit(1)
 	}
 
@@ -942,10 +945,102 @@ func runHook(args []string) {
 		} else {
 			fmt.Printf("• Coppermind episodic git hook is NOT installed in %s\n", *repo)
 		}
+	case "check":
+		repoRoot := *repo
+		mgr, activeProj, err := initManager("", "")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening vault: %v\n", err)
+			os.Exit(1)
+		}
+		defer mgr.Close()
+
+		repoName := filepath.Base(repoRoot)
+		obs, err := mgr.ListObservations(context.Background(), repoName, "", "open", "high", 10)
+		if err != nil || len(obs) == 0 {
+			obs, _ = mgr.ListObservations(context.Background(), "", "", "open", "high", 10)
+		}
+
+		if len(obs) == 0 {
+			fmt.Printf("✓ No unresolved high or critical observations in vault %q.\n", activeProj)
+		} else {
+			fmt.Printf("⚠️  Found %d unresolved high/critical observations in vault %q:\n", len(obs), activeProj)
+			for _, o := range obs {
+				firstLine := strings.Split(o.Content, "\n")[0]
+				fmt.Printf("  • [%s] %s: %s (ID: %s)\n", strings.ToUpper(o.Severity), o.SourceLens, firstLine, o.ID)
+			}
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown hook action: %q. Expected 'install', 'uninstall', or 'status'\n", action)
+		fmt.Fprintf(os.Stderr, "Unknown hook action: %q. Expected 'install', 'uninstall', 'status', or 'check'\n", action)
 		os.Exit(1)
 	}
+}
+
+func runObservations(args []string) {
+	fs := flag.NewFlagSet("observations", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory for database files")
+	project := fs.String("project", "", "Target project vault (e.g. github, personal, work)")
+	session := fs.String("session", "", "Filter by session or worktree")
+	lens := fs.String("lens", "", "Filter by source lens (e.g. security-architect, devils-advocate)")
+	status := fs.String("status", "open", "Filter by status: open, resolved, or all")
+	minSev := fs.String("min-severity", "", "Minimum severity filter: info, low, medium, high, critical")
+	resolveID := fs.String("resolve", "", "Mark an observation ID as resolved")
+	limit := fs.Int("limit", 50, "Maximum observations to display")
+	_ = fs.Parse(args)
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	if *resolveID != "" {
+		if err := mgr.ResolveObservation(ctx, *resolveID); err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving observation %s: %v\n", *resolveID, err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Successfully resolved observation %s in vault %s\n", *resolveID, activeProj)
+		return
+	}
+
+	filterStatus := *status
+	if filterStatus == "all" {
+		filterStatus = ""
+	}
+
+	obs, err := mgr.ListObservations(ctx, *session, *lens, filterStatus, *minSev, *limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing observations: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Coppermind Cognitive Observations (Vault: %s, Status: %s, Lens: %s)\n", activeProj, *status, *lens)
+	fmt.Println(strings.Repeat("=", 80))
+
+	if len(obs) == 0 {
+		fmt.Println("No matching observations found.")
+		return
+	}
+
+	for i, node := range obs {
+		sevBadge := strings.ToUpper(node.Severity)
+		statusBadge := strings.ToUpper(node.Status)
+		if statusBadge == "" {
+			statusBadge = "OPEN"
+		}
+		fmt.Printf("\n[%d] %s (%s) — %s [ID: %s]\n", i+1, sevBadge, node.SourceLens, statusBadge, node.ID)
+		fmt.Printf("    Created: %s\n", node.CreatedAt.Format(time.RFC3339))
+		if len(node.ParentIDs) > 0 {
+			fmt.Printf("    Parent Memories: %s\n", strings.Join(node.ParentIDs, ", "))
+		}
+		lines := strings.Split(node.Content, "\n")
+		for _, line := range lines {
+			fmt.Printf("    %s\n", line)
+		}
+	}
+	fmt.Println()
 }
 
 func runProject(args []string) {

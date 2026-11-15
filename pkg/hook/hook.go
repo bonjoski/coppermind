@@ -17,11 +17,16 @@ if command -v coppermind >/dev/null 2>&1; then
     COMMIT_AUTHOR=$(git log -1 --pretty=%an 2>/dev/null)
     REPO_NAME=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
     BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    DIFF_SUMMARY=$(git diff-tree --no-commit-id --name-status -r HEAD 2>/dev/null | head -n 20)
     if [ -n "$COMMIT_HASH" ]; then
         coppermind remember \
             --session "$REPO_NAME" \
             --category "git_commit" \
-            "Git commit $COMMIT_HASH on branch '$BRANCH_NAME' by $COMMIT_AUTHOR: $COMMIT_MSG" >/dev/null 2>&1 &
+            "Git commit $COMMIT_HASH on branch '$BRANCH_NAME' by $COMMIT_AUTHOR: $COMMIT_MSG
+Changed files:
+$DIFF_SUMMARY" >/dev/null 2>&1 &
+        # Asynchronously evaluate security-architect lens on recent commit
+        coppermind dispatch reflect --lens security-architect --since 10m >/dev/null 2>&1 &
     fi
 fi
 # <<< coppermind episodic capture hook <<<

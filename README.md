@@ -47,7 +47,7 @@ flowchart TD
 5. **Absolute Secret & Credential Quarantine**: Strict fail-closed defense scanning for private keys, AWS/OpenAI/Anthropic/GitHub API keys, and high-entropy tokens. Raw keys are rejected with typed security errors, and embedded tokens are redacted (`[REDACTED_*]`) before reaching SQLite or vector embeddings.
 6. **Asynchronous AMQP / RabbitMQ Task Engine**: Dispatches background cognitive workflows (`deep_reflect`, `summarize_session`, `defrag_memory`) onto an embedded topic bus or external RabbitMQ cluster (`COPPERMIND_RABBITMQ_URL`).
 7. **LiteLLM Model Router**: Autonomous reflection and synthesis engine with outbound API key scrubbing on upstream HTTP error frames.
-8. **Cognitive Lenses**: Asynchronous, event-driven analytical personas (`security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`) that subscribe to bus events, evaluate memories across cognitive tiers, and synthesize structured observations back into project vaults without recursive loops.
+8. **Cognitive Lenses**: Asynchronous, event-driven analytical personas (`security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`, `devils-advocate`) that subscribe to bus events, evaluate memories across cognitive tiers, and synthesize structured observations back into project vaults without recursive loops.
 
 ---
 
@@ -59,6 +59,7 @@ Cognitive Lenses provide continuous analytical evaluation of project memories vi
 * **`systems-architect`**: Analyzes architectural coherence, modularity, single-responsibility invariants, and multi-agent concurrency bottlenecks.
 * **`drift-auditor`**: Detects drift between architectural specifications/docs and live implementations, flagging regressions and configuration drift.
 * **`synthesizer`**: Cross-correlates memories across sessions, distilling high-level decisions, patterns, and overarching system state.
+* **`devils-advocate`**: Stress-tests technical decisions, ADRs, and plans; highlights single-points-of-failure, scalability walls, and unexamined tradeoffs.
 
 ### Key Architectural Invariants
 * **Zero-Cost Pre-Filter Gates**: Fast regex/AST matching (e.g. scanning for `exec`, `syscall`, `unsafe`, credentials) skips 85%+ of candidate memories before invoking LLMs, preserving local VRAM and CPU.
@@ -94,12 +95,21 @@ lenses:
 ```bash
 # Trigger deep reflection using a specific lens or all lenses
 coppermind dispatch reflect --lens security-architect --since 24h
+coppermind dispatch reflect --lens devils-advocate --since 24h
 
 # Recall memories and filter strictly to observations from a specific lens
 coppermind recall --lens security-architect "command execution"
 
 # Recall canonical memories with linked cognitive lens observations automatically attached (default)
 coppermind recall --include-observations "sandbox configuration"
+
+# Inspect and resolve open cognitive lens observations
+coppermind observations --status open --min-severity high
+coppermind observations --resolve <observation-id>
+
+# Automated Git Post-Commit Hook with background lens evaluation
+coppermind hook install
+coppermind hook check
 ```
 
 In MCP:
