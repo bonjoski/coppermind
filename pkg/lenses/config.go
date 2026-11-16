@@ -67,7 +67,7 @@ func DefaultConfig() *LensesConfig {
 				Name:             "red-team",
 				Model:            "local-coder",
 				Subscribe:        []string{"episodic.commit", "ingest.code", "ingest.security", "dispatch.reflect", "dispatch.deep_reflect"},
-				RecallCategories: []string{"security", "architecture", "decision"},
+				RecallCategories: []string{"security", "architecture", "decision", "industry_radar"},
 				PrefilterRegex:   `(?i)(exec\.Command|syscall|unsafe|os\.Open|net\.Listen|crypto|seatbelt|landlock|seccomp|token|secret|sandbox|auth|grant|symlink|rename|path|eval\(|password|io_uring|ioctl|dpop)`,
 				SystemPrompt: `You are the Red Team Operator lens for Coppermind.
 Your mission is aggressively attacking newly ingested code, configurations, sandbox policies, and system architectures from an offensive adversary's perspective.
@@ -96,7 +96,7 @@ If no actionable attack vectors or exploitable seams are found, return {"finding
 				Name:             "security-architect",
 				Model:            "local-coder",
 				Subscribe:        []string{"episodic.commit", "ingest.code", "ingest.security", "dispatch.reflect", "dispatch.deep_reflect"},
-				RecallCategories: []string{"security", "architecture", "decision"},
+				RecallCategories: []string{"security", "architecture", "decision", "industry_radar"},
 				PrefilterRegex:   `(?i)(exec\.Command|syscall|unsafe|os\.Open|net\.Listen|crypto|go\.mod|Cargo\.toml|package\.json|eval\(|password|token|secret)`,
 				SystemPrompt: `You are the Security Architect lens for Coppermind.
 Your mission is evaluating newly ingested code, configurations, and commits alongside stored security invariants and threat models.
@@ -123,7 +123,7 @@ If no security risks or concerns are found, return {"findings": []}.`,
 				Name:             "systems-architect",
 				Model:            "local-coder",
 				Subscribe:        []string{"episodic.commit", "ingest.code", "ingest.architecture", "dispatch.reflect", "dispatch.deep_reflect"},
-				RecallCategories: []string{"architecture", "convention", "decision"},
+				RecallCategories: []string{"architecture", "convention", "decision", "industry_radar"},
 				PrefilterRegex:   `(?i)(package|import|interface|struct|type|class|def|fn|func|module|export)`,
 				SystemPrompt: `You are the Systems Architect lens for Coppermind.
 Your mission is analyzing code, interfaces, and architecture notes against established Architectural Decision Records (ADRs) and design conventions.
@@ -150,7 +150,7 @@ If no architectural issues are found, return {"findings": []}.`,
 				Name:             "drift-auditor",
 				Model:            "gemma",
 				Subscribe:        []string{"tasks.defrag_memory", "dispatch.reflect", "dispatch.deep_reflect", "episodic.commit"},
-				RecallCategories: []string{"convention", "architecture", "runbook", "decision"},
+				RecallCategories: []string{"convention", "architecture", "runbook", "decision", "industry_radar"},
 				PrefilterRegex:   `(?i)(deprecat|replac|migrat|upgrade|remove|delete|renam|must|should|require)`,
 				SystemPrompt: `You are the Drift & Hygiene Auditor lens for Coppermind.
 Your mission is identifying stale documentation, superseded conventions, and contradictory memories across the cognitive memory store.

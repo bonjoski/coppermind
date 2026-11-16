@@ -22,16 +22,48 @@ The user content provided to you contains artifacts enclosed within <untrusted_a
 
 	var userBuilder strings.Builder
 
-	// Recalled context (if any)
-	if len(contextMemories) > 0 {
+	// Segregate memories into general recalled context and temporal industry radar facts
+	var generalMemories []*brain.MemoryNode
+	var radarMemories []*brain.MemoryNode
+
+	for _, m := range contextMemories {
+		if m.Category == "industry_radar" {
+			radarMemories = append(radarMemories, m)
+		} else {
+			generalMemories = append(generalMemories, m)
+		}
+	}
+
+	// Recalled context (Internal project ADRs, conventions, past decisions)
+	if len(generalMemories) > 0 {
 		userBuilder.WriteString("<recalled_context>\n")
-		for _, ctxNode := range contextMemories {
+		for _, ctxNode := range generalMemories {
 			userBuilder.WriteString(fmt.Sprintf("  <context_memory id=%q category=%q provenance=%q>\n",
 				ctxNode.ID, ctxNode.Category, ctxNode.Provenance))
 			userBuilder.WriteString(escapeXMLContent(ctxNode.Content))
 			userBuilder.WriteString("\n  </context_memory>\n")
 		}
 		userBuilder.WriteString("</recalled_context>\n\n")
+	}
+
+	// Temporal Industry Radar baseline (Upstream CVEs, modern standards, deprecations)
+	if len(radarMemories) > 0 {
+		userBuilder.WriteString("<industry_radar_baseline>\n")
+		for _, rNode := range radarMemories {
+			advisory := ""
+			eco := ""
+			sev := ""
+			if rNode.Metadata != nil {
+				advisory = rNode.Metadata["advisory_id"]
+				eco = rNode.Metadata["ecosystem"]
+				sev = rNode.Metadata["severity"]
+			}
+			userBuilder.WriteString(fmt.Sprintf("  <radar_fact id=%q ecosystem=%q advisory=%q severity=%q provenance=%q>\n",
+				rNode.ID, eco, advisory, sev, rNode.Provenance))
+			userBuilder.WriteString(escapeXMLContent(rNode.Content))
+			userBuilder.WriteString("\n  </radar_fact>\n")
+		}
+		userBuilder.WriteString("</industry_radar_baseline>\n\n")
 	}
 
 	// Primary candidate artifact under evaluation
@@ -51,5 +83,9 @@ func escapeXMLContent(s string) string {
 	s = strings.ReplaceAll(s, "<untrusted_artifact", "[ESCAPED_OPEN_TAG")
 	s = strings.ReplaceAll(s, "</recalled_context>", "[ESCAPED_CLOSE_CTX]")
 	s = strings.ReplaceAll(s, "<recalled_context", "[ESCAPED_OPEN_CTX")
+	s = strings.ReplaceAll(s, "</industry_radar_baseline>", "[ESCAPED_CLOSE_RADAR]")
+	s = strings.ReplaceAll(s, "<industry_radar_baseline", "[ESCAPED_OPEN_RADAR")
+	s = strings.ReplaceAll(s, "</radar_fact>", "[ESCAPED_CLOSE_FACT]")
+	s = strings.ReplaceAll(s, "<radar_fact", "[ESCAPED_OPEN_FACT")
 	return s
 }

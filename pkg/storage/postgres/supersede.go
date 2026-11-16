@@ -54,6 +54,16 @@ func (s *PostgresStore) Supersede(
 		return fmt.Errorf("failed to query target memory node: %w", err)
 	}
 
+	targetTierParsed := authz.ParseAuthorityTier(targetTier)
+	nodeTier := supersedingNode.AuthorityTier
+	if nodeTier == "" {
+		nodeTier = authz.TierToString(authz.CategoryToDefaultTier(supersedingNode.Category))
+	}
+	nodeTierParsed := authz.ParseAuthorityTier(nodeTier)
+	if nodeTierParsed < targetTierParsed {
+		return authz.ErrInvalidSupersession
+	}
+
 	// 2. Mark target node as SUPERSEDED
 	nowNano := time.Now().UnixNano()
 	_, err = tx.ExecContext(ctx, `

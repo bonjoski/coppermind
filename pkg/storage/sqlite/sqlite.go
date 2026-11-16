@@ -383,6 +383,16 @@ func (s *SQLiteStore) execSupersede(req *supersedeReq) error {
 		return fmt.Errorf("failed to query target memory node: %w", err)
 	}
 
+	targetTierParsed := authz.ParseAuthorityTier(targetTier)
+	nodeTier := req.node.AuthorityTier
+	if nodeTier == "" {
+		nodeTier = authz.TierToString(authz.CategoryToDefaultTier(req.node.Category))
+	}
+	nodeTierParsed := authz.ParseAuthorityTier(nodeTier)
+	if nodeTierParsed < targetTierParsed {
+		return authz.ErrInvalidSupersession
+	}
+
 	nowNano := time.Now().UnixNano()
 	_, err = tx.Exec(`
 		UPDATE memory_nodes

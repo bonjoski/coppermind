@@ -25,6 +25,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/mcp"
 	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/queue"
+	"github.com/bonjoski/coppermind/pkg/radar"
 	"github.com/bonjoski/coppermind/pkg/router"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/seeder"
@@ -115,6 +116,8 @@ func main() {
 		runObservations(cmdArgs)
 	case "proposals", "proposal":
 		runProposals(cmdArgs)
+	case "radar":
+		runRadar(cmdArgs)
 	case "status":
 		runStatus(cmdArgs)
 	case "version", "--version", "-v":
@@ -153,6 +156,7 @@ Commands:
   hook         Manage Git post-commit capture and lens hooks (install, uninstall, status, check)
   observations List, filter, and resolve cognitive lens observations (alias: obs)
   proposals    Review, approve, or reject quarantined memory proposals
+  radar        Synchronize or inspect industry standards and threat intelligence feeds
   status       Display brain health metrics and stored memory counts
   version      Print version information
 
@@ -1508,6 +1512,90 @@ func runProposals(args []string) {
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown proposals subcommand %q. Usage: coppermind proposals <list|approve|reject> [id]\n", action)
+		os.Exit(1)
+	}
+}
+
+func runRadar(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: coppermind radar <sync|detect|list> [options]\n")
+		os.Exit(1)
+	}
+
+	action := args[0]
+	cmdArgs := args[1:]
+
+	switch action {
+	case "detect":
+		fs := flag.NewFlagSet("radar detect", flag.ExitOnError)
+		dirFlag := fs.String("dir", ".", "Directory to inspect for ecosystem manifests")
+		_ = fs.Parse(cmdArgs)
+
+		ecos := radar.DetectWorkspaceEcosystems(*dirFlag)
+		fmt.Printf("Detected active ecosystems in %q:\n", *dirFlag)
+		for _, e := range ecos {
+			fmt.Printf("  • %s\n", e)
+		}
+
+	case "list", "ls":
+		fs := flag.NewFlagSet("radar list", flag.ExitOnError)
+		configPath := fs.String("config", "", "Path to radar.yaml")
+		_ = fs.Parse(cmdArgs)
+
+		cfg, err := radar.LoadConfig(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading radar config: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Enabled Ecosystem Packs: %s\n\n", strings.Join(cfg.EnabledPacks, ", "))
+		fmt.Println("Active Feeds:")
+		for _, f := range cfg.ActiveFeeds() {
+			fmt.Printf("  • [%s] %s (Ecosystem: %s, Adapter: %s)\n    URL: %s\n", f.ID, f.Name, f.Ecosystem, f.Adapter, f.URL)
+		}
+
+	case "sync":
+		fs := flag.NewFlagSet("radar sync", flag.ExitOnError)
+		configPath := fs.String("config", "", "Path to radar.yaml")
+		dataDir := fs.String("data-dir", "", "Data directory")
+		project := fs.String("project", "", "Target project vault")
+		_ = fs.Parse(cmdArgs)
+
+		cfg, err := radar.LoadConfig(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading radar config: %v\n", err)
+			os.Exit(1)
+		}
+
+		mgr, activeProj, err := initManager(*dataDir, *project)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		defer mgr.Close()
+
+		ctx := context.Background()
+		fmt.Printf("Starting radar sync across %d active feeds into vault %q...\n", len(cfg.ActiveFeeds()), activeProj)
+		syncer := radar.NewSyncer(cfg, mgr)
+		res, err := syncer.SyncPass(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Radar sync failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("\n✓ Radar sync completed in %dms\n", res.DurationMillis)
+		fmt.Printf("  • Total Feeds: %d\n", res.TotalFeeds)
+		fmt.Printf("  • Raw Items Fetched: %d\n", res.TotalItems)
+		fmt.Printf("  • Ingested Facts: %d\n", res.IngestedCount)
+		if len(res.Errors) > 0 {
+			fmt.Printf("  • Warnings/Errors (%d):\n", len(res.Errors))
+			for _, e := range res.Errors {
+				fmt.Printf("    - %s\n", e)
+			}
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown radar action %q. Usage: coppermind radar <sync|detect|list>\n", action)
 		os.Exit(1)
 	}
 }
