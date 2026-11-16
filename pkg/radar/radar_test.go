@@ -16,18 +16,26 @@ import (
 
 func TestRadar_DefaultConfigAndActiveFeeds(t *testing.T) {
 	cfg := DefaultConfig()
-	if len(cfg.EnabledPacks) != 3 {
-		t.Fatalf("expected 3 default packs, got %d", len(cfg.EnabledPacks))
+	if cfg.Settings.Enabled {
+		t.Fatalf("expected radar to be OFF by default, got enabled=true")
 	}
 
+	// When disabled, ActiveFeeds() must return nil
 	feeds := cfg.ActiveFeeds()
-	if len(feeds) == 0 {
-		t.Fatalf("expected active feeds in default config, got 0")
+	if len(feeds) != 0 {
+		t.Fatalf("expected 0 active feeds when disabled by default, got %d", len(feeds))
+	}
+
+	// When explicitly enabled, ActiveFeeds() returns the curated pack feeds
+	cfg.Settings.Enabled = true
+	enabledFeeds := cfg.ActiveFeeds()
+	if len(enabledFeeds) == 0 {
+		t.Fatalf("expected active feeds when enabled, got 0")
 	}
 
 	foundGo := false
 	foundCISA := false
-	for _, f := range feeds {
+	for _, f := range enabledFeeds {
 		if f.ID == "go-release-notes" {
 			foundGo = true
 		}
@@ -254,6 +262,7 @@ func TestRadar_SyncerEndToEnd(t *testing.T) {
 	cfg := &RadarConfig{
 		Version: "1.0",
 		Settings: RadarSettings{
+			Enabled:         true,
 			SyncInterval:    "1h",
 			MaxFactsPerFeed: 10,
 			MinSeverity:     SeverityHigh, // Filter out noise below High

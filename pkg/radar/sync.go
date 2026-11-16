@@ -38,6 +38,13 @@ func NewSyncer(cfg *RadarConfig, mgr *brain.Manager) *Syncer {
 
 // SyncPass executes an asynchronous sync across all active feeds.
 func (s *Syncer) SyncPass(ctx context.Context) (*SyncResult, error) {
+	if !s.cfg.Settings.Enabled {
+		return &SyncResult{
+			TotalFeeds: 0,
+			Errors:     []string{"radar is disabled by default: set 'settings.enabled: true' in radar.yaml to activate"},
+		}, nil
+	}
+
 	start := time.Now()
 	feeds := s.cfg.ActiveFeeds()
 

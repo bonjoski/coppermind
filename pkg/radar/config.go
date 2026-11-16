@@ -12,6 +12,7 @@ import (
 
 // RadarSettings holds operational settings for the radar subsystem.
 type RadarSettings struct {
+	Enabled               bool   `yaml:"enabled" json:"enabled"` // OFF by default
 	SyncInterval          string `yaml:"sync_interval" json:"sync_interval"`
 	MaxFactsPerFeed       int    `yaml:"max_facts_per_feed" json:"max_facts_per_feed"`
 	AutoDetectEcosystems  bool   `yaml:"auto_detect_ecosystems" json:"auto_detect_ecosystems"`
@@ -166,14 +167,15 @@ var CuratedPackFeeds = map[string][]FeedConfig{
 	},
 }
 
-// DefaultConfig provides embedded sensible defaults with core packs enabled.
+// DefaultConfig provides embedded sensible defaults with radar disabled by default.
 func DefaultConfig() *RadarConfig {
 	return &RadarConfig{
 		Version: "1.0",
 		Settings: RadarSettings{
+			Enabled:              false, // Disabled by default
 			SyncInterval:         "24h",
 			MaxFactsPerFeed:      50,
-			AutoDetectEcosystems: true,
+			AutoDetectEcosystems: false, // Disabled by default
 			QuarantineUnverified: true,
 			MinConfidence:        "high",
 			MinSeverity:          SeverityHigh, // Filter out low/info noise by default
@@ -232,7 +234,12 @@ func LoadConfig(path string) (*RadarConfig, error) {
 }
 
 // ActiveFeeds aggregates all configured feeds across enabled packs and custom feeds.
+// If radar is disabled (Settings.Enabled == false), ActiveFeeds returns nil.
 func (c *RadarConfig) ActiveFeeds() []FeedConfig {
+	if !c.Settings.Enabled {
+		return nil
+	}
+
 	var feeds []FeedConfig
 	seen := make(map[string]bool)
 

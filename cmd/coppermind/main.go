@@ -1548,10 +1548,19 @@ func runRadar(args []string) {
 			os.Exit(1)
 		}
 
-		fmt.Printf("Enabled Ecosystem Packs: %s\n\n", strings.Join(cfg.EnabledPacks, ", "))
-		fmt.Println("Active Feeds:")
-		for _, f := range cfg.ActiveFeeds() {
-			fmt.Printf("  • [%s] %s (Ecosystem: %s, Adapter: %s)\n    URL: %s\n", f.ID, f.Name, f.Ecosystem, f.Adapter, f.URL)
+		status := "DISABLED (default)"
+		if cfg.Settings.Enabled {
+			status = "ENABLED"
+		}
+		fmt.Printf("Radar Status: %s\n", status)
+		fmt.Printf("Configured Ecosystem Packs: %s\n\n", strings.Join(cfg.EnabledPacks, ", "))
+		if !cfg.Settings.Enabled {
+			fmt.Println("Notice: Radar is disabled by default. Pass --enable to sync or set 'settings.enabled: true' in radar.yaml to activate.")
+		} else {
+			fmt.Println("Active Feeds:")
+			for _, f := range cfg.ActiveFeeds() {
+				fmt.Printf("  • [%s] %s (Ecosystem: %s, Adapter: %s)\n    URL: %s\n", f.ID, f.Name, f.Ecosystem, f.Adapter, f.URL)
+			}
 		}
 
 	case "sync":
@@ -1559,12 +1568,25 @@ func runRadar(args []string) {
 		configPath := fs.String("config", "", "Path to radar.yaml")
 		dataDir := fs.String("data-dir", "", "Data directory")
 		project := fs.String("project", "", "Target project vault")
+		enableFlag := fs.Bool("enable", false, "Enable radar for this sync run")
 		_ = fs.Parse(cmdArgs)
 
 		cfg, err := radar.LoadConfig(*configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading radar config: %v\n", err)
 			os.Exit(1)
+		}
+
+		if *enableFlag {
+			cfg.Settings.Enabled = true
+		}
+
+		if !cfg.Settings.Enabled {
+			fmt.Println("Notice: Industry radar is disabled by default.")
+			fmt.Println("To run sync, either:")
+			fmt.Println("  1. Pass the --enable flag: coppermind radar sync --enable")
+			fmt.Println("  2. Or set 'settings.enabled: true' in ~/.coppermind/radar.yaml or .coppermind/radar.yaml")
+			return
 		}
 
 		mgr, activeProj, err := initManager(*dataDir, *project)
