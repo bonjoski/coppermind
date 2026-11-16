@@ -34,7 +34,7 @@ When working in `coppermind`, you act as the **Lead Cognitive Systems Architect 
 7. **Fail-Closed Isolation**:
    - Tainted memories or corrupted payload frames must fail closed without poisoning the root vector space or crashing peer connections.
 8. **Cognitive Lenses & Analytical Synthesis**:
-   - **Bus-Native Stateless Execution**: Five canonical lenses (`security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`, `devils-advocate`) execute as stateless subscribers on embedded Go channel topic buses (Profile A) and RabbitMQ AMQP exchanges (Profile B).
+   - **Bus-Native Stateless Execution**: Six canonical lenses (`red-team`, `security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`, `devils-advocate`) execute as stateless subscribers on embedded Go channel topic buses (Profile A) and RabbitMQ AMQP exchanges (Profile B).
    - **Single-Writer Ring Compliance**: All lens observations must route through single-writer channel workers (SQLite WAL / Postgres 17 pgvector) to preserve $N=8$ parallel subagent concurrency without lock contention.
    - **Project Vault Isolation**: Lenses execute strictly within their assigned `COPPERMIND_PROJECT` vault unless explicitly called with `--cross-vault` on dispatch.
    - **Strict Loop Prevention (`derived` flag)**: Records with `derived=true` MUST NOT emit `ingest.*` or `episodic.*` events onto the topic bus, structurally preventing infinite recursion.

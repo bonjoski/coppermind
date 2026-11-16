@@ -659,3 +659,112 @@ func TestLenses_DevilsAdvocate(t *testing.T) {
 		t.Errorf("expected parent ID %s, got %v", node.ID, obs.ParentIDs)
 	}
 }
+
+// TestLenses_RedTeam verifies that the red-team lens properly triggers on offensive sinks
+// and produces structured exploit observations with evidence.
+func TestLenses_RedTeam(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "red_team.db")
+
+	store, err := sqlite.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer store.Close()
+
+	embedder := embedding.NewLocalHashEmbedder(128)
+	sp := scratchpad.NewMemoryScratchpad()
+	mgr := brain.NewManager(store, embedder, sp)
+
+	cfg := lenses.DefaultConfig()
+	lens, ok := cfg.GetLens("red-team")
+	if !ok || lens == nil {
+		t.Fatalf("red-team lens not found in DefaultConfig")
+	}
+
+	// 1. Verify prefilter regex matches offensive and sandbox sinks
+	offensiveSamples := []string{
+		`func swap() { os.Symlink("/etc/passwd", target) }`,
+		`cmd := exec.Command("sandbox-exec", "-p", profile)`,
+		`err := syscall.Ioctl(fd, TIOCSTI, uintptr(unsafe.Pointer(&c)))`,
+		`if check(path) { rename(temp, path) }`,
+		`func tokenExchange(dpopHeader string) { ... }`,
+	}
+	for _, sample := range offensiveSamples {
+		if !lens.MatchesPrefilter(sample) {
+			t.Errorf("expected prefilter to match offensive sample: %s", sample)
+		}
+	}
+
+	benignCode := "func add(a, b int) int { return a + b }"
+	if lens.MatchesPrefilter(benignCode) {
+		t.Fatalf("expected prefilter to skip benign pure function code")
+	}
+
+	// 2. Mock model router returning offensive exploit finding
+	mockR := &mockRouter{
+		completeFunc: func(ctx context.Context, req *router.CompletionRequest) (*router.CompletionResponse, error) {
+			return &router.CompletionResponse{
+				Content: `{
+					"findings": [
+						{
+							"severity": "critical",
+							"category": "exploit",
+							"summary": "TOCTOU symlink race condition: non-atomic file check allows arbitrary host file overwrite via renameat2 race",
+							"evidence": "if check(path) { os.Symlink(untrusted, path) }"
+						}
+					]
+				}`,
+			}, nil
+		},
+	}
+
+	broker := queue.NewEmbeddedBroker(100)
+	defer broker.Close()
+
+	engine := lenses.NewEngine(cfg, broker, mgr, mockR, "default", nil)
+
+	// Ingest vulnerable memory
+	vulnerableCode := `
+	func WriteWorkspaceFile(path, untrusted string) error {
+		if check(path) {
+			return os.Symlink(untrusted, path)
+		}
+		return nil
+	}
+	`
+	node, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID: "audit-worktree",
+		Category:  "code",
+		Content:   vulnerableCode,
+	})
+	if err != nil {
+		t.Fatalf("failed to remember code: %v", err)
+	}
+
+	// Run reflection for red-team lens
+	res, err := engine.Reflect(ctx, lenses.ReflectRequest{
+		Lens:       "red-team",
+		Project:    "default",
+		CrossVault: false,
+	})
+	if err != nil {
+		t.Fatalf("reflect failed: %v", err)
+	}
+
+	if len(res.Observations) != 1 {
+		t.Fatalf("expected 1 observation from red-team lens, got %d", len(res.Observations))
+	}
+
+	obs := res.Observations[0]
+	if obs.SourceLens != "red-team" || obs.Severity != "critical" {
+		t.Errorf("observation mismatch: lens=%s, sev=%s", obs.SourceLens, obs.Severity)
+	}
+	if !strings.Contains(obs.Content, "TOCTOU symlink race condition") {
+		t.Errorf("expected exploit summary in observation content, got: %s", obs.Content)
+	}
+	if len(obs.ParentIDs) == 0 || obs.ParentIDs[0] != node.ID {
+		t.Errorf("expected parent ID %s, got %v", node.ID, obs.ParentIDs)
+	}
+}

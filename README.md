@@ -47,7 +47,7 @@ flowchart TD
 5. **Absolute Secret & Credential Quarantine**: Strict fail-closed defense scanning for private keys, AWS/OpenAI/Anthropic/GitHub API keys, and high-entropy tokens. Raw keys are rejected with typed security errors, and embedded tokens are redacted (`[REDACTED_*]`) before reaching SQLite or vector embeddings.
 6. **Asynchronous AMQP / RabbitMQ Task Engine**: Dispatches background cognitive workflows (`deep_reflect`, `summarize_session`, `defrag_memory`) onto an embedded topic bus or external RabbitMQ cluster (`COPPERMIND_RABBITMQ_URL`).
 7. **LiteLLM Model Router**: Autonomous reflection and synthesis engine with outbound API key scrubbing on upstream HTTP error frames.
-8. **Cognitive Lenses**: Asynchronous, event-driven analytical personas (`security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`, `devils-advocate`) that subscribe to bus events, evaluate memories across cognitive tiers, and synthesize structured observations back into project vaults without recursive loops.
+8. **Cognitive Lenses**: Asynchronous, event-driven analytical personas (`red-team`, `security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`, `devils-advocate`) that subscribe to bus events, evaluate memories across cognitive tiers, and synthesize structured observations back into project vaults without recursive loops.
 
 ---
 
@@ -55,6 +55,7 @@ flowchart TD
 
 Cognitive Lenses provide continuous analytical evaluation of project memories via configurable personas:
 
+* **`red-team`**: Aggressively attacks code, configurations, and sandbox policies from an adversary's mindset; identifies concrete exploit vectors, sandbox escapes (Seatbelt/Landlock/seccomp), TOCTOU symlink races, parameter injections, and token replay.
 * **`security-architect`**: Audits code diffs, command executions, and configuration changes for OWASP vulnerabilities, credential exposure, unsafe syscalls, and privilege escalation vectors.
 * **`systems-architect`**: Analyzes architectural coherence, modularity, single-responsibility invariants, and multi-agent concurrency bottlenecks.
 * **`drift-auditor`**: Detects drift between architectural specifications/docs and live implementations, flagging regressions and configuration drift.

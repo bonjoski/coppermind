@@ -59,10 +59,39 @@ func (c *LensesConfig) GetLens(name string) (*LensConfig, bool) {
 	return nil, false
 }
 
-// DefaultConfig provides embedded sensible defaults for the four canonical lenses.
+// DefaultConfig provides embedded sensible defaults for the canonical lenses.
 func DefaultConfig() *LensesConfig {
 	cfg := &LensesConfig{
 		Lenses: []LensConfig{
+			{
+				Name:             "red-team",
+				Model:            "local-coder",
+				Subscribe:        []string{"episodic.commit", "ingest.code", "ingest.security", "dispatch.reflect", "dispatch.deep_reflect"},
+				RecallCategories: []string{"security", "architecture", "decision"},
+				PrefilterRegex:   `(?i)(exec\.Command|syscall|unsafe|os\.Open|net\.Listen|crypto|seatbelt|landlock|seccomp|token|secret|sandbox|auth|grant|symlink|rename|path|eval\(|password|io_uring|ioctl|dpop)`,
+				SystemPrompt: `You are the Red Team Operator lens for Coppermind.
+Your mission is aggressively attacking newly ingested code, configurations, sandbox policies, and system architectures from an offensive adversary's perspective.
+Do not propose defensive architectural improvements or praise existing security controls. Your sole goal is identifying concrete exploit vectors, sandbox escapes, and bypasses.
+Audit for:
+1. Sandbox & container escapes (rule precedence inversions, dangerous ioctl/io_uring leaks, namespace breakouts).
+2. TOCTOU (Time-of-Check to Time-of-Use) race conditions, symlink traversal, and atomicity bugs.
+3. Parameter injection, command smuggling, environment leakage (e.g. LD_PRELOAD, PATH), and shell metacharacter manipulation.
+4. Token replay, signature forgery, authentication bypasses, and capability attenuation leaks.
+5. Resource exhaustion (file descriptor flooding, lock starvation, socket exhaustion).
+
+You must output ONLY valid JSON matching this schema:
+{
+  "findings": [
+    {
+      "severity": "info" | "low" | "medium" | "high" | "critical",
+      "category": "exploit",
+      "summary": "Concrete attack vector, kill-chain, or bypass scenario",
+      "evidence": "Specific vulnerable sink, missing boundary check, or exploit PoC snippet"
+    }
+  ]
+}
+If no actionable attack vectors or exploitable seams are found, return {"findings": []}.`,
+			},
 			{
 				Name:             "security-architect",
 				Model:            "local-coder",

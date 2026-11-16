@@ -667,7 +667,7 @@ func runDispatch(args []string) {
 	// Special handling for dispatch reflect
 	if taskType == "reflect" {
 		rfs := flag.NewFlagSet("reflect", flag.ExitOnError)
-		lensName := rfs.String("lens", "all", "Target lens to execute (e.g. security-architect, systems-architect, drift-auditor, synthesizer, devils-advocate, or all)")
+		lensName := rfs.String("lens", "all", "Target lens to execute (e.g. red-team, security-architect, systems-architect, drift-auditor, synthesizer, devils-advocate, or all)")
 		sinceStr := rfs.String("since", "0", "Time window for candidate memories (e.g. 1h, 24h, 7d, or 0 for all)")
 		limit := rfs.Int("limit", 100, "Maximum candidate memories to evaluate")
 		crossVault := rfs.Bool("cross-vault", false, "Execute across project vaults")
@@ -1118,7 +1118,7 @@ func runObservations(args []string) {
 	dataDir := fs.String("data-dir", "", "Data directory for database files")
 	project := fs.String("project", "", "Target project vault (e.g. github, personal, work)")
 	session := fs.String("session", "", "Filter by session or worktree")
-	lens := fs.String("lens", "", "Filter by source lens (e.g. security-architect, devils-advocate)")
+	lens := fs.String("lens", "", "Filter by source lens (e.g. red-team, security-architect, devils-advocate)")
 	status := fs.String("status", "open", "Filter by status: open, resolved, or all")
 	minSev := fs.String("min-severity", "", "Minimum severity filter: info, low, medium, high, critical")
 	resolveID := fs.String("resolve", "", "Mark an observation ID as resolved")
