@@ -1,5 +1,9 @@
 # 🧠 Coppermind (`bonjoski/coppermind`)
 
+[![CI](https://github.com/bonjoski/coppermind/actions/workflows/ci.yml/badge.svg)](https://github.com/bonjoski/coppermind/actions/workflows/ci.yml)
+[![SLSA 2](https://slsa.dev/images/gh-badge-level2.svg)](https://slsa.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
 > **Portable Cognitive AI Brain & Sovereign Agent Memory Runtime**  
 > *Zero-SaaS, MCP-native long-term episodic/semantic memory, hybrid vector retrieval, and fast working scratchpad for autonomous AI agents.*
 
@@ -326,6 +330,22 @@ Coppermind operates as the persistent memory and cognitive runtime tier within t
 * [**`bonjoski/airlock`**](https://github.com/bonjoski/airlock): Sub-15ms kernel-enforced sandbox for AI agents and build tools.
 * [**`bonjoski/locksmith`**](https://github.com/bonjoski/locksmith): Hardware biometric secrets vault and MCP credential manager.
 * [**`bonjoski/homebrew-tap`**](https://github.com/bonjoski/homebrew-tap): Official distribution tap for pre-compiled binaries.
+
+---
+
+## SLSA Provenance & Verification
+
+Coppermind adheres to the **SLSA v1.0** specification.
+
+Verify provenance with GitHub CLI:
+```bash
+gh attestation verify coppermind --repo bonjoski/coppermind
+```
+
+Or verify offline using Soulcaster:
+```bash
+soulcaster verify --attestation coppermind.intoto.jsonl bin/coppermind
+```
 
 ---
 
