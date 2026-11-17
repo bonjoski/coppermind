@@ -577,10 +577,40 @@ func runRecall(args []string) {
 	}
 	fmt.Printf("Found %d matching memories (%s) in vault %q for %q:\n\n", len(results), mode, activeProj, query)
 	for i, r := range results {
-		fmt.Printf("%d. [Score: %.3f] [%s | %s | %s]\n   %s\n",
-			i+1, r.Score, r.Node.AuthorityTier, r.Node.Category, r.Node.SessionID, r.Node.Content)
+		isLearning := r.Node.Category == "learning" ||
+			r.Node.Category == "architectural-learning" ||
+			r.Node.Category == "lesson" ||
+			r.Node.Category == "learnings" ||
+			strings.Contains(r.Node.Content, "[ARCHITECTURAL LEARNING") ||
+			strings.Contains(r.Node.Content, "**Remediation:**") ||
+			strings.Contains(r.Node.Content, "**remediation:**")
+
+		tierBadge := r.Node.AuthorityTier
+		catBadge := r.Node.Category
+		if isLearning && !strings.Contains(catBadge, "learning") {
+			catBadge = catBadge + " (learning)"
+		}
+
+		fmt.Printf("%d. [Score: %.3f] [%s | %s | %s]\n",
+			i+1, r.Score, tierBadge, catBadge, r.Node.SessionID)
+
+		if isLearning {
+			fmt.Println("   💡 ARCHITECTURAL LEARNING / INVARIANT:")
+		}
+		fmt.Printf("   %s\n", r.Node.Content)
+
 		if len(r.Observations) > 0 {
-			fmt.Printf("   ↳ Linked Observations (%d):\n", len(r.Observations))
+			synthesizerObs := 0
+			for _, obs := range r.Observations {
+				if obs.SourceLens == "synthesizer" {
+					synthesizerObs++
+				}
+			}
+			if synthesizerObs > 0 {
+				fmt.Printf("   ↳ Synthesized Architectural Learnings (%d):\n", len(r.Observations))
+			} else {
+				fmt.Printf("   ↳ Linked Observations (%d):\n", len(r.Observations))
+			}
 			for _, obs := range r.Observations {
 				fmt.Printf("     • [%s] (%s): %s\n",
 					strings.ToUpper(obs.Severity), obs.SourceLens, obs.Content)

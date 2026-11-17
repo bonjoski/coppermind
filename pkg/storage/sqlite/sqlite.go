@@ -180,6 +180,20 @@ func initSchema(db *sql.DB) error {
 		_, _ = db.Exec("INSERT OR IGNORE INTO memory_fts(id, session_id, category, content) SELECT id, session_id, category, content FROM memory_nodes")
 	}
 
+	// Backfill authority_tier from CategoryToDefaultTier for existing rows with default tier
+	archCategories := []string{"architecture", "convention", "tech_stack", "api_schema", "decision", "accepted-rfc", "ecosystem-architecture", "rfc", "adr", "learning", "architectural-learning", "lesson", "learnings"}
+	for _, cat := range archCategories {
+		_, _ = db.Exec("UPDATE memory_nodes SET authority_tier = 'TIER_1_ARCHITECTURE' WHERE category = ? AND authority_tier = 'TIER_3_EPISODIC'", cat)
+	}
+	sovereignCategories := []string{"security_policy", "sandbox_rule", "crypto_root", "sovereign_invariant"}
+	for _, cat := range sovereignCategories {
+		_, _ = db.Exec("UPDATE memory_nodes SET authority_tier = 'TIER_0_SOVEREIGN' WHERE category = ? AND authority_tier = 'TIER_3_EPISODIC'", cat)
+	}
+	productCategories := []string{"product", "user_story", "acceptance_criteria", "spec", "business_logic"}
+	for _, cat := range productCategories {
+		_, _ = db.Exec("UPDATE memory_nodes SET authority_tier = 'TIER_2_PRODUCT' WHERE category = ? AND authority_tier = 'TIER_3_EPISODIC'", cat)
+	}
+
 	return nil
 }
 
@@ -1024,7 +1038,7 @@ func (s *SQLiteStore) GetObservationsForParents(ctx context.Context, parentIDs [
 	if len(parentIDs) == 0 {
 		return nil, nil
 	}
-	query := "SELECT " + sqliteMemoryColumns + " FROM memory_nodes WHERE derived = 1 AND status != 'resolved' ORDER BY created_at DESC"
+	query := "SELECT " + sqliteMemoryColumns + " FROM memory_nodes WHERE derived = 1 AND (status != 'resolved' OR source_lens = 'synthesizer') ORDER BY created_at DESC"
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err

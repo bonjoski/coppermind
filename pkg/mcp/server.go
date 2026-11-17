@@ -425,10 +425,41 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Found %d relevant memories in project vault %q:\n\n", len(results), targetProj))
 	for i, r := range results {
-		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] [%s | %s]\n   %s\n",
-			i+1, r.Score, r.Node.Category, r.Node.Provenance, r.Node.Content))
+		isLearning := r.Node.Category == "learning" ||
+			r.Node.Category == "architectural-learning" ||
+			r.Node.Category == "lesson" ||
+			r.Node.Category == "learnings" ||
+			strings.Contains(r.Node.Content, "[ARCHITECTURAL LEARNING") ||
+			strings.Contains(r.Node.Content, "**Remediation:**") ||
+			strings.Contains(r.Node.Content, "**remediation:**")
+
+		tierBadge := r.Node.AuthorityTier
+		if tierBadge == "" {
+			tierBadge = "TIER_3_EPISODIC"
+		}
+		catBadge := r.Node.Category
+		if isLearning && !strings.Contains(catBadge, "learning") {
+			catBadge = catBadge + " (learning)"
+		}
+
+		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] [%s | %s | %s]\n",
+			i+1, r.Score, tierBadge, catBadge, r.Node.Provenance))
+		if isLearning {
+			sb.WriteString("   💡 ARCHITECTURAL LEARNING / INVARIANT:\n")
+		}
+		sb.WriteString(fmt.Sprintf("   %s\n", r.Node.Content))
 		if len(r.Observations) > 0 {
-			sb.WriteString(fmt.Sprintf("   ↳ Linked Observations (%d):\n", len(r.Observations)))
+			synthesizerObs := 0
+			for _, obs := range r.Observations {
+				if obs.SourceLens == "synthesizer" {
+					synthesizerObs++
+				}
+			}
+			if synthesizerObs > 0 {
+				sb.WriteString(fmt.Sprintf("   ↳ Synthesized Architectural Learnings (%d):\n", synthesizerObs))
+			} else {
+				sb.WriteString(fmt.Sprintf("   ↳ Linked Observations (%d):\n", len(r.Observations)))
+			}
 			for _, obs := range r.Observations {
 				sb.WriteString(fmt.Sprintf("     • [%s] (%s): %s\n",
 					strings.ToUpper(obs.Severity), obs.SourceLens, obs.Content))

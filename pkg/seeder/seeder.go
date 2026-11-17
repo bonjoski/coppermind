@@ -86,7 +86,10 @@ func IngestDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, de
 		}
 
 		cat := defaultCategory
-		if strings.Contains(path, "knowledge-base") {
+		lowerPath := strings.ToLower(path)
+		if strings.Contains(lowerPath, "learning") || strings.Contains(lowerPath, "lesson") {
+			cat = "learning"
+		} else if strings.Contains(path, "knowledge-base") {
 			cat = "knowledge-base"
 		} else if strings.Contains(path, "plans/accepted") {
 			cat = "accepted-rfc"
@@ -125,9 +128,30 @@ func parseMarkdownChunks(r *os.File, sessionID, defaultCategory, sourcePath stri
 			if title == "" {
 				title = filepath.Base(sourcePath)
 			}
+
+			chunkCategory := defaultCategory
+			lowerTitle := strings.ToLower(title)
+			lowerContent := strings.ToLower(content)
+
+			isFindingWithRemediation := (strings.Contains(lowerTitle, "finding") || strings.Contains(lowerTitle, "audit")) &&
+				(strings.Contains(lowerContent, "**remediation:**") || strings.Contains(lowerContent, "remediation:"))
+			isExplicitLearning := strings.Contains(lowerTitle, "learning") || strings.Contains(lowerTitle, "lesson") || strings.Contains(lowerTitle, "invariant")
+
+			if isExplicitLearning {
+				chunkCategory = "learning"
+				if !strings.HasPrefix(strings.ToUpper(title), "[LEARNING") && !strings.HasPrefix(strings.ToUpper(title), "[ARCHITECTURAL LEARNING") {
+					title = "[ARCHITECTURAL LEARNING] " + title
+				}
+			} else if isFindingWithRemediation {
+				chunkCategory = "architectural-learning"
+				if !strings.HasPrefix(strings.ToUpper(title), "[LEARNING") && !strings.HasPrefix(strings.ToUpper(title), "[ARCHITECTURAL LEARNING") {
+					title = "[ARCHITECTURAL LEARNING & REMEDIATION] " + title
+				}
+			}
+
 			chunks = append(chunks, DocumentChunk{
 				SessionID:  sessionID,
-				Category:   defaultCategory,
+				Category:   chunkCategory,
 				Title:      title,
 				Content:    fmt.Sprintf("[%s] %s\n%s", title, sessionID, content),
 				Provenance: brain.ProvenanceLocalWorkspace,

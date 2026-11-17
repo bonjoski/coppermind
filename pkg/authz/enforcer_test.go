@@ -155,3 +155,25 @@ func TestValidateSupersession_CycleDetection(t *testing.T) {
 		t.Fatalf("expected ErrCyclicSupersession for self-loop, got %v", errSelf)
 	}
 }
+
+func TestCategoryToDefaultTier_Learnings(t *testing.T) {
+	cases := []struct {
+		category string
+		expected AuthorityTier
+	}{
+		{"learning", Tier1Architecture},
+		{"architectural-learning", Tier1Architecture},
+		{"lesson", Tier1Architecture},
+		{"learnings", Tier1Architecture},
+		{"accepted-rfc", Tier1Architecture},
+		{"architecture", Tier1Architecture},
+		{"general", Tier3Episodic},
+	}
+
+	for _, tc := range cases {
+		tier := CategoryToDefaultTier(tc.category)
+		if tier != tc.expected {
+			t.Errorf("CategoryToDefaultTier(%q) = %v; want %v", tc.category, tier, tc.expected)
+		}
+	}
+}

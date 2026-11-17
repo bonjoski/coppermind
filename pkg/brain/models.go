@@ -18,7 +18,7 @@ const (
 type MemoryNode struct {
 	ID         string            `json:"id"`
 	SessionID  string            `json:"session_id"`
-	Category   string            `json:"category"` // e.g. "architecture", "convention", "decision", "runbook", "observation"
+	Category   string            `json:"category"` // e.g. "architecture", "convention", "decision", "learning", "architectural-learning", "runbook", "observation"
 	Content    string            `json:"content"`
 	Vector     []float32         `json:"vector,omitempty"`
 	Provenance ProvenanceTier    `json:"provenance"`

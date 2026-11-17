@@ -102,4 +102,40 @@ PostgreSQL 17 with pgvector 0.8.0 is the official Profile B storage engine.
 	if rfcResults[0].Node.AuthorityTier != "TIER_1_ARCHITECTURE" {
 		t.Errorf("expected TIER_1_ARCHITECTURE for accepted-rfc, got %s", rfcResults[0].Node.AuthorityTier)
 	}
+
+	// Test IngestFile with finding that has remediation -> should elevate to architectural-learning at TIER_1_ARCHITECTURE
+	findingDoc := `---
+title: "Security Findings"
+---
+# Security Audit
+
+## Finding ADV-01: TOCTOU Socket Race
+- **Vulnerability:** Race condition during unprivileged connection.
+- **Remediation:** Atomically capture PID and kernel start time at Accept() time.
+`
+	findingPath := filepath.Join(tmpDir, "findings.md")
+	if err := os.WriteFile(findingPath, []byte(findingDoc), 0644); err != nil {
+		t.Fatalf("failed to write finding md: %v", err)
+	}
+
+	count, err = IngestFile(ctx, mgr, findingPath, "audit-cat")
+	if err != nil {
+		t.Fatalf("IngestFile finding returned error: %v", err)
+	}
+	if count == 0 {
+		t.Fatalf("expected ingested finding chunks")
+	}
+
+	findingResults, err := mgr.Recall(ctx, brain.RecallRequest{
+		Query: "TOCTOU Socket Race Accept",
+	})
+	if err != nil || len(findingResults) == 0 {
+		t.Fatalf("failed to recall finding chunk: %v", err)
+	}
+	if findingResults[0].Node.Category != "architectural-learning" {
+		t.Errorf("expected category 'architectural-learning', got %s", findingResults[0].Node.Category)
+	}
+	if findingResults[0].Node.AuthorityTier != "TIER_1_ARCHITECTURE" {
+		t.Errorf("expected TIER_1_ARCHITECTURE for architectural-learning, got %s", findingResults[0].Node.AuthorityTier)
+	}
 }

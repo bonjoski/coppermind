@@ -142,7 +142,25 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	`, s.dimension)
 
 	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Backfill authority_tier from CategoryToDefaultTier for existing rows with default tier
+	archCategories := []string{"architecture", "convention", "tech_stack", "api_schema", "decision", "accepted-rfc", "ecosystem-architecture", "rfc", "adr", "learning", "architectural-learning", "lesson", "learnings"}
+	for _, cat := range archCategories {
+		_, _ = s.db.ExecContext(ctx, "UPDATE memory_nodes SET authority_tier = 'TIER_1_ARCHITECTURE' WHERE category = $1 AND authority_tier = 'TIER_3_EPISODIC'", cat)
+	}
+	sovereignCategories := []string{"security_policy", "sandbox_rule", "crypto_root", "sovereign_invariant"}
+	for _, cat := range sovereignCategories {
+		_, _ = s.db.ExecContext(ctx, "UPDATE memory_nodes SET authority_tier = 'TIER_0_SOVEREIGN' WHERE category = $1 AND authority_tier = 'TIER_3_EPISODIC'", cat)
+	}
+	productCategories := []string{"product", "user_story", "acceptance_criteria", "spec", "business_logic"}
+	for _, cat := range productCategories {
+		_, _ = s.db.ExecContext(ctx, "UPDATE memory_nodes SET authority_tier = 'TIER_2_PRODUCT' WHERE category = $1 AND authority_tier = 'TIER_3_EPISODIC'", cat)
+	}
+
+	return nil
 }
 
 // FormatVector converts a float32 slice into pgvector text representation: "[0.1,0.2,...]"
@@ -744,7 +762,7 @@ func (s *PostgresStore) GetObservationsForParents(ctx context.Context, parentIDs
 	query := fmt.Sprintf(`
 	SELECT %s
 	FROM memory_nodes
-	WHERE derived = TRUE AND status != 'resolved'
+	WHERE derived = TRUE AND (status != 'resolved' OR source_lens = 'synthesizer')
 	ORDER BY created_at DESC
 	`, postgresMemoryColumns)
 	rows, err := s.db.QueryContext(ctx, query)
