@@ -53,12 +53,15 @@ func DistillItem(item RawItem, feed FeedConfig) (*RadarFact, error) {
 	if strings.Contains(normTitle, "CVE-") || strings.Contains(normTitle, "GHSA-") || strings.Contains(lowerTitle, "vulnerab") {
 		category = CategoryVulnerability
 		severity = SeverityHigh
-	} else if strings.Contains(lowerTitle, "deprecat") || strings.Contains(lowerBody, "deprecat") {
+	} else if strings.Contains(lowerTitle, "deprecat") || strings.Contains(lowerBody, "deprecat") || strings.Contains(lowerTitle, "breaking") {
 		category = CategoryDeprecation
-		severity = SeverityMedium
+		severity = SeverityHigh
 	} else if strings.Contains(lowerTitle, "exploit") || strings.Contains(lowerBody, "bypass") || strings.Contains(lowerBody, "jailbreak") {
 		category = CategoryExploitPrimitive
 		severity = SeverityCritical
+	} else if strings.Contains(lowerTitle, "release") || strings.Contains(lowerTitle, "standard") || strings.Contains(lowerTitle, "architecture") || strings.Contains(lowerTitle, "edition") || strings.Contains(lowerTitle, "jep ") || strings.Contains(lowerTitle, "rfc ") {
+		category = CategoryStandard
+		severity = SeverityHigh
 	}
 
 	if feed.SeverityThreshold != "" {

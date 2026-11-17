@@ -113,12 +113,23 @@ func (s *Syncer) SyncPass(ctx context.Context) (*SyncResult, error) {
 				continue
 			}
 
-			// Signal-to-Noise Gate: Filter out noise below configured minimum severity threshold
-			if s.cfg.Settings.MinSeverity != "" && SeverityRank(fact.Severity) < SeverityRank(s.cfg.Settings.MinSeverity) {
-				mu.Lock()
-				res.SkippedCount++
-				mu.Unlock()
-				continue
+			// Signal-to-Noise Gate:
+			// Vulnerabilities are gated by MinSeverity (default: "high") to avoid CVE flood.
+			// Architectural standards and deprecations are high-signal by definition for systems architects and pass unless ranked below "medium".
+			if fact.Category == CategoryVulnerability || fact.Category == CategoryExploitPrimitive {
+				if s.cfg.Settings.MinSeverity != "" && SeverityRank(fact.Severity) < SeverityRank(s.cfg.Settings.MinSeverity) {
+					mu.Lock()
+					res.SkippedCount++
+					mu.Unlock()
+					continue
+				}
+			} else {
+				if SeverityRank(fact.Severity) < SeverityRank(SeverityMedium) {
+					mu.Lock()
+					res.SkippedCount++
+					mu.Unlock()
+					continue
+				}
 			}
 
 			if s.mgr != nil {
