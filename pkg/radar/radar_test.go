@@ -10,6 +10,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/capsule"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 )
@@ -262,10 +263,11 @@ func TestRadar_SyncerEndToEnd(t *testing.T) {
 	cfg := &RadarConfig{
 		Version: "1.0",
 		Settings: RadarSettings{
-			Enabled:         true,
-			SyncInterval:    "1h",
-			MaxFactsPerFeed: 10,
-			MinSeverity:     SeverityHigh, // Filter out noise below High
+			Enabled:                true,
+			SyncInterval:           "1h",
+			MaxFactsPerFeed:        10,
+			MinSeverity:            SeverityHigh, // Filter out noise below High
+			DisableAmbientCapsules: true,
 		},
 		EnabledPacks: []string{},
 		CustomFeeds: []FeedConfig{
@@ -311,5 +313,205 @@ func TestRadar_SyncerEndToEnd(t *testing.T) {
 	}
 	if node.AuthorityTier != authz.TierName3Episodic {
 		t.Errorf("expected Tier 3.5 authority, got %q", node.AuthorityTier)
+	}
+}
+
+func TestRadar_CapsuleFirstIngestionPoint(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// 1. Create a source database to export as a baseline capsule
+	srcDBPath := filepath.Join(tmpDir, "source.db")
+	srcStore, err := sqlite.NewSQLiteStore(srcDBPath)
+	if err != nil {
+		t.Fatalf("failed to create source sqlite store: %v", err)
+	}
+	embedder := embedding.NewLocalHashEmbedder(128)
+	srcMgr := brain.NewManager(srcStore, embedder, nil)
+
+	// Pre-seed baseline radar facts into source database
+	_, err = srcMgr.Remember(ctx, brain.RememberRequest{
+		SessionID:     "radar-baseline",
+		Category:      "industry_radar",
+		Content:       "Baseline Advisory CVE-2026-1001: Pre-packaged offline exploit primitive in capsule",
+		Provenance:    brain.ProvenanceUntrustedWeb,
+		AuthorityTier: authz.TierName3Episodic,
+	})
+	if err != nil {
+		t.Fatalf("pre-seed remember failed: %v", err)
+	}
+	srcStore.Close()
+
+	// 2. Export source database into a signed capsule
+	capsulePath := filepath.Join(tmpDir, "radar-test.capsule")
+	manifest, err := capsule.ExportCapsule(ctx, srcDBPath, capsulePath, nil)
+	if err != nil {
+		t.Fatalf("ExportCapsule failed: %v", err)
+	}
+	if manifest.TotalRecords != 1 {
+		t.Fatalf("expected 1 record in capsule, got %d", manifest.TotalRecords)
+	}
+
+	// 3. Create a fresh target database representing an air-gapped or fresh agent workstation
+	dstDBPath := filepath.Join(tmpDir, "target.db")
+	dstStore, err := sqlite.NewSQLiteStore(dstDBPath)
+	if err != nil {
+		t.Fatalf("failed to create target sqlite store: %v", err)
+	}
+	defer dstStore.Close()
+	dstMgr := brain.NewManager(dstStore, embedder, nil)
+
+	// 4. Configure Syncer with CapsulePath pointing to our capsule file
+	cfg := &RadarConfig{
+		Version: "1.0",
+		Settings: RadarSettings{
+			Enabled:     true,
+			CapsulePath: capsulePath,
+		},
+		EnabledPacks: []string{},
+		CustomFeeds:  []FeedConfig{},
+	}
+
+	syncer := NewSyncer(cfg, dstMgr)
+	res, err := syncer.SyncPass(ctx)
+	if err != nil {
+		t.Fatalf("SyncPass failed: %v", err)
+	}
+
+	if res.CapsuleIngestedCount != 1 {
+		t.Errorf("expected 1 fact ingested from capsule as first ingestion point, got %d (errors: %v)", res.CapsuleIngestedCount, res.Errors)
+	}
+	if len(res.CapsulesChecked) != 1 {
+		t.Errorf("expected 1 capsule checked, got %d", len(res.CapsulesChecked))
+	}
+
+	// 5. Verify the target brain now has the baseline radar fact recalled
+	recalled, err := dstMgr.Recall(ctx, brain.RecallRequest{
+		Category: "industry_radar",
+		Query:    "offline exploit primitive in capsule",
+		Limit:    5,
+	})
+	if err != nil {
+		t.Fatalf("Recall failed on target brain: %v", err)
+	}
+	if len(recalled) == 0 {
+		t.Fatalf("expected recalled radar fact imported from capsule, got 0")
+	}
+	if !strings.Contains(recalled[0].Node.Content, "CVE-2026-1001") {
+		t.Errorf("unexpected content: %s", recalled[0].Node.Content)
+	}
+}
+
+func TestRadar_DisabledSyncCapsuleOnly(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// 1. Setup source db and write a radar node
+	srcDBPath := filepath.Join(tmpDir, "source_disabled.db")
+	srcStore, err := sqlite.NewSQLiteStore(srcDBPath)
+	if err != nil {
+		t.Fatalf("failed to create source store: %v", err)
+	}
+	embedder := embedding.NewLocalHashEmbedder(128)
+	srcMgr := brain.NewManager(srcStore, embedder, nil)
+
+	_, err = srcMgr.Remember(ctx, brain.RememberRequest{
+		SessionID:     "radar-baseline",
+		Category:      "industry_radar",
+		Content:       "Baseline Advisory CVE-2026-9999: Offline Capsule Advisory",
+		Provenance:    brain.ProvenanceUntrustedWeb,
+		AuthorityTier: authz.TierName3Episodic,
+	})
+	if err != nil {
+		t.Fatalf("srcMgr.Remember failed: %v", err)
+	}
+	srcStore.Close()
+
+	// 2. Export to capsule
+	capsulePath := filepath.Join(tmpDir, "offline.capsule")
+	_, err = capsule.ExportCapsule(ctx, srcDBPath, capsulePath, nil)
+	if err != nil {
+		t.Fatalf("ExportCapsule failed: %v", err)
+	}
+
+	// 3. Register mock feed with MemoryAdapter
+	memAdapter := NewMemoryAdapter()
+	Register(memAdapter)
+	feedID := "live-feed-should-not-run"
+	memAdapter.SetItems(feedID, []RawItem{
+		{
+			FeedID:      feedID,
+			ExternalID:  "LIVE-001",
+			Title:       "SHOULD NEVER BE INGESTED",
+			RawBody:     "Live feed data that must not be ingested when radar is disabled",
+			URL:         "https://example.com/live-001",
+			PublishedAt: time.Now().UTC(),
+		},
+	})
+
+	// 4. Target database with radar disabled (Settings.Enabled == false)
+	dstDBPath := filepath.Join(tmpDir, "target_disabled.db")
+	dstStore, err := sqlite.NewSQLiteStore(dstDBPath)
+	if err != nil {
+		t.Fatalf("failed to create target store: %v", err)
+	}
+	defer dstStore.Close()
+	dstMgr := brain.NewManager(dstStore, embedder, nil)
+
+	cfg := &RadarConfig{
+		Version: "1.0",
+		Settings: RadarSettings{
+			Enabled:                false, // DISABLED!
+			CapsulePath:            capsulePath,
+			DisableAmbientCapsules: true,
+		},
+		EnabledPacks: []string{},
+		CustomFeeds: []FeedConfig{
+			{
+				ID:      feedID,
+				Adapter: "static",
+				Enabled: true,
+			},
+		},
+	}
+
+	syncer := NewSyncer(cfg, dstMgr)
+	res, err := syncer.SyncPass(ctx)
+	if err != nil {
+		t.Fatalf("SyncPass failed: %v", err)
+	}
+
+	// 5. Invariant check: Capsules are the ONLY data ingested when radar is disabled
+	if res.CapsuleIngestedCount != 1 {
+		t.Errorf("expected 1 fact from capsule, got %d", res.CapsuleIngestedCount)
+	}
+	if res.TotalFeeds != 0 {
+		t.Errorf("expected 0 total live feeds run when radar is disabled, got %d", res.TotalFeeds)
+	}
+	if res.TotalItems != 0 {
+		t.Errorf("expected 0 live items fetched when radar is disabled, got %d", res.TotalItems)
+	}
+	if res.IngestedCount != 1 {
+		t.Errorf("expected IngestedCount == 1 (capsule only), got %d", res.IngestedCount)
+	}
+
+	// Verify capsule fact exists in brain
+	recalled, err := dstMgr.Recall(ctx, brain.RecallRequest{
+		Category: "industry_radar",
+		Query:    "CVE-2026-9999",
+		Limit:    5,
+	})
+	if err != nil || len(recalled) == 0 {
+		t.Fatalf("expected capsule fact in brain, got err=%v, results=%d", err, len(recalled))
+	}
+
+	// Verify live feed fact does NOT exist in brain
+	recalledLive, _ := dstMgr.Recall(ctx, brain.RecallRequest{
+		Category: "industry_radar",
+		Query:    "SHOULD NEVER BE INGESTED",
+		Limit:    5,
+	})
+	if len(recalledLive) > 0 && strings.Contains(recalledLive[0].Node.Content, "SHOULD NEVER BE INGESTED") {
+		t.Fatalf("FATAL: live feed fact was ingested even though radar was disabled!")
 	}
 }

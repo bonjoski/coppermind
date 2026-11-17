@@ -20,6 +20,9 @@ type RadarSettings struct {
 	MinConfidence         string `yaml:"min_confidence" json:"min_confidence"`
 	MinSeverity           string `yaml:"min_severity" json:"min_severity"`
 	FactTTL               string `yaml:"fact_ttl" json:"fact_ttl"`
+	CapsulePath           string `yaml:"capsule_path,omitempty" json:"capsule_path,omitempty"`
+	CapsuleDir            string `yaml:"capsule_dir,omitempty" json:"capsule_dir,omitempty"`
+	DisableAmbientCapsules bool  `yaml:"disable_ambient_capsules,omitempty" json:"disable_ambient_capsules,omitempty"`
 }
 
 // RadarConfig holds the declarative radar configuration.

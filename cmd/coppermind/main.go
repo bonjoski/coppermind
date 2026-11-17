@@ -1582,11 +1582,8 @@ func runRadar(args []string) {
 		}
 
 		if !cfg.Settings.Enabled {
-			fmt.Println("Notice: Industry radar is disabled by default.")
-			fmt.Println("To run sync, either:")
-			fmt.Println("  1. Pass the --enable flag: coppermind radar sync --enable")
-			fmt.Println("  2. Or set 'settings.enabled: true' in ~/.coppermind/radar.yaml or .coppermind/radar.yaml")
-			return
+			fmt.Println("Notice: Industry radar live feeds are disabled by default. Running in offline capsule-only ingestion mode.")
+			fmt.Println("To enable live external feeds, pass --enable or set 'settings.enabled: true' in radar.yaml.")
 		}
 
 		mgr, activeProj, err := initManager(*dataDir, *project)
@@ -1597,7 +1594,11 @@ func runRadar(args []string) {
 		defer mgr.Close()
 
 		ctx := context.Background()
-		fmt.Printf("Starting radar sync across %d active feeds into vault %q...\n", len(cfg.ActiveFeeds()), activeProj)
+		if cfg.Settings.Enabled {
+			fmt.Printf("Starting radar sync across %d active feeds into vault %q...\n", len(cfg.ActiveFeeds()), activeProj)
+		} else {
+			fmt.Printf("Starting offline capsule-only sync into vault %q...\n", activeProj)
+		}
 		syncer := radar.NewSyncer(cfg, mgr)
 		res, err := syncer.SyncPass(ctx)
 		if err != nil {
@@ -1606,9 +1607,16 @@ func runRadar(args []string) {
 		}
 
 		fmt.Printf("\n✓ Radar sync completed in %dms\n", res.DurationMillis)
-		fmt.Printf("  • Total Feeds: %d\n", res.TotalFeeds)
-		fmt.Printf("  • Raw Items Fetched: %d\n", res.TotalItems)
-		fmt.Printf("  • Ingested Facts: %d\n", res.IngestedCount)
+		if len(res.CapsulesChecked) > 0 {
+			fmt.Printf("  • Capsules Checked: %d (Ingested Facts: %d)\n", len(res.CapsulesChecked), res.CapsuleIngestedCount)
+		}
+		if cfg.Settings.Enabled {
+			fmt.Printf("  • Total Feeds: %d\n", res.TotalFeeds)
+			fmt.Printf("  • Raw Items Fetched: %d\n", res.TotalItems)
+		} else {
+			fmt.Println("  • Live Feeds: Skipped (radar disabled; offline capsule-only mode)")
+		}
+		fmt.Printf("  • Total Ingested Facts: %d\n", res.IngestedCount)
 		if len(res.Errors) > 0 {
 			fmt.Printf("  • Warnings/Errors (%d):\n", len(res.Errors))
 			for _, e := range res.Errors {
@@ -1616,8 +1624,26 @@ func runRadar(args []string) {
 			}
 		}
 
+	case "export-capsule":
+		fs := flag.NewFlagSet("radar export-capsule", flag.ExitOnError)
+		dataDir := fs.String("data-dir", "", "Data directory")
+		project := fs.String("project", "", "Target project vault")
+		outPath := fs.String("out", "radar-baseline.capsule", "Output capsule path")
+		_ = fs.Parse(cmdArgs)
+
+		dbPath := getDBPath(*dataDir, *project)
+		manifest, err := capsule.ExportCapsule(context.Background(), dbPath, *outPath, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Export failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("✓ Successfully exported radar capsule to %s\n", *outPath)
+		fmt.Printf("  • Total Records: %d\n", manifest.TotalRecords)
+		fmt.Printf("  • SHA-256 Checksum: %s\n", manifest.DBChecksum)
+
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown radar action %q. Usage: coppermind radar <sync|detect|list>\n", action)
+		fmt.Fprintf(os.Stderr, "Unknown radar action %q. Usage: coppermind radar <sync|detect|list|export-capsule>\n", action)
 		os.Exit(1)
 	}
 }

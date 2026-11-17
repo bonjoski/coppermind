@@ -3,6 +3,7 @@ package radar
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -11,12 +12,14 @@ import (
 
 // SyncResult captures the metrics and outcomes of a radar sync pass.
 type SyncResult struct {
-	TotalFeeds     int      `json:"total_feeds"`
-	TotalItems     int      `json:"total_items"`
-	IngestedCount  int      `json:"ingested_count"`
-	SkippedCount   int      `json:"skipped_count"`
-	Errors         []string `json:"errors,omitempty"`
-	DurationMillis int64    `json:"duration_ms"`
+	TotalFeeds           int      `json:"total_feeds"`
+	TotalItems           int      `json:"total_items"`
+	IngestedCount        int      `json:"ingested_count"`
+	CapsuleIngestedCount int      `json:"capsule_ingested_count"`
+	SkippedCount         int      `json:"skipped_count"`
+	CapsulesChecked      []string `json:"capsules_checked,omitempty"`
+	Errors               []string `json:"errors,omitempty"`
+	DurationMillis       int64    `json:"duration_ms"`
 }
 
 // Syncer coordinates out-of-band radar ingestion into the brain manager.
@@ -37,22 +40,40 @@ func NewSyncer(cfg *RadarConfig, mgr *brain.Manager) *Syncer {
 }
 
 // SyncPass executes an asynchronous sync across all active feeds.
+// When radar is disabled (Settings.Enabled == false), capsules are the ONLY data ingested (offline baseline mode).
+// When radar is enabled, capsules are ingested first, followed by live external feed synchronization.
 func (s *Syncer) SyncPass(ctx context.Context) (*SyncResult, error) {
-	if !s.cfg.Settings.Enabled {
-		return &SyncResult{
-			TotalFeeds: 0,
-			Errors:     []string{"radar is disabled by default: set 'settings.enabled: true' in radar.yaml to activate"},
-		}, nil
-	}
-
 	start := time.Now()
-	feeds := s.cfg.ActiveFeeds()
-
-	res := &SyncResult{
-		TotalFeeds: len(feeds),
-	}
+	res := &SyncResult{}
 
 	var mu sync.Mutex
+
+	// 1. FIRST INGESTION POINT: Discover and ingest local radar capsule archives.
+	// Capsules are offline, immutable, and are the ONLY data ingested if the radar is disabled.
+	capsules := FindCapsules(s.cfg)
+	res.CapsulesChecked = capsules
+	for _, capPath := range capsules {
+		count, err := IngestCapsule(ctx, capPath, s.mgr)
+		if err != nil {
+			mu.Lock()
+			res.Errors = append(res.Errors, fmt.Sprintf("capsule %q error: %v", filepath.Base(capPath), err))
+			mu.Unlock()
+		} else {
+			mu.Lock()
+			res.CapsuleIngestedCount += count
+			res.IngestedCount += count
+			mu.Unlock()
+		}
+	}
+
+	// If radar is disabled, capsules are the ONLY data ingested; skip all live network feeds.
+	if !s.cfg.Settings.Enabled {
+		res.DurationMillis = time.Since(start).Milliseconds()
+		return res, nil
+	}
+
+	feeds := s.cfg.ActiveFeeds()
+	res.TotalFeeds = len(feeds)
 
 	for _, feed := range feeds {
 		adapter, err := GetAdapter(feed.Adapter)
