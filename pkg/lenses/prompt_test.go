@@ -269,3 +269,113 @@ func TestEscapeXMLContent_AllDelimitersAndCasing(t *testing.T) {
 		}
 	}
 }
+
+func TestSystemsArchitect_LeanPromptGeneration(t *testing.T) {
+	cfg := DefaultConfig()
+	lens, ok := cfg.GetLens("systems-architect")
+	if !ok {
+		t.Fatalf("systems-architect lens not found in default config")
+	}
+
+	// 1. Verify lean prompt characteristics
+	if !strings.Contains(lens.SystemPrompt, "Lean Systems Architect Auditor") {
+		t.Errorf("system prompt missing 'Lean Systems Architect Auditor'")
+	}
+	if !strings.Contains(lens.SystemPrompt, "1. MAP ARCHITECTURAL BOUNDARY") {
+		t.Errorf("system prompt missing step 1: MAP ARCHITECTURAL BOUNDARY")
+	}
+	if !strings.Contains(lens.SystemPrompt, "2. BOUNDARY LEAK CHECK") {
+		t.Errorf("system prompt missing step 2: BOUNDARY LEAK CHECK")
+	}
+	if !strings.Contains(lens.SystemPrompt, "3. REPRODUCIBLE REFACTOR TRACE") {
+		t.Errorf("system prompt missing step 3: REPRODUCIBLE REFACTOR TRACE")
+	}
+	if !strings.Contains(lens.SystemPrompt, "boundary_leak") {
+		t.Errorf("system prompt missing category 'boundary_leak'")
+	}
+	if !strings.Contains(lens.SystemPrompt, "entry_point") {
+		t.Errorf("system prompt missing 'entry_point'")
+	}
+	if !strings.Contains(lens.SystemPrompt, "poc") {
+		t.Errorf("system prompt missing 'poc'")
+	}
+
+	// Token slimming check: prompt should be concise (< 1500 chars, ~250 tokens)
+	if len(lens.SystemPrompt) > 1500 {
+		t.Errorf("lean prompt exceeded token budget: %d chars", len(lens.SystemPrompt))
+	}
+
+	// 2. Build prompt with candidate and recalled ADR context
+	candidate := &brain.MemoryNode{
+		ID:        "cand_arch_code",
+		SessionID: "sess-arch",
+		Category:  "code",
+		Content:   "package brain\nimport \"flag\"\nfunc Parse() { flag.Parse() }",
+		CreatedAt: time.Now(),
+	}
+	adrNode := &brain.MemoryNode{
+		ID:         "mem_adr_004",
+		Category:   "architecture",
+		Provenance: brain.ProvenanceLocalWorkspace,
+		Content:    "ADR-004: Core brain package must never import transport or CLI flags directly.",
+		CreatedAt:  time.Now(),
+	}
+
+	sysPrompt, userPrompt := BuildEvaluationPrompt(lens, candidate, []*brain.MemoryNode{adrNode})
+	if !strings.Contains(sysPrompt, "Lean Systems Architect Auditor") {
+		t.Errorf("built system prompt missing lean header")
+	}
+	if !strings.Contains(userPrompt, "<recalled_context>") {
+		t.Errorf("user prompt missing <recalled_context>")
+	}
+	if !strings.Contains(userPrompt, "ADR-004: Core brain package must never import transport") {
+		t.Errorf("user prompt missing recalled ADR content")
+	}
+	if !strings.Contains(userPrompt, "<untrusted_artifact") {
+		t.Errorf("user prompt missing <untrusted_artifact>")
+	}
+}
+
+func TestSystemsArchitect_SchemaParsing(t *testing.T) {
+	rawJSON := `{
+		"findings": [
+			{
+				"severity": "high",
+				"category": "boundary_leak",
+				"entry_point": "pkg/brain/manager.go",
+				"summary": "Direct dependency on transport CLI flag violates ADR-004",
+				"evidence": "import 'flag' found in core brain domain",
+				"poc": "Extract flag parsing to cmd/coppermind/main.go and pass configured struct into brain.NewManager"
+			}
+		]
+	}`
+
+	resp, err := parseAndSanitizeResponse(rawJSON)
+	if err != nil {
+		t.Fatalf("failed to parse systems-architect finding JSON: %v", err)
+	}
+
+	if len(resp.Findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(resp.Findings))
+	}
+
+	f := resp.Findings[0]
+	if f.Severity != "high" {
+		t.Errorf("expected severity 'high', got %q", f.Severity)
+	}
+	if f.Category != "boundary_leak" {
+		t.Errorf("expected category 'boundary_leak', got %q", f.Category)
+	}
+	if f.EntryPoint != "pkg/brain/manager.go" {
+		t.Errorf("expected entry_point 'pkg/brain/manager.go', got %q", f.EntryPoint)
+	}
+	if !strings.Contains(f.Summary, "violates ADR-004") {
+		t.Errorf("expected summary containing 'violates ADR-004', got %q", f.Summary)
+	}
+	if !strings.Contains(f.Evidence, "import 'flag'") {
+		t.Errorf("expected evidence containing \"import 'flag'\", got %q", f.Evidence)
+	}
+	if !strings.Contains(f.PoC, "Extract flag parsing to cmd/coppermind/main.go") {
+		t.Errorf("expected poc containing refactor trace, got %q", f.PoC)
+	}
+}

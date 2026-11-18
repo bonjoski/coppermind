@@ -918,3 +918,169 @@ func TestLens_SecurityArchitect_DifferentialAuth(t *testing.T) {
 		t.Errorf("expected unverified_poc to not be set to true for valid PoC")
 	}
 }
+
+// TestLens_SystemsArchitect_BoundaryCrossing verifies the 3-step lean architecture taskflow:
+// mapping architectural boundaries, detecting ADR violations / layer leaks in recalled context,
+// and synthesizing a reproducible refactor trace.
+func TestLens_SystemsArchitect_BoundaryCrossing(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "sysarch.db")
+
+	store, err := sqlite.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	embedder := embedding.NewLocalHashEmbedder(128)
+	scratch := scratchpad.NewMemoryScratchpad()
+	mgr := brain.NewManager(store, embedder, scratch)
+
+	cfg := lenses.DefaultConfig()
+
+	// 1. Ingest Stored ADR baseline (ADR-004: Core package must never import transport or CLI flags)
+	adrContent := `ADR-004: Subsystem Boundary Isolation for package brain.
+Rule: Core package brain must never import flag or transport directly.
+Violation: CLIConfig or ParseFlags using flag.Parse inside brain is forbidden.`
+	_, err = mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:  "sess-sys-arch",
+		Category:   "architecture",
+		Content:    adrContent,
+		Provenance: brain.ProvenanceLocalWorkspace,
+		Metadata: map[string]string{
+			"advisory_ref": "ADR-004",
+			"tier":         "TIER_1_ARCHITECTURE",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to remember ADR: %v", err)
+	}
+
+	// 2. Ingest Candidate Component with boundary leak (Core package parsing CLI flags)
+	candidateCode := `package brain
+
+import "flag"
+
+type CLIConfig struct {
+    DataDir string
+}
+
+func ParseFlags() *CLIConfig {
+    d := flag.String("data-dir", "", "Data directory")
+    flag.Parse()
+    return &CLIConfig{DataDir: *d}
+}`
+	candidateNode, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:  "sess-sys-arch",
+		Category:   "code",
+		Content:    candidateCode,
+		Provenance: brain.ProvenanceLocalWorkspace,
+		Metadata: map[string]string{
+			"file_path": "pkg/brain/config.go",
+			"package":   "brain",
+			"component": "CLIConfig",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to remember candidate code: %v", err)
+	}
+
+	// 3. Mock Router verifying lean prompt generation and ADR grounding
+	leanPromptVerified := false
+	recalledContextVerified := false
+
+	mockR := &mockRouter{
+		completeFunc: func(ctx context.Context, req *router.CompletionRequest) (*router.CompletionResponse, error) {
+			sysPrompt := req.Messages[0].Content
+			userPrompt := req.Messages[1].Content
+
+			// Verify Lean Architecture Taskflow System Prompt
+			if strings.Contains(sysPrompt, "Lean Systems Architect Auditor") &&
+				strings.Contains(sysPrompt, "1. MAP ARCHITECTURAL BOUNDARY") &&
+				strings.Contains(sysPrompt, "2. BOUNDARY LEAK CHECK") &&
+				strings.Contains(sysPrompt, "3. REPRODUCIBLE REFACTOR TRACE") &&
+				strings.Contains(sysPrompt, "boundary_leak") {
+				leanPromptVerified = true
+			}
+
+			// Verify Recalled Context contains ADR-004 baseline
+			if strings.Contains(userPrompt, "<recalled_context>") &&
+				strings.Contains(userPrompt, "ADR-004: Subsystem Boundary Isolation") {
+				recalledContextVerified = true
+			}
+
+			// Return structured architectural finding with reproducible refactoring trace
+			return &router.CompletionResponse{
+				Content: `{
+					"findings": [
+						{
+							"severity": "high",
+							"category": "boundary_leak",
+							"entry_point": "pkg/brain/config.go:ParseFlags",
+							"summary": "Core package directly imports 'flag' and parses CLI arguments, violating ADR-004 subsystem isolation",
+							"evidence": "import \"flag\" and flag.Parse() inside core package brain",
+							"poc": "Step 1: Move CLIConfig and flag parsing to cmd/coppermind/main.go. Step 2: Inject configuration struct into brain.NewManager()."
+						}
+					]
+				}`,
+			}, nil
+		},
+	}
+
+	broker := queue.NewEmbeddedBroker(100)
+	defer broker.Close()
+
+	engine := lenses.NewEngine(cfg, broker, mgr, mockR, "default", nil)
+
+	// 4. Run reflection on systems-architect lens
+	res, err := engine.Reflect(ctx, lenses.ReflectRequest{
+		Lens:           "systems-architect",
+		Project:        "default",
+		CandidateNodes: []*brain.MemoryNode{candidateNode},
+	})
+	if err != nil {
+		t.Fatalf("reflect failed: %v", err)
+	}
+
+	if !leanPromptVerified {
+		t.Errorf("lean prompt verification failed: systems-architect prompt did not contain 3-step lean taskflow")
+	}
+	if !recalledContextVerified {
+		t.Errorf("recalled context verification failed: ADR-004 not present in model prompt")
+	}
+
+	if len(res.Observations) != 1 {
+		t.Fatalf("expected 1 observation, got %d", len(res.Observations))
+	}
+
+	obs := res.Observations[0]
+	if obs.Severity != "high" {
+		t.Errorf("expected observation severity 'high', got %q", obs.Severity)
+	}
+	if obs.SourceLens != "systems-architect" {
+		t.Errorf("expected source_lens 'systems-architect', got %q", obs.SourceLens)
+	}
+
+	// Verify Entry Point, Evidence, and PoC refactor trace in observation content
+	if !strings.Contains(obs.Content, "Entry Point: pkg/brain/config.go:ParseFlags") {
+		t.Errorf("observation content missing Entry Point: %s", obs.Content)
+	}
+	if !strings.Contains(obs.Content, "Evidence: import \"flag\" and flag.Parse()") {
+		t.Errorf("observation content missing Evidence: %s", obs.Content)
+	}
+	if !strings.Contains(obs.Content, "PoC: Step 1: Move CLIConfig") {
+		t.Errorf("observation content missing PoC refactor trace: %s", obs.Content)
+	}
+
+	// Verify Metadata fields
+	if obs.Metadata["entry_point"] != "pkg/brain/config.go:ParseFlags" {
+		t.Errorf("expected metadata entry_point 'pkg/brain/config.go:ParseFlags', got %q", obs.Metadata["entry_point"])
+	}
+	if obs.Metadata["finding_category"] != "boundary_leak" {
+		t.Errorf("expected metadata finding_category 'boundary_leak', got %q", obs.Metadata["finding_category"])
+	}
+	if !strings.Contains(obs.Metadata["poc"], "Move CLIConfig and flag parsing") {
+		t.Errorf("expected metadata poc containing refactor trace, got %q", obs.Metadata["poc"])
+	}
+}
