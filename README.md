@@ -177,6 +177,21 @@ coppermind doctor
 coppermind status
 ```
 
+---
+
+## 💡 Core Use Cases & Recipes
+
+Every primary developer use case is backed by dedicated, copy-pasteable recipes in [**`docs/use-cases/`**](docs/use-cases/README.md):
+
+| Use Case | Scenario & Quick Recipe | Full Guide |
+| :--- | :--- | :--- |
+| **Cross-Session Cognitive Memory & Retrieval** | Store and query architectural facts via hybrid vector search:<br/>`coppermind remember` && `coppermind recall "<query>"` | [Guide](docs/use-cases/01-cross-session-memory.md) |
+| **Automated Git Post-Commit Reflection** | Ingest commit diffs and flag architectural drifts automatically:<br/>`coppermind hook install` && `coppermind observations` | [Guide](docs/use-cases/02-git-hook-reflection.md) |
+| **Multi-Perspective Analytical Threat Lenses** | Stress-test RFCs with automated Devil's Advocate and Red Team lenses:<br/>`coppermind radar --lenses all --file <doc>` | [Guide](docs/use-cases/03-analytical-threat-lenses.md) |
+| **Exporting Signed Knowledge Capsules** | Create immutable, signed `.capsule` archives linking memory to release tags:<br/>`coppermind export-capsule --sign` | [Guide](docs/use-cases/04-signed-knowledge-capsules.md) |
+
+---
+
 ### Connecting to AI Coding Agents (Claude Code, Cursor, Antigravity)
 
 Add Coppermind to your agent's MCP configuration (`mcp_config.json` or `claude_desktop_config.json`):
