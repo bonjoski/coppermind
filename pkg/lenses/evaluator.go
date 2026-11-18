@@ -14,6 +14,53 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
+// EnforcePoCGate ensures findings have actionable, reproducible proof before alerting.
+// Returns true for info or low severity findings.
+// For medium, high, critical, requires a non-empty, actionable PoC (>= 15 characters,
+// not placeholder/todo/na, containing executable structures such as curl, http, {}, (), $).
+// If a medium/high/critical finding fails the PoC gate, demotes severity to info,
+// sets UnverifiedPoC = true, and returns false.
+func EnforcePoCGate(f *Finding) bool {
+	if f == nil {
+		return false
+	}
+
+	sev := strings.ToLower(strings.TrimSpace(f.Severity))
+	if sev == "info" || sev == "low" {
+		return true
+	}
+
+	cleanPoC := strings.TrimSpace(f.PoC)
+	if len(cleanPoC) < 15 {
+		f.Severity = "info"
+		f.UnverifiedPoC = true
+		return false
+	}
+
+	lower := strings.ToLower(cleanPoC)
+	if strings.Contains(lower, "todo") || strings.Contains(lower, "n/a") || strings.Contains(lower, "not applicable") {
+		f.Severity = "info"
+		f.UnverifiedPoC = true
+		return false
+	}
+
+	// Must contain a verifiable command or payload structure
+	hasExecutableStructure := strings.Contains(lower, "curl") ||
+		strings.Contains(lower, "http") ||
+		strings.Contains(cleanPoC, "{") ||
+		strings.Contains(cleanPoC, "()") ||
+		(strings.Contains(cleanPoC, "(") && strings.Contains(cleanPoC, ")")) ||
+		strings.Contains(cleanPoC, "$")
+
+	if !hasExecutableStructure {
+		f.Severity = "info"
+		f.UnverifiedPoC = true
+		return false
+	}
+
+	return true
+}
+
 // ComputeDedupHash calculates a deterministic idempotency key for an observation:
 // SHA256(project + ":" + lens_name + ":" + target_memory_hash + ":" + observation_fingerprint)
 func ComputeDedupHash(project, lensName, targetHash, summary string) string {
@@ -51,7 +98,19 @@ func EvaluateCandidate(ctx context.Context, lens *LensConfig, candidate *brain.M
 		return nil, fmt.Errorf("model completion failed for lens %q: %w", lens.Name, err)
 	}
 
-	return parseAndSanitizeResponse(resp.Content)
+	modelResp, err := parseAndSanitizeResponse(resp.Content)
+	if err != nil {
+		return nil, err
+	}
+
+	// For security-architect lens, enforce PoC gate across all findings
+	if lens != nil && lens.Name == "security-architect" {
+		for i := range modelResp.Findings {
+			EnforcePoCGate(&modelResp.Findings[i])
+		}
+	}
+
+	return modelResp, nil
 }
 
 // parseAndSanitizeResponse parses the model output, enforces structured JSON, and runs secret quarantine.
@@ -86,6 +145,9 @@ func parseAndSanitizeResponse(content string) (*ModelResponse, error) {
 		// 2. NFKC Normalization & Zero-width rune stripping
 		normSummary := sanitizeRunes(f.Summary)
 		normEvidence := sanitizeRunes(f.Evidence)
+		normEntryPoint := sanitizeRunes(f.EntryPoint)
+		normSiblingInconsistency := sanitizeRunes(f.SiblingInconsistency)
+		normPoC := sanitizeRunes(f.PoC)
 
 		// 3. Secret & Credential Quarantine (Fail-closed or redact)
 		secSum, err := security.SanitizeMemory(normSummary)
@@ -101,6 +163,21 @@ func parseAndSanitizeResponse(content string) (*ModelResponse, error) {
 			f.Evidence = "[REDACTED_PRIVATE_KEY]"
 		} else {
 			f.Evidence = secEv.SanitizedText
+		}
+
+		secPoC, err := security.SanitizeMemory(normPoC)
+		if err != nil {
+			f.PoC = "[REDACTED_PRIVATE_KEY]"
+		} else {
+			f.PoC = secPoC.SanitizedText
+		}
+
+		f.EntryPoint = normEntryPoint
+		f.SiblingInconsistency = normSiblingInconsistency
+
+		// 4. Enforce PoC gate for differential security findings
+		if f.Category == "differential_auth" || f.Category == "unintended_side_effect" || f.Category == "sink_injection" {
+			EnforcePoCGate(&f)
 		}
 
 		if strings.TrimSpace(f.Summary) != "" {

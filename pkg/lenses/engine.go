@@ -194,6 +194,18 @@ func (e *Engine) ProcessCandidate(ctx context.Context, lens *LensConfig, candida
 		}
 	}
 
+	// 2b. Recall sibling endpoints for differential authorization verification
+	if lens.Name == "security-architect" && e.manager != nil {
+		siblings := RetrieveSiblingEndpoints(ctx, e.manager, candidate)
+		for _, sib := range siblings {
+			if sib.Metadata == nil {
+				sib.Metadata = make(map[string]string)
+			}
+			sib.Metadata["is_sibling"] = "true"
+			contextMemories = append(contextMemories, sib)
+		}
+	}
+
 	// 3. Invoke LiteLLM via Model Router
 	modelResp, err := EvaluateCandidate(ctx, lens, candidate, contextMemories, e.router)
 	if err != nil {
@@ -218,12 +230,33 @@ func (e *Engine) ProcessCandidate(ctx context.Context, lens *LensConfig, candida
 		if finding.Evidence != "" {
 			obsContent += fmt.Sprintf("\nEvidence: %s", finding.Evidence)
 		}
+		if finding.EntryPoint != "" {
+			obsContent += fmt.Sprintf("\nEntry Point: %s", finding.EntryPoint)
+		}
+		if finding.SiblingInconsistency != "" {
+			obsContent += fmt.Sprintf("\nSibling Inconsistency: %s", finding.SiblingInconsistency)
+		}
+		if finding.PoC != "" {
+			obsContent += fmt.Sprintf("\nPoC: %s", finding.PoC)
+		}
 
 		meta := map[string]string{
 			"lens":             lens.Name,
 			"severity":         finding.Severity,
 			"finding_category": finding.Category,
 			"project":          e.project,
+		}
+		if finding.EntryPoint != "" {
+			meta["entry_point"] = finding.EntryPoint
+		}
+		if finding.SiblingInconsistency != "" {
+			meta["sibling_inconsistency"] = finding.SiblingInconsistency
+		}
+		if finding.PoC != "" {
+			meta["poc"] = finding.PoC
+		}
+		if finding.UnverifiedPoC {
+			meta["unverified_poc"] = "true"
 		}
 
 		obsNode, err := e.manager.Remember(ctx, brain.RememberRequest{

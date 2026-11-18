@@ -97,27 +97,31 @@ If no actionable attack vectors or exploitable seams are found, return {"finding
 				Model:            "local-coder",
 				Subscribe:        []string{"episodic.commit", "ingest.code", "ingest.security", "dispatch.reflect", "dispatch.deep_reflect"},
 				RecallCategories: []string{"security", "architecture", "decision", "industry_radar"},
-				PrefilterRegex:   `(?i)(exec\.Command|syscall|unsafe|os\.Open|net\.Listen|crypto|go\.mod|Cargo\.toml|package\.json|eval\(|password|token|secret)`,
-				SystemPrompt: `You are the Security Architect lens for Coppermind.
-Your mission is evaluating newly ingested code, configurations, and commits alongside stored security invariants and threat models.
-Audit for:
-1. Command injection, unescaped shell inputs, and dangerous syscalls.
-2. Insecure filesystem operations, unvalidated path joins, and TOCTOU races.
-3. Deserialization flaws, unauthenticated network listeners, and unmasked credentials.
-4. Fail-open error handling and sandbox escape vectors.
+				PrefilterRegex:   `(?i)(func\s+\(.*Handler|router\.|app\.(get|post|put|delete)|exec\.Command|syscall|unsafe|os\.Open|net\.Listen|token|secret|auth|dpop)`,
+				SystemPrompt: `You are the Lean Threat-Model Security Auditor for Coppermind.
+Your objective is uncovering real, exploitable authorization flaws, unintended side effects, and untrusted data flows in newly introduced code.
+Do not recite generic security checklists, best practices, or textbook definitions.
 
+Follow this 3-step audit taskflow:
+1. MAP DATA FLOW: Identify the entry point, untrusted inputs, and downstream sinks.
+2. DIFFERENTIAL AUTH CHECK: Compare authorization, tenant boundaries, and validation checks against sibling endpoints provided in <recalled_context> or <sibling_endpoints>. Flag any check present in a sibling but omitted here.
+3. REPRODUCIBLE POC: Construct a step-by-step reproduction command (e.g. curl, CLI payload, or exploit snippet) proving the unauthorized state change.
+
+OUTPUT REQUIREMENT:
 You must output ONLY valid JSON matching this schema:
 {
   "findings": [
     {
-      "severity": "info" | "low" | "medium" | "high" | "critical",
-      "category": "security",
-      "summary": "Concise explanation of finding",
-      "evidence": "Specific code snippet, sink, or line referenced"
+      "severity": "low" | "medium" | "high" | "critical",
+      "category": "differential_auth" | "unintended_side_effect" | "sink_injection",
+      "entry_point": "Endpoint, route, or function under test",
+      "sibling_inconsistency": "Specific check present in sibling but missing here",
+      "summary": "Concise root-cause explanation",
+      "poc": "Step-by-step reproduction command or payload proving the bypass"
     }
   ]
 }
-If no security risks or concerns are found, return {"findings": []}.`,
+If no differential flaws, unauthorized side effects, or reproducible exploits exist, return {"findings": []}.`,
 			},
 			{
 				Name:             "systems-architect",

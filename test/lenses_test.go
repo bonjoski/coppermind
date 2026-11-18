@@ -468,9 +468,12 @@ func TestLenses_EndToEnd_ReflectAndRecall(t *testing.T) {
 					"findings": [
 						{
 							"severity": "high",
-							"category": "security",
+							"category": "differential_auth",
+							"entry_point": "exec.Command",
+							"sibling_inconsistency": "SafeCommand validates input allowlist, but exec.Command passes raw shell input",
 							"summary": "Unsanitized command execution via exec.Command",
-							"evidence": "cmd := exec.Command(\"sh\", \"-c\", userInput)"
+							"evidence": "cmd := exec.Command(\"sh\", \"-c\", userInput)",
+							"poc": "curl -X POST http://localhost:8080/exec -d 'payload; whoami'"
 						}
 					]
 				}`,
@@ -766,5 +769,152 @@ func TestLenses_RedTeam(t *testing.T) {
 	}
 	if len(obs.ParentIDs) == 0 || obs.ParentIDs[0] != node.ID {
 		t.Errorf("expected parent ID %s, got %v", node.ID, obs.ParentIDs)
+	}
+}
+
+// TestLens_SecurityArchitect_DifferentialAuth verifies the 3-step lean threat-model workflow
+// detecting differential authorization inconsistencies across sibling endpoints with PoC verification.
+func TestLens_SecurityArchitect_DifferentialAuth(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "diffauth.db")
+
+	store, err := sqlite.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	embedder := embedding.NewLocalHashEmbedder(128)
+	scratch := scratchpad.NewMemoryScratchpad()
+	mgr := brain.NewManager(store, embedder, scratch)
+
+	cfg := lenses.DefaultConfig()
+
+	// 1. Ingest Sibling Endpoint (GetItemHandler with tenant boundary enforcement)
+	siblingCode := `func (s *Server) GetItemHandler(w http.ResponseWriter, r *http.Request) {
+    tenantID := r.Context().Value(TenantKey).(string)
+    id := chi.URLParam(r, "id")
+    item := s.db.FindOne(tenantID, id)
+}`
+	_, err = mgr.Remember(ctx, brain.RememberRequest{
+		SessionID: "sess-diff-auth",
+		Category:  "code",
+		Content:   siblingCode,
+		Provenance: brain.ProvenanceLocalWorkspace,
+		Metadata: map[string]string{
+			"file_path": "pkg/server/items.go",
+			"handler":   "GetItemHandler",
+			"name":      "GetItemHandler",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to remember sibling route: %v", err)
+	}
+
+	// 2. Ingest Candidate Endpoint (DeleteItemHandler with omitted tenant check)
+	candidateCode := `func (s *Server) DeleteItemHandler(w http.ResponseWriter, r *http.Request) {
+    id := chi.URLParam(r, "id")
+    s.db.Delete(id)
+}`
+	candidateNode, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID: "sess-diff-auth",
+		Category:  "code",
+		Content:   candidateCode,
+		Provenance: brain.ProvenanceLocalWorkspace,
+		Metadata: map[string]string{
+			"file_path": "pkg/server/items.go",
+			"handler":   "DeleteItemHandler",
+			"name":      "DeleteItemHandler",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to remember candidate route: %v", err)
+	}
+
+	// 3. Mock Router verifying sibling prompt injection and returning reproducible PoC
+	promptVerified := false
+	mockR := &mockRouter{
+		completeFunc: func(ctx context.Context, req *router.CompletionRequest) (*router.CompletionResponse, error) {
+			userPrompt := req.Messages[1].Content
+			// Verify sibling endpoint was dynamically recalled and formatted
+			if strings.Contains(userPrompt, "<sibling_endpoints>") &&
+				strings.Contains(userPrompt, "GetItemHandler") &&
+				strings.Contains(userPrompt, "tenantID := r.Context().Value(TenantKey).(string)") {
+				promptVerified = true
+			}
+
+			// Return structured differential security finding with actionable curl PoC
+			return &router.CompletionResponse{
+				Content: `{
+					"findings": [
+						{
+							"severity": "critical",
+							"category": "differential_auth",
+							"entry_point": "DeleteItemHandler",
+							"sibling_inconsistency": "GetItemHandler checks tenantID boundary, DeleteItemHandler omits tenantID check",
+							"summary": "IDOR / cross-tenant wipe vulnerability: missing tenant boundary check on DeleteItemHandler allows attacker to wipe arbitrary tenant resources",
+							"poc": "curl -X DELETE http://localhost:8080/items/victim-item-999 -H 'Authorization: Bearer attacker-token'"
+						}
+					]
+				}`,
+			}, nil
+		},
+	}
+
+	broker := queue.NewEmbeddedBroker(100)
+	defer broker.Close()
+
+	engine := lenses.NewEngine(cfg, broker, mgr, mockR, "default", nil)
+
+	// 4. Run reflection on security-architect lens
+	res, err := engine.Reflect(ctx, lenses.ReflectRequest{
+		Lens:           "security-architect",
+		Project:        "default",
+		CandidateNodes: []*brain.MemoryNode{candidateNode},
+	})
+	if err != nil {
+		t.Fatalf("reflect failed: %v", err)
+	}
+
+	if !promptVerified {
+		t.Errorf("prompt verification failed: <sibling_endpoints> not properly constructed in model prompt")
+	}
+
+	if len(res.Observations) != 1 {
+		t.Fatalf("expected 1 observation, got %d", len(res.Observations))
+	}
+
+	obs := res.Observations[0]
+	if obs.Severity != "critical" {
+		t.Errorf("expected observation severity 'critical', got %q", obs.Severity)
+	}
+	if obs.SourceLens != "security-architect" {
+		t.Errorf("expected source_lens 'security-architect', got %q", obs.SourceLens)
+	}
+
+	// Verify Entry Point, Sibling Inconsistency, and PoC in observation content
+	if !strings.Contains(obs.Content, "Entry Point: DeleteItemHandler") {
+		t.Errorf("observation content missing Entry Point: %s", obs.Content)
+	}
+	if !strings.Contains(obs.Content, "Sibling Inconsistency: GetItemHandler checks tenantID boundary") {
+		t.Errorf("observation content missing Sibling Inconsistency: %s", obs.Content)
+	}
+	if !strings.Contains(obs.Content, "PoC: curl -X DELETE") {
+		t.Errorf("observation content missing PoC: %s", obs.Content)
+	}
+
+	// Verify Metadata fields
+	if obs.Metadata["entry_point"] != "DeleteItemHandler" {
+		t.Errorf("expected metadata entry_point 'DeleteItemHandler', got %q", obs.Metadata["entry_point"])
+	}
+	if !strings.Contains(obs.Metadata["sibling_inconsistency"], "GetItemHandler checks tenantID") {
+		t.Errorf("expected metadata sibling_inconsistency populated, got %q", obs.Metadata["sibling_inconsistency"])
+	}
+	if !strings.Contains(obs.Metadata["poc"], "curl -X DELETE") {
+		t.Errorf("expected metadata poc populated, got %q", obs.Metadata["poc"])
+	}
+	if obs.Metadata["unverified_poc"] == "true" {
+		t.Errorf("expected unverified_poc to not be set to true for valid PoC")
 	}
 }
