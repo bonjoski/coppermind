@@ -1197,22 +1197,55 @@ func runObservations(args []string) {
 	}
 
 	for i, node := range obs {
-		sevBadge := strings.ToUpper(node.Severity)
-		statusBadge := strings.ToUpper(node.Status)
-		if statusBadge == "" {
-			statusBadge = "OPEN"
-		}
-		fmt.Printf("\n[%d] %s (%s) — %s [ID: %s]\n", i+1, sevBadge, node.SourceLens, statusBadge, node.ID)
-		fmt.Printf("    Created: %s\n", node.CreatedAt.Format(time.RFC3339))
-		if len(node.ParentIDs) > 0 {
-			fmt.Printf("    Parent Memories: %s\n", strings.Join(node.ParentIDs, ", "))
-		}
-		lines := strings.Split(node.Content, "\n")
-		for _, line := range lines {
-			fmt.Printf("    %s\n", line)
-		}
+		fmt.Printf("\n%s", FormatObservation(node, i+1))
 	}
 	fmt.Println()
+}
+
+// FormatObservation formats an observation node for display in the observations CLI.
+func FormatObservation(node *brain.MemoryNode, index int) string {
+	var sb strings.Builder
+	sevBadge := strings.ToUpper(node.Severity)
+	statusBadge := strings.ToUpper(node.Status)
+	if statusBadge == "" {
+		statusBadge = "OPEN"
+	}
+	sb.WriteString(fmt.Sprintf("[%d] %s (%s) — %s [ID: %s]\n", index, sevBadge, node.SourceLens, statusBadge, node.ID))
+	sb.WriteString(fmt.Sprintf("    Created: %s\n", node.CreatedAt.Format(time.RFC3339)))
+	if len(node.ParentIDs) > 0 {
+		sb.WriteString(fmt.Sprintf("    Parent Memories: %s\n", strings.Join(node.ParentIDs, ", ")))
+	}
+	if node.Metadata != nil {
+		if node.Metadata["unverified_poc"] == "true" {
+			sb.WriteString("  ⚠️  [UNVERIFIED POC: Demoted to Info]\n")
+		}
+		if ep, ok := node.Metadata["entry_point"]; ok && ep != "" {
+			sb.WriteString(fmt.Sprintf("  Entry Point: %s\n", ep))
+		}
+		if si, ok := node.Metadata["sibling_inconsistency"]; ok && si != "" {
+			sb.WriteString(fmt.Sprintf("  Sibling Inconsistency: %s\n", si))
+		}
+		if poc, ok := node.Metadata["poc"]; ok && poc != "" {
+			sb.WriteString(fmt.Sprintf("  PoC: %s\n", poc))
+		}
+	}
+	lines := strings.Split(node.Content, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if node.Metadata != nil {
+			if node.Metadata["entry_point"] != "" && strings.HasPrefix(trimmed, "Entry Point: ") {
+				continue
+			}
+			if node.Metadata["sibling_inconsistency"] != "" && strings.HasPrefix(trimmed, "Sibling Inconsistency: ") {
+				continue
+			}
+			if node.Metadata["poc"] != "" && strings.HasPrefix(trimmed, "PoC: ") {
+				continue
+			}
+		}
+		sb.WriteString(fmt.Sprintf("    %s\n", line))
+	}
+	return sb.String()
 }
 
 func runProject(args []string) {
