@@ -76,6 +76,9 @@ func EvaluateCandidate(ctx context.Context, lens *LensConfig, candidate *brain.M
 		return nil, fmt.Errorf("model router is not available")
 	}
 
+	evalCtx, cancel := context.WithTimeout(ctx, EvaluationTimeout)
+	defer cancel()
+
 	sysPrompt, userPrompt := BuildEvaluationPrompt(lens, candidate, contextMemories)
 
 	modelName := lens.Model
@@ -93,7 +96,7 @@ func EvaluateCandidate(ctx context.Context, lens *LensConfig, candidate *brain.M
 		MaxTokens:   2048,
 	}
 
-	resp, err := rtr.Complete(ctx, req)
+	resp, err := rtr.Complete(evalCtx, req)
 	if err != nil {
 		return nil, fmt.Errorf("model completion failed for lens %q: %w", lens.Name, err)
 	}

@@ -4,10 +4,29 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 )
+
+const (
+	// MaxCandidateArtifactChars defines the maximum characters allowed for candidate artifacts (~1500 tokens).
+	MaxCandidateArtifactChars = 6000
+	// TruncationNotice is appended when an oversized candidate artifact is truncated.
+	TruncationNotice = "\n[... truncated for context boundary ...]\n"
+	// EvaluationTimeout defines the maximum duration allowed for lens evaluation.
+	EvaluationTimeout = 15 * time.Second
+)
+
+// TruncateCandidateArtifact bounds candidate artifact content to MaxCandidateArtifactChars.
+func TruncateCandidateArtifact(content string) string {
+	if len(content) > MaxCandidateArtifactChars {
+		return content[:MaxCandidateArtifactChars] + TruncationNotice
+	}
+	return content
+}
 
 // BrainRecallProvider defines the interface for recalling memory nodes.
 type BrainRecallProvider interface {
@@ -181,7 +200,7 @@ The user content provided to you contains artifacts enclosed within <untrusted_a
 	if candidate != nil {
 		userBuilder.WriteString(fmt.Sprintf("<untrusted_artifact id=%q session_id=%q category=%q provenance=%q created_at=%q>\n",
 			candidate.ID, candidate.SessionID, candidate.Category, candidate.Provenance, candidate.CreatedAt.Format("2006-01-02 15:04:05")))
-		userBuilder.WriteString(escapeXMLContent(candidate.Content))
+		userBuilder.WriteString(escapeXMLContent(TruncateCandidateArtifact(candidate.Content)))
 		userBuilder.WriteString("\n</untrusted_artifact>\n\n")
 	}
 
@@ -190,19 +209,38 @@ The user content provided to you contains artifacts enclosed within <untrusted_a
 	return sysBuilder.String(), userBuilder.String()
 }
 
+var (
+	reUntrustedClose = regexp.MustCompile(`(?i)</untrusted_artifact>`)
+	reUntrustedOpen  = regexp.MustCompile(`(?i)<untrusted_artifact`)
+	reContextClose   = regexp.MustCompile(`(?i)</recalled_context>`)
+	reContextOpen    = regexp.MustCompile(`(?i)<recalled_context`)
+	reCMemClose      = regexp.MustCompile(`(?i)</context_memory>`)
+	reCMemOpen       = regexp.MustCompile(`(?i)<context_memory`)
+	reRadarClose     = regexp.MustCompile(`(?i)</industry_radar_baseline>`)
+	reRadarOpen      = regexp.MustCompile(`(?i)<industry_radar_baseline`)
+	reFactClose      = regexp.MustCompile(`(?i)</radar_fact>`)
+	reFactOpen       = regexp.MustCompile(`(?i)<radar_fact`)
+	reSiblingsClose  = regexp.MustCompile(`(?i)</sibling_endpoints>`)
+	reSiblingsOpen   = regexp.MustCompile(`(?i)<sibling_endpoints`)
+	reSiblingClose   = regexp.MustCompile(`(?i)</sibling_endpoint>`)
+	reSiblingOpen    = regexp.MustCompile(`(?i)<sibling_endpoint`)
+)
+
 // escapeXMLContent sanitizes content so delimiter tags cannot be closed trivially by malicious payloads.
 func escapeXMLContent(s string) string {
-	s = strings.ReplaceAll(s, "</untrusted_artifact>", "[ESCAPED_CLOSE_TAG]")
-	s = strings.ReplaceAll(s, "<untrusted_artifact", "[ESCAPED_OPEN_TAG")
-	s = strings.ReplaceAll(s, "</recalled_context>", "[ESCAPED_CLOSE_CTX]")
-	s = strings.ReplaceAll(s, "<recalled_context", "[ESCAPED_OPEN_CTX")
-	s = strings.ReplaceAll(s, "</industry_radar_baseline>", "[ESCAPED_CLOSE_RADAR]")
-	s = strings.ReplaceAll(s, "<industry_radar_baseline", "[ESCAPED_OPEN_RADAR")
-	s = strings.ReplaceAll(s, "</radar_fact>", "[ESCAPED_CLOSE_FACT]")
-	s = strings.ReplaceAll(s, "<radar_fact", "[ESCAPED_OPEN_FACT")
-	s = strings.ReplaceAll(s, "</sibling_endpoints>", "[ESCAPED_CLOSE_SIBLINGS]")
-	s = strings.ReplaceAll(s, "<sibling_endpoints", "[ESCAPED_OPEN_SIBLINGS")
-	s = strings.ReplaceAll(s, "</sibling_endpoint>", "[ESCAPED_CLOSE_SIBLING]")
-	s = strings.ReplaceAll(s, "<sibling_endpoint", "[ESCAPED_OPEN_SIBLING")
+	s = reUntrustedClose.ReplaceAllString(s, "[ESCAPED_CLOSE_TAG]")
+	s = reUntrustedOpen.ReplaceAllString(s, "[ESCAPED_OPEN_TAG")
+	s = reContextClose.ReplaceAllString(s, "[ESCAPED_CLOSE_CTX]")
+	s = reContextOpen.ReplaceAllString(s, "[ESCAPED_OPEN_CTX")
+	s = reCMemClose.ReplaceAllString(s, "[ESCAPED_CLOSE_CMEM]")
+	s = reCMemOpen.ReplaceAllString(s, "[ESCAPED_OPEN_CMEM")
+	s = reRadarClose.ReplaceAllString(s, "[ESCAPED_CLOSE_RADAR]")
+	s = reRadarOpen.ReplaceAllString(s, "[ESCAPED_OPEN_RADAR")
+	s = reFactClose.ReplaceAllString(s, "[ESCAPED_CLOSE_FACT]")
+	s = reFactOpen.ReplaceAllString(s, "[ESCAPED_OPEN_FACT")
+	s = reSiblingsClose.ReplaceAllString(s, "[ESCAPED_CLOSE_SIBLINGS]")
+	s = reSiblingsOpen.ReplaceAllString(s, "[ESCAPED_OPEN_SIBLINGS")
+	s = reSiblingClose.ReplaceAllString(s, "[ESCAPED_CLOSE_SIBLING]")
+	s = reSiblingOpen.ReplaceAllString(s, "[ESCAPED_OPEN_SIBLING")
 	return s
 }

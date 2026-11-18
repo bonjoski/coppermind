@@ -1,8 +1,13 @@
 package lenses
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/router"
 )
 
 func TestEnforcePoCGate(t *testing.T) {
@@ -279,5 +284,84 @@ func TestParseAndSanitizeResponse_DifferentialSecurity(t *testing.T) {
 	}
 	if !strings.Contains(fSec.PoC, "REDACTED") {
 		t.Errorf("expected PoC secret to be redacted, got: %s", fSec.PoC)
+	}
+}
+
+type mockEvalRouter struct {
+	completeFn func(ctx context.Context, req *router.CompletionRequest) (*router.CompletionResponse, error)
+}
+
+func (m *mockEvalRouter) Complete(ctx context.Context, req *router.CompletionRequest) (*router.CompletionResponse, error) {
+	if m.completeFn != nil {
+		return m.completeFn(ctx, req)
+	}
+	return &router.CompletionResponse{Content: `{"findings":[]}`}, nil
+}
+
+func (m *mockEvalRouter) Reflect(ctx context.Context, sessionID string, memories []*brain.MemoryNode) (string, error) {
+	return "", nil
+}
+
+func (m *mockEvalRouter) DistillDecisions(ctx context.Context, sessionID string, memories []*brain.MemoryNode) (string, error) {
+	return "", nil
+}
+
+func TestEvaluateCandidate_ContextDeadlineEnforcement(t *testing.T) {
+	lens := &LensConfig{
+		Name:         "security-architect",
+		Model:        "local-coder",
+		SystemPrompt: "Auditor",
+	}
+	candidate := &brain.MemoryNode{
+		ID:        "cand_1",
+		Content:   "func test() {}",
+		CreatedAt: time.Now(),
+	}
+
+	// 1. Verify deadline is set to <= 15s even if parent ctx has no deadline
+	var observedDeadline time.Time
+	var hadDeadline bool
+	rtr := &mockEvalRouter{
+		completeFn: func(ctx context.Context, req *router.CompletionRequest) (*router.CompletionResponse, error) {
+			observedDeadline, hadDeadline = ctx.Deadline()
+			return &router.CompletionResponse{Content: `{"findings":[]}`}, nil
+		},
+	}
+
+	start := time.Now()
+	_, err := EvaluateCandidate(context.Background(), lens, candidate, nil, rtr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hadDeadline {
+		t.Fatalf("expected context passed to router to have a deadline enforced")
+	}
+	remaining := time.Until(observedDeadline)
+	if remaining > 15*time.Second || remaining < 14*time.Second {
+		t.Errorf("expected deadline around 15s, got remaining duration: %v (elapsed: %v)", remaining, time.Since(start))
+	}
+
+	// 2. Verify timeout triggers error when router blocks past deadline
+	slowRtr := &mockEvalRouter{
+		completeFn: func(ctx context.Context, req *router.CompletionRequest) (*router.CompletionResponse, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+				return &router.CompletionResponse{Content: `{"findings":[]}`}, nil
+			}
+		},
+	}
+
+	// Create a short-timeout parent context
+	shortCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err = EvaluateCandidate(shortCtx, lens, candidate, nil, slowRtr)
+	if err == nil {
+		t.Errorf("expected error when context deadline exceeded, got nil")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Errorf("expected context deadline exceeded error, got: %v", err)
 	}
 }
