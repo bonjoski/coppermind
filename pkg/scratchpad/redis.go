@@ -126,12 +126,17 @@ func (r *RedisScratchpad) Get(_ context.Context, key string) (string, bool) {
 }
 
 // Set stores a key-value pair in Redis with optional TTL.
+// Rejects raw private keys, automatically redacts credentials, and verifies cognitive safety against prompt injection.
 func (r *RedisScratchpad) Set(_ context.Context, key string, val string, ttl time.Duration) error {
 	secRes, err := security.SanitizeMemory(val)
 	if err != nil {
 		return fmt.Errorf("scratchpad write rejected: %w", err)
 	}
 	val = secRes.SanitizedText
+
+	if threatRes, err := security.InspectCognitiveThreats(val); err == nil && threatRes != nil && threatRes.IsCritical {
+		return fmt.Errorf("scratchpad write rejected: %w: %s", security.ErrPromptInjectionRejected, strings.Join(threatRes.Flags, ", "))
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
