@@ -52,6 +52,42 @@ var injectionPatterns = []InjectionPattern{
 		TaintScore: 0.75,
 		IsCritical: false,
 	},
+	{
+		Name:       "XML Tool Reflection & Delimiter Smuggling",
+		Regex:      regexp.MustCompile(`(?i)<\/?(?:tool_call|tool_response|tool_results|function_call|call_tool|result|observation|thought|antml|untrusted_artifact|openclaw_execute|control_panel|system_override|root_exec|admin_[a-z0-9_-]+|system_[a-z0-9_-]+)(?:\s+[^>]*)?>`),
+		TaintScore: 0.95,
+		IsCritical: true,
+	},
+}
+
+var xmlDelimiterRegex = regexp.MustCompile(`(?i)<\/?(?:tool_call|tool_response|tool_results|function_call|call_tool|result|observation|thought|antml|untrusted_artifact|untrusted_code_artifact|untrusted_external_artifact|untrusted_[a-z0-9_-]+|openclaw_execute|control_panel|system_override|root_exec|admin_[a-z0-9_-]+|system_[a-z0-9_-]+|system|admin|instruction|developer|prompt|context|assistant|user)(?:\s+[^>]*)?>`)
+
+// SanitizeXMLDelimiters strips artificial prompt-injection delimiters and XML tool reflection tags.
+func SanitizeXMLDelimiters(text string) (string, int) {
+	// Normalize NFKC to avoid Unicode obfuscation
+	normalized := norm.NFKC.String(text)
+	var clean strings.Builder
+	for _, r := range normalized {
+		if (r >= 0x200B && r <= 0x200F) || r == 0xFEFF {
+			continue
+		}
+		clean.WriteRune(r)
+	}
+	cleaned := clean.String()
+	count := 0
+	for pass := 0; pass < 8; pass++ {
+		before := cleaned
+		if strings.IndexByte(cleaned, '<') >= 0 {
+			cleaned = xmlDelimiterRegex.ReplaceAllStringFunc(cleaned, func(m string) string {
+				count++
+				return " "
+			})
+		}
+		if cleaned == before {
+			break
+		}
+	}
+	return strings.TrimSpace(cleaned), count
 }
 
 // FirewallResult encapsulates the cognitive firewall evaluation.

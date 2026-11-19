@@ -189,6 +189,7 @@ Every primary developer use case is backed by dedicated, copy-pasteable recipes 
 | **Automated Git Post-Commit Reflection** | Ingest commit diffs and flag architectural drifts automatically:<br/>`coppermind hook install` && `coppermind observations` | [Guide](docs/use-cases/02-git-hook-reflection.md) |
 | **Multi-Perspective Analytical Threat Lenses** | Stress-test RFCs with automated Devil's Advocate and Red Team lenses:<br/>`coppermind radar --lenses all --file <doc>` | [Guide](docs/use-cases/03-analytical-threat-lenses.md) |
 | **Exporting Signed Knowledge Capsules** | Create immutable, signed `.capsule` archives linking memory to release tags:<br/>`coppermind export-capsule --sign` | [Guide](docs/use-cases/04-signed-knowledge-capsules.md) |
+| **Episodic Scratchpad Integrity & Observation Quarantine** | Verify Ed25519 signatures, defang XML tool reflections, and quarantine untrusted observations:<br/>`coppermind remember` && `coppermind recall` | [Guide](docs/use-cases/05-episodic-scratchpad-integrity.md) |
 
 ---
 

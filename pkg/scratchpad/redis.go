@@ -134,6 +134,8 @@ func (r *RedisScratchpad) Set(_ context.Context, key string, val string, ttl tim
 	}
 	val = secRes.SanitizedText
 
+	val, _ = security.SanitizeXMLDelimiters(val)
+
 	if threatRes, err := security.InspectCognitiveThreats(val); err == nil && threatRes != nil && threatRes.IsCritical {
 		return fmt.Errorf("scratchpad write rejected: %w: %s", security.ErrPromptInjectionRejected, strings.Join(threatRes.Flags, ", "))
 	}

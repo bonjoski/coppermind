@@ -12,7 +12,6 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/gitscope"
-	"github.com/bonjoski/coppermind/pkg/security"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -75,6 +74,7 @@ type Manager struct {
 	store      MemoryStore
 	embedder   Embedder
 	scratchpad Scratchpad
+	validator  *MemoryValidator
 	eventHook  EventHook
 }
 
@@ -84,6 +84,7 @@ func NewManager(store MemoryStore, embedder Embedder, scratchpad Scratchpad) *Ma
 		store:      store,
 		embedder:   embedder,
 		scratchpad: scratchpad,
+		validator:  NewMemoryValidator(),
 	}
 }
 
@@ -104,27 +105,6 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		return nil, fmt.Errorf("content cannot be empty")
 	}
 
-	// 1. Secret & Credential Scan (Fail-closed or sanitize)
-	secRes, err := security.SanitizeMemory(req.Content)
-	if err != nil {
-		return nil, fmt.Errorf("memory rejected: %w", err)
-	}
-
-	// 2. Normalize content via NFKC and strip invisible runes (Stormcage cognitive firewall invariant)
-	normalized := sanitizeText(secRes.SanitizedText)
-
-	// 3. Cognitive Firewall Scan (OWASP LLM01 Prompt Injection & Jailbreak Defense)
-	threatRes, err := security.InspectCognitiveThreats(normalized)
-	if err != nil {
-		return nil, fmt.Errorf("cognitive threat inspection failed: %w", err)
-	}
-	if threatRes.IsCritical && req.Provenance != ProvenanceLocalWorkspace {
-		return nil, fmt.Errorf("untrusted input rejected: %w", security.ErrPromptInjectionRejected)
-	}
-
-	if req.Category == "" {
-		req.Category = "general"
-	}
 	if req.Provenance == "" {
 		req.Provenance = ProvenanceLocalWorkspace
 	}
@@ -132,18 +112,34 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		req.SessionID = "default"
 	}
 
-	metadata := req.Metadata
-	if secRes.RedactedCount > 0 {
-		if metadata == nil {
-			metadata = make(map[string]string)
-		}
-		metadata["redacted_secrets"] = fmt.Sprintf("%d", secRes.RedactedCount)
+	// 1. Memory and Scratchpad Integrity Validation (Author attribution, delimiter defanging, cognitive threat, and quarantine partition)
+	if m.validator == nil {
+		m.validator = NewMemoryValidator()
 	}
-	if len(threatRes.Flags) > 0 {
+	verdict, err := m.validator.Validate(ctx, &req)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. Normalize content via NFKC and strip invisible runes
+	normalized := sanitizeText(verdict.CleanedContent)
+
+	if req.Category == "" {
+		req.Category = "general"
+	}
+
+	metadata := req.Metadata
+	if verdict.RedactedCount > 0 {
 		if metadata == nil {
 			metadata = make(map[string]string)
 		}
-		metadata["firewall_flags"] = strings.Join(threatRes.Flags, ",")
+		metadata["redacted_secrets"] = fmt.Sprintf("%d", verdict.RedactedCount)
+	}
+	if len(verdict.Flags) > 0 {
+		if metadata == nil {
+			metadata = make(map[string]string)
+		}
+		metadata["firewall_flags"] = strings.Join(verdict.Flags, ",")
 	}
 
 	// Automatic ambient Git repository & branch detection
@@ -225,7 +221,7 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		Content:         normalized,
 		Vector:          vec,
 		Provenance:      req.Provenance,
-		TaintScore:      threatRes.TaintScore,
+		TaintScore:      verdict.TaintScore,
 		Metadata:        metadata,
 		CreatedAt:       now,
 		UpdatedAt:       now,
