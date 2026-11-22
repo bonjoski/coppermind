@@ -6,7 +6,7 @@ import "fmt"
 
 var (
 	// Version is the current semantic version of Coppermind.
-	Version = "0.4.7"
+	Version = "0.5.0"
 
 	// Commit is the git commit SHA injected at build time via -ldflags.
 	Commit = "dev"
