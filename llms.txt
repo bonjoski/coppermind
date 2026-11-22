@@ -1,0 +1,5 @@
+
+
+## Paved-Road Integration (`2026-11-22`: Mentor Capsules, PO Requirements & `BLPR-v1`)
+- Passive ideation mentor & PO requirements: `coppermind recall --lens mentor [--json]`, `coppermind requirements [--triggers ...] [--json]`, `coppermind distill`
+- MCP (`UB-MCP-v1` & `BLPR-v1`): `coppermind_recall` supports `session_id` + `emit_receipt` to atomically write signed `ideation` `BLPR-v1` DSSE receipts under `FABRIAL_RECEIPT_DIR` (linking `CONJOINER_SIR_ID` lineage) and returns `UB-MCP-v1` `structuredContent` (`exit_code: 10`) on quarantine/policy denials.

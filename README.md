@@ -118,7 +118,9 @@ coppermind hook check
 ```
 
 In MCP:
-* `coppermind_recall` accepts optional `lens` (string filter) and `include_observations` (bool, default `true`).
+* `coppermind_recall` accepts optional `lens` (string filter), `include_observations` (bool, default `true`), `session_id` (string), and `emit_receipt` (bool).
+* **BLPR-v1 Ideation Receipts**: When `FABRIAL_RECEIPT_DIR` is set and `emit_receipt: true` is passed to `coppermind_recall` (especially with `lens="mentor"` or `lens="requirements"`), Coppermind atomically writes a `BLPR-v1` DSSE / in-toto Statement v1 receipt (`producer.tool: "coppermind"`, `producer.stage: "ideation"`, `claims: {lens, results_count, open_high_observations}`) via `os.OpenRoot` (`O_NOFOLLOW`, `0600`), signs it via `LOCKSMITH_SOCKET` (`action: "sign_dsse"`) when reachable, and links `CONJOINER_SIR_ID` into `parent_receipts` / `claims`. Symlinked receipt directories fail closed (`exit_code: 10`).
+* **UB-MCP-v1 Structured Errors**: Quarantine, cognitive firewall, validation, and receipt policy denials return MCP `CallToolResult` (`isError: true`) with ANSI-sanitized calm `<=3`-line text in `content[0].text` and machine-readable `structuredContent` conforming to `ub-mcp-v1-error.schema.json` (`schema_version: "ub-cli-v2"`, `tool: "coppermind"`, `exit_code: 10`).
 * `coppermind_dispatch_task` accepts `task="reflect"` with optional `lens` argument.
 * On `coppermind mcp` startup, the active project's scratchpad is automatically seeded with the top 3 unresolved `high`/`critical` observations.
 

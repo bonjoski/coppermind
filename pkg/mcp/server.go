@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
+	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 	"github.com/bonjoski/coppermind/pkg/worker"
 )
@@ -207,7 +209,8 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"include_why": { "type": "boolean", "description": "When lens='requirements', include plain-English 1-sentence business impact and optional kata link (default false)." },
 					"include_observations": { "type": "boolean", "description": "Whether to auto-attach linked cognitive lens observations to recalled memories (default true)." },
 					"include_superseded": { "type": "boolean", "description": "Whether to include superseded historical memories in results (default false)." },
-					"tier": { "type": "string", "description": "Optional authority tier filter (e.g. TIER_1_ARCHITECTURE)." }
+					"tier": { "type": "string", "description": "Optional authority tier filter (e.g. TIER_1_ARCHITECTURE)." },
+					"emit_receipt": { "type": "boolean", "description": "When true and FABRIAL_RECEIPT_DIR is set, atomically emit a BLPR-v1 ideation receipt (signed via LOCKSMITH_SOCKET when reachable)." }
 				},
 				"required": ["query"]
 			}`),
@@ -278,7 +281,7 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *JSONRPCMessage) *JSON
 	case "coppermind_remember":
 		result, err = s.callRemember(ctx, params.Arguments)
 	case "coppermind_recall":
-		result, err = s.callRecall(ctx, params.Arguments)
+		result, err = s.callRecall(ctx, params.Arguments, params.Meta)
 	case "coppermind_project":
 		result, err = s.callProject(ctx, params.Arguments)
 	case "coppermind_scratchpad":
@@ -292,14 +295,108 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *JSONRPCMessage) *JSON
 	}
 
 	if err != nil {
-		result = &ToolCallResult{
-			IsError: true,
-			Content: []TextContent{{Type: "text", Text: fmt.Sprintf("Error: %v", err)}},
-		}
+		result = classifyCoppermindError(params.Name, err)
 	}
 
 	resp, _ := NewSuccessResponse(msg.ID, result)
 	return resp
+}
+
+// classifyCoppermindError maps Coppermind quarantine, validation, and policy denials to
+// UB-MCP-v1 FixForwardError payloads (exit_code: 10) and general I/O errors to exit_code: 1.
+func classifyCoppermindError(toolName string, err error) *ToolCallResult {
+	errMsg := SanitizeSingleLine(err.Error())
+
+	switch {
+	case errors.Is(err, security.ErrSecretRejected):
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_SECRET_QUARANTINE",
+			ExitCode:       ExitCodePolicyDeny,
+			Retryable:      true,
+			Summary:        "Paused memory write: raw credential or private key blocked by secret quarantine.",
+			RemediationCmd: "locksmith checkout --secret <name>",
+			Why:            "Coppermind never persists raw credentials or private keys in memory vaults; use Locksmith opaque leases instead.",
+			References:     []string{"https://github.com/bonjoski/coppermind/blob/main/docs/use-cases/05-episodic-scratchpad-integrity.md"},
+		})
+
+	case errors.Is(err, security.ErrPromptInjectionRejected):
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_FIREWALL_DENY",
+			ExitCode:       ExitCodePolicyDeny,
+			Retryable:      false,
+			Summary:        "Paused memory write: untrusted input triggered the cognitive firewall.",
+			RemediationCmd: "coppermind recall --category quarantined_observations",
+			Why:            "Untrusted content containing prompt-injection or delimiter-smuggling directives is blocked to preserve memory integrity.",
+			References:     []string{"https://github.com/bonjoski/coppermind/blob/main/docs/use-cases/05-episodic-scratchpad-integrity.md"},
+		})
+
+	case errors.Is(err, brain.ErrInvalidAuthorSignature), errors.Is(err, brain.ErrScratchpadIntegrityFail):
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_VALIDATION_DENY",
+			ExitCode:       ExitCodePolicyDeny,
+			Retryable:      true,
+			Summary:        "Paused operation: memory validation failed cryptographic integrity verification.",
+			RemediationCmd: "coppermind doctor",
+			Why:            "Signed memories must verify against their Ed25519 author public key before entering the vault.",
+		})
+
+	case errors.Is(err, ErrReceiptPolicyDeny):
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_RECEIPT_POLICY_DENY",
+			ExitCode:       ExitCodePolicyDeny,
+			Retryable:      false,
+			Summary:        "Paused receipt emission: FABRIAL_RECEIPT_DIR failed symlink and containment verification.",
+			RemediationCmd: "fabrial doctor --fix",
+			Why:            "BLPR-v1 receipts must be written atomically inside a real, non-symlinked directory owned by the local user.",
+		})
+
+	case isValidationPolicyError(errMsg):
+		summary := fmt.Sprintf("Paused %s: %s", SanitizeSingleLine(toolName), errMsg)
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_VALIDATION_DENY",
+			ExitCode:       ExitCodePolicyDeny,
+			Retryable:      true,
+			Summary:        summary,
+			RemediationCmd: "coppermind status",
+			Why:            "Tool arguments must pass schema, trigger, and policy validation before execution.",
+		})
+
+	default:
+		summary := fmt.Sprintf("Failed %s: %s", SanitizeSingleLine(toolName), errMsg)
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_RUNTIME_ERROR",
+			ExitCode:       ExitCodeRuntimeErr,
+			Retryable:      true,
+			Summary:        summary,
+			RemediationCmd: "coppermind doctor",
+			Why:            "Coppermind encountered a local runtime error while handling this request.",
+		})
+	}
+}
+
+func isValidationPolicyError(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, needle := range []string{
+		"invalid arguments",
+		"cannot be empty",
+		"is required",
+		"unknown action",
+		"unknown scratchpad action",
+		"unknown trigger",
+		"unsupported trigger",
+		"invalid trigger",
+		"policy",
+		"quarantine",
+		"validation",
+		"forbidden",
+		"denied",
+		"supersession",
+	} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) getManagerForProject(projectName string) (*brain.Manager, func(), error) {
@@ -384,7 +481,7 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 	}, nil
 }
 
-func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
+func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *ToolCallMeta) (*ToolCallResult, error) {
 	var input struct {
 		Project             string   `json:"project"`
 		Query               string   `json:"query"`
@@ -399,6 +496,7 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		IncludeObservations *bool    `json:"include_observations"`
 		IncludeSuperseded   bool     `json:"include_superseded"`
 		Tier                string   `json:"tier"`
+		EmitReceipt         bool     `json:"emit_receipt"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -409,6 +507,49 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		return nil, err
 	}
 	defer cleanup()
+
+	effectiveSessionID := strings.TrimSpace(input.SessionID)
+	var conjoinerSIRID string
+	if meta != nil {
+		if effectiveSessionID == "" {
+			if meta.FabrialSessionID != "" {
+				effectiveSessionID = meta.FabrialSessionID
+			} else if meta.SessionID != "" {
+				effectiveSessionID = meta.SessionID
+			}
+		}
+		conjoinerSIRID = meta.ConjoinerSIRID
+	}
+
+	maybeEmitReceipt := func(lensName string, resultsCount int) (any, error) {
+		if !input.EmitReceipt {
+			return nil, nil
+		}
+		openHigh := countOpenHighObservations(ctx, mgr)
+		emitted, rErr := EmitIdeationReceipt(ctx, IdeationReceiptInput{
+			SessionID:            effectiveSessionID,
+			ConjoinerSIRID:       conjoinerSIRID,
+			Lens:                 lensName,
+			Query:                input.Query,
+			ResultsCount:         resultsCount,
+			OpenHighObservations: openHigh,
+		})
+		if rErr != nil {
+			return nil, rErr
+		}
+		if emitted == nil {
+			return nil, nil
+		}
+		return map[string]any{
+			"receipt_id":             emitted.ReceiptID,
+			"receipt_path":           emitted.FilePath,
+			"session_id":             emitted.SessionID,
+			"signed":                 emitted.Signed,
+			"lens":                   lensName,
+			"results_count":          resultsCount,
+			"open_high_observations": openHigh,
+		}, nil
+	}
 
 	// Fast-path: Mentor Cognitive Lens (sub-5ms lock-free WAL read, hard ceiling 2 cards, <=120 tokens/nudge)
 	if strings.EqualFold(strings.TrimSpace(input.Lens), "mentor") {
@@ -424,13 +565,19 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		if err != nil {
 			return nil, err
 		}
+		sc, err := maybeEmitReceipt("mentor", len(nudges))
+		if err != nil {
+			return nil, err
+		}
 		if len(nudges) == 0 {
 			return &ToolCallResult{
-				Content: []TextContent{{Type: "text", Text: "No matching security mentor nudges found. Import capsules with `coppermind capsule import <file>`."}},
+				Content:           []TextContent{{Type: "text", Text: "No matching security mentor nudges found. Import capsules with `coppermind capsule import <file>`."}},
+				StructuredContent: sc,
 			}, nil
 		}
 		return &ToolCallResult{
-			Content: []TextContent{{Type: "text", Text: lenses.FormatMentorNudges(nudges)}},
+			Content:           []TextContent{{Type: "text", Text: lenses.FormatMentorNudges(nudges)}},
+			StructuredContent: sc,
 		}, nil
 	}
 
@@ -446,7 +593,7 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		}
 		triggers := make([]capsule.TriggerFlag, 0, len(input.Triggers))
 		for _, t := range input.Triggers {
-			parsed, parseErr := capsule.ParseTriggerFlags(t)
+			parsed, parseErr := capsule.ParseTriggerFlags(SanitizeSingleLine(t))
 			if parseErr != nil {
 				return nil, parseErr
 			}
@@ -456,8 +603,13 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		if err != nil {
 			return nil, err
 		}
+		sc, err := maybeEmitReceipt("requirements", len(criteria))
+		if err != nil {
+			return nil, err
+		}
 		return &ToolCallResult{
-			Content: []TextContent{{Type: "text", Text: lenses.FormatRequirementsMarkdown(criteria, input.IncludeWhy)}},
+			Content:           []TextContent{{Type: "text", Text: lenses.FormatRequirementsMarkdown(criteria, input.IncludeWhy)}},
+			StructuredContent: sc,
 		}, nil
 	}
 
@@ -486,9 +638,19 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		return nil, err
 	}
 
+	lensTag := strings.TrimSpace(input.Lens)
+	if lensTag == "" {
+		lensTag = "hybrid"
+	}
+	sc, err := maybeEmitReceipt(lensTag, len(results))
+	if err != nil {
+		return nil, err
+	}
+
 	if len(results) == 0 {
 		return &ToolCallResult{
-			Content: []TextContent{{Type: "text", Text: "No matching memories found."}},
+			Content:           []TextContent{{Type: "text", Text: "No matching memories found."}},
+			StructuredContent: sc,
 		}, nil
 	}
 
@@ -543,8 +705,20 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 	}
 
 	return &ToolCallResult{
-		Content: []TextContent{{Type: "text", Text: strings.TrimSpace(sb.String())}},
+		Content:           []TextContent{{Type: "text", Text: strings.TrimSpace(sb.String())}},
+		StructuredContent: sc,
 	}, nil
+}
+
+func countOpenHighObservations(ctx context.Context, mgr *brain.Manager) int {
+	if mgr == nil || mgr.Store() == nil {
+		return 0
+	}
+	obs, err := mgr.ListObservations(ctx, "", "", "open", "high", 1000)
+	if err != nil {
+		return 0
+	}
+	return len(obs)
 }
 
 func (s *Server) callProject(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
