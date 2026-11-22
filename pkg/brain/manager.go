@@ -327,6 +327,8 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 			weight = 1.25
 		case "TIER_1_ARCHITECTURE", "TIER_2_PRODUCT":
 			weight = 1.00
+		case "TIER_2_MENTOR_CAPSULE":
+			weight = 0.85
 		case "TIER_3_EPISODIC":
 			weight = 0.75
 		case "TIER_4_SCRATCHPAD":

@@ -1,0 +1,144 @@
+{
+  "schema_version": "bonjoski-mentor-v1",
+  "name": "deterministic-web-basics",
+  "version": "1.0.0",
+  "author": "bonjoski",
+  "created_at": "2026-11-22T00:00:00Z",
+  "authority_tier": "TIER_2_MENTOR_CAPSULE",
+  "merkle_root": "1f93b01153c05c14bd13c5df44adc7995a2ad4c94014769d8984601ead1bd6c1",
+  "cards": [
+    {
+      "id": "web-01-parameterized-sql",
+      "domain": "deterministic-web",
+      "triggers": [
+        "sql",
+        "database",
+        "query",
+        "orm",
+        "postgres",
+        "sqlite",
+        "mysql",
+        "where clause",
+        "raw sql"
+      ],
+      "title": "Parameterized Queries \u0026 ORM Traps",
+      "deterministic_analogy": "Keep code and data strictly separated, just like passing argv slices instead of shell strings.",
+      "secure_default": "Use bound placeholders ($1, ?) for every dynamic SQL value; validate dynamic ORDER BY column names against a static allowlist.",
+      "why_one_liner": "String interpolation or raw ORM fragments let untrusted input rewrite query logic and dump or modify rows across tenants.",
+      "code_snippet": "row := db.QueryRowContext(ctx,\n  \"SELECT id, email FROM users WHERE tenant_id = $1 AND id = $2\",\n  tenantID, userID,\n)",
+      "kata_ref": "kata-01-sql-parameterization",
+      "cwe_or_owasp": "CWE-89"
+    },
+    {
+      "id": "web-02-ssrf-egress-block",
+      "domain": "deterministic-web",
+      "triggers": [
+        "ssrf",
+        "webhook",
+        "fetch",
+        "http client",
+        "url",
+        "callback",
+        "proxy",
+        "outbound request",
+        "metadata"
+      ],
+      "title": "SSRF \u0026 Private-IP Egress Blocking",
+      "deterministic_analogy": "Check destination IPs after DNS resolution, like verifying an address at the loading dock.",
+      "secure_default": "Validate URLs against an HTTPS allowlist and block loopback, link-local (169.254.169.254), and RFC1918 IPs inside the dialer.",
+      "why_one_liner": "Unchecked server-side fetches let attackers pivot to cloud metadata endpoints, localhost admin panels, or internal services.",
+      "code_snippet": "dialer := \u0026net.Dialer{Control: blockPrivateAndLoopbackIPs}\nclient := \u0026http.Client{\n  Transport: \u0026http.Transport{DialContext: dialer.DialContext},\n  Timeout:   5 * time.Second,\n}",
+      "kata_ref": "kata-02-ssrf-egress-guard",
+      "cwe_or_owasp": "CWE-918"
+    },
+    {
+      "id": "web-03-path-traversal-openroot",
+      "domain": "deterministic-web",
+      "triggers": [
+        "file upload",
+        "file path",
+        "filepath",
+        "read file",
+        "download",
+        "zip",
+        "tar",
+        "directory",
+        "symlink",
+        "openroot"
+      ],
+      "title": "Path Traversal \u0026 Workspace Confinement",
+      "deterministic_analogy": "Use OS-enforced directory handles instead of string prefix checks that symlinks bypass.",
+      "secure_default": "Open user-supplied relative paths via os.OpenRoot (Go 1.24+) or O_NOFOLLOW plus realpath checks against a fixed base directory.",
+      "why_one_liner": "String checks like filepath.Clean fail against symlinks and traversal sequences, exposing host files like /etc/passwd or ~/.ssh.",
+      "code_snippet": "root, err := os.OpenRoot(workspaceDir)\nif err != nil { return err }\ndefer root.Close()\nf, err := root.Open(relPath)",
+      "kata_ref": "kata-02-path-confinement",
+      "cwe_or_owasp": "CWE-22"
+    },
+    {
+      "id": "web-04-keyless-local-dev",
+      "domain": "secrets",
+      "triggers": [
+        ".env",
+        "dotenv",
+        "api key",
+        "secret",
+        "credentials",
+        "config",
+        "local dev",
+        "token",
+        "locksmith"
+      ],
+      "title": "Zero-.env Keyless Local Development",
+      "deterministic_analogy": "Inject short-lived secrets in memory at runtime, like an SSH agent instead of plaintext keys on disk.",
+      "secure_default": "Inject credentials at process launch with locksmith run instead of storing plaintext secrets in .env files or shell history.",
+      "why_one_liner": "Plaintext .env files are routinely swept into git commits, AI context windows, and compromised build scripts.",
+      "code_snippet": "# Run locally without writing plaintext secrets to .env:\nlocksmith run -- go test ./...",
+      "kata_ref": "kata-04-keyless-locksmith",
+      "cwe_or_owasp": "CWE-798"
+    },
+    {
+      "id": "web-05-slopsquatting-hygiene",
+      "domain": "deterministic-web",
+      "triggers": [
+        "npm install",
+        "pip install",
+        "go get",
+        "cargo add",
+        "dependency",
+        "package",
+        "registry",
+        "slopsquat",
+        "argus"
+      ],
+      "title": "Dependency \u0026 Slopsquatting Pre-Flight Hygiene",
+      "deterministic_analogy": "Verify package provenance before installing, like checking a TLS certificate before sending a login.",
+      "secure_default": "Vet unfamiliar AI-suggested packages via argus before installing, pin exact hashes in lockfiles, and verify maintainer ownership.",
+      "why_one_liner": "LLMs hallucinate plausible package names that attackers register on PyPI and npm to execute malware on install.",
+      "code_snippet": "# Pre-flight check before installing unfamiliar packages:\nargus check npm \u003cpackage-name\u003e",
+      "kata_ref": "kata-04-slopsquat-check",
+      "cwe_or_owasp": "CWE-829"
+    },
+    {
+      "id": "web-06-sbom-license-attribution",
+      "domain": "deterministic-web",
+      "triggers": [
+        "sbom",
+        "license",
+        "cyclonedx",
+        "third-party",
+        "open source",
+        "vendor",
+        "attribution",
+        "release",
+        "bomhound"
+      ],
+      "title": "SBOM \u0026 License Provenance Hygiene",
+      "deterministic_analogy": "Track software ingredients automatically at build time, like labels generated directly from the recipe.",
+      "secure_default": "Generate a CycloneDX SBOM and verify license compatibility automatically in local release checks using bomhound.",
+      "why_one_liner": "Untracked transitive dependencies hide vulnerable libraries and copyleft obligations until right before launch.",
+      "code_snippet": "# Generate CycloneDX SBOM and verify licenses locally:\nbomhound scan --format cyclonedx --out sbom.json .",
+      "kata_ref": "kata-04-sbom-provenance",
+      "cwe_or_owasp": "CWE-1104"
+    }
+  ]
+}

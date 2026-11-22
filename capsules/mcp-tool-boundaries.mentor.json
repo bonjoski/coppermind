@@ -1,0 +1,143 @@
+{
+  "schema_version": "bonjoski-mentor-v1",
+  "name": "mcp-tool-boundaries",
+  "version": "1.0.0",
+  "author": "bonjoski",
+  "created_at": "2026-11-22T00:00:00Z",
+  "authority_tier": "TIER_2_MENTOR_CAPSULE",
+  "merkle_root": "6388ce787490333c73a71c37405ff99d317032e63c70720d6d3ea017bfd65314",
+  "cards": [
+    {
+      "id": "mcp-01-deterministic-authz",
+      "domain": "mcp-tools",
+      "triggers": [
+        "mcp",
+        "tool",
+        "agent",
+        "refund",
+        "delete",
+        "admin",
+        "permission",
+        "authz",
+        "rbac",
+        "function calling",
+        "conjoiner"
+      ],
+      "title": "Deterministic AuthZ Outside the LLM Loop",
+      "deterministic_analogy": "Never trust client-side JS auth: enforce permissions in server middleware, never in prompt text.",
+      "secure_default": "Enforce caller identity, tenant ownership, and action permissions in deterministic middleware (conjoiner pattern) outside the LLM loop.",
+      "why_one_liner": "Prompts like 'never delete prod' are probabilistic suggestions, not security boundaries; one indirect injection bypasses them.",
+      "code_snippet": "func handleRefund(ctx context.Context, caller Principal, args RefundArgs) error {\n  if !conjoiner.Allow(caller, \"billing:refund\", args.OrderID) {\n    return ErrForbidden\n  }\n  return billing.IssueRefund(ctx, args.OrderID)\n}",
+      "kata_ref": "kata-05-mcp-authz-boundary",
+      "cwe_or_owasp": "OWASP-LLM06"
+    },
+    {
+      "id": "mcp-02-monotonic-scope-attenuation",
+      "domain": "mcp-tools",
+      "triggers": [
+        "mcp",
+        "scope",
+        "least privilege",
+        "token",
+        "subagent",
+        "delegate",
+        "read-only",
+        "mutating",
+        "conjoiner"
+      ],
+      "title": "Monotonic Scope Attenuation \u0026 Tool Separation",
+      "deterministic_analogy": "UNIX file modes and scoped OAuth tokens: split read-only queries from state-changing actions.",
+      "secure_default": "Separate read-only and mutating MCP tools and issue short-lived, monotonically attenuated tokens scoped to a single resource.",
+      "why_one_liner": "Broad wildcard tokens let a compromised read-only subagent escalate into destructive writes or cross-service lateral movement.",
+      "code_snippet": "childGrant, err := conjoiner.Attenuate(parentGrant, Scope{\n  Action:   \"repo:read\",\n  Resource: \"repo/docs/*\",\n  TTL:      5 * time.Minute,\n})",
+      "kata_ref": "kata-05-scope-attenuation",
+      "cwe_or_owasp": "OWASP-LLM06"
+    },
+    {
+      "id": "mcp-03-inode-repo-confinement",
+      "domain": "mcp-tools",
+      "triggers": [
+        "mcp",
+        "file tool",
+        "filesystem",
+        "edit file",
+        "write file",
+        "repo",
+        "workspace",
+        "symlink",
+        "inode"
+      ],
+      "title": "Inode-Level Workspace Confinement for File Tools",
+      "deterministic_analogy": "chroot or os.OpenRoot for agent file editors: block symlink escapes before opening the file.",
+      "secure_default": "Confine file-reading and file-editing MCP tools to the workspace root using openat2/os.OpenRoot with strict symlink escape rejection.",
+      "why_one_liner": "A symlink inside a cloned repo can trick an agent file tool into reading ~/.ssh or overwriting shell startup scripts.",
+      "code_snippet": "root, err := os.OpenRoot(repoPath)\nif err != nil { return err }\ndefer root.Close()\ndata, err := root.ReadFile(relPath)",
+      "kata_ref": "kata-05-inode-confinement",
+      "cwe_or_owasp": "CWE-59"
+    },
+    {
+      "id": "mcp-04-zero-background-authority",
+      "domain": "mcp-tools",
+      "triggers": [
+        "mcp",
+        "approval",
+        "confirm",
+        "human in the loop",
+        "mutating",
+        "deploy",
+        "payment",
+        "email",
+        "egress",
+        "background"
+      ],
+      "title": "Zero-Background Authority for Mutating Tools",
+      "deterministic_analogy": "Step-up confirmation on wire transfers: require explicit user presence before irreversible side effects.",
+      "secure_default": "Require explicit interactive user confirmation for state-mutating, financial, or external-egress MCP tool calls.",
+      "why_one_liner": "Silent background execution lets a single poisoned issue comment or web page trigger unauthorized emails, deploys, or refunds.",
+      "code_snippet": "if tool.IsMutating() \u0026\u0026 !req.HasApproval() {\n  return ErrApprovalRequired\n}",
+      "kata_ref": "kata-05-zero-background-auth",
+      "cwe_or_owasp": "OWASP-LLM06"
+    },
+    {
+      "id": "mcp-05-hermetic-mcp-execution",
+      "domain": "mcp-tools",
+      "triggers": [
+        "mcp server",
+        "third-party mcp",
+        "community mcp",
+        "npx",
+        "uvx",
+        "stdio",
+        "sandbox",
+        "airlock"
+      ],
+      "title": "Hermetic Sandboxing for Third-Party MCP Servers",
+      "deterministic_analogy": "Run untrusted browser plugins in a sandboxed process with zero access to personal home directories.",
+      "secure_default": "Launch third-party or community MCP servers inside airlock so host filesystem access excludes ~/.ssh, ~/.aws, and unrelated repos.",
+      "why_one_liner": "Community MCP binaries run with your full workstation user privileges by default, turning any supply-chain flaw into full host theft.",
+      "code_snippet": "# Wrap third-party MCP servers in a local kernel sandbox:\nairlock run --ro-cwd --no-home-secrets -- npx -y @vendor/mcp-server",
+      "kata_ref": "kata-05-hermetic-mcp",
+      "cwe_or_owasp": "CWE-250"
+    },
+    {
+      "id": "mcp-06-tool-description-poisoning",
+      "domain": "mcp-tools",
+      "triggers": [
+        "mcp",
+        "tool description",
+        "tools/list",
+        "tool schema",
+        "rug pull",
+        "prompt injection",
+        "server metadata"
+      ],
+      "title": "Tool Description Poisoning Defense",
+      "deterministic_analogy": "Treat remote API schemas as untrusted input: pin and inspect tool descriptions before passing to models.",
+      "secure_default": "Sanitize and pin hashes of third-party MCP tool descriptions on connect, treating schema text as untrusted data rather than instructions.",
+      "why_one_liner": "Malicious or silently updated MCP servers can hide prompt injections inside tool descriptions to hijack agent behavior on every turn.",
+      "code_snippet": "sum := sha256.Sum256(toolSchemaBytes)\nif pinned != fmt.Sprintf(\"%x\", sum) {\n  return ErrToolSchemaChanged\n}",
+      "kata_ref": "kata-05-tool-desc-poisoning",
+      "cwe_or_owasp": "OWASP-LLM01"
+    }
+  ]
+}

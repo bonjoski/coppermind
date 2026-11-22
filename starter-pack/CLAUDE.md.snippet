@@ -1,0 +1,7 @@
+## Security Mentor Nudges (Coppermind MCP)
+
+When designing or implementing endpoints, RAG vector queries, LLM SDK integrations, or MCP tools:
+- Run `coppermind_recall(lens="mentor", query="<topic>", limit=2)` once during planning.
+- Bake the `secure_default` straight into the implementation (e.g., parameterized SQL, `<untrusted_context>` fences, tenant `WHERE` filters, deterministic authz middleware).
+- Surface the `why_one_liner` in **one brief, plain-English sentence** at the end of your summary—helpful and non-blocking, zero jargon or scolding.
+- Local project decisions (`TIER_0_SOVEREIGN` / `TIER_1_ARCHITECTURE`) always take precedence over advisory `TIER_2_MENTOR_CAPSULE` nudges.

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -100,6 +102,12 @@ func main() {
 		runExport(cmdArgs)
 	case "import":
 		runImport(cmdArgs)
+	case "capsule":
+		runCapsule(cmdArgs)
+	case "requirements":
+		runRequirements(cmdArgs)
+	case "distill":
+		runDistill(cmdArgs)
 	case "verify":
 		runVerify(cmdArgs)
 	case "vacuum", "gc":
@@ -148,6 +156,9 @@ Commands:
   index        Scan, chunk, and index a codebase repository into semantic memory
   export       Export the brain into a portable, verified capsule archive
   import       Restore a brain from a capsule archive with path traversal checks
+  capsule      Manage Security Mentor & Requirements Capsules (keygen, sign, pack, import, list, verify, export)
+  requirements Generate <=3 sprint-ready Given/When/Then abuse-case acceptance criteria (ephemeral)
+  distill      Distill a sanitized post-mortem lesson into MentorCard, AbuseCaseCriterion, and Aegisbox probe JSON
   verify       Audit cryptographic Merkle chain integrity for a session
   vacuum       Purge expired TTL memories and compact SQLite storage
   project      Manage isolated vaults (list, use, create, delete)
@@ -527,15 +538,18 @@ func runRecall(args []string) {
 	limit := fs.Int("limit", 5, "Maximum results to retrieve")
 	minScore := fs.Float64("min-score", 0.0, "Minimum cosine score threshold")
 	hybrid := fs.Bool("hybrid", true, "Use hybrid FTS5 BM25 + vector RRF search (default true)")
-	lensName := fs.String("lens", "", "Filter recall to observations from a specific lens (e.g. security-architect, systems-architect)")
+	lensName := fs.String("lens", "", "Filter recall to observations from a specific lens (e.g. mentor, security-architect, systems-architect)")
+	sdkHints := fs.String("sdk", "", "Optional comma-separated SDK hints for --lens mentor (e.g. openai,mcp,pgvector)")
 	includeObs := fs.Bool("include-observations", true, "Auto-attach linked cognitive lens observations to primary recalled memories")
 	includeSuperseded := fs.Bool("include-superseded", false, "Include superseded historical memories in query results")
 	tier := fs.String("tier", "", "Filter by specific authority tier (e.g. TIER_1_ARCHITECTURE)")
+	asJSON := fs.Bool("json", false, "Emit machine-readable JSON output")
+	showWhy := fs.Bool("why", false, "Include detailed explanations where supported")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: search query is required\nUsage: coppermind recall [--limit 5] [--lens <name>] [--include-observations] <query>\n")
+		fmt.Fprintf(os.Stderr, "Error: search query is required\nUsage: coppermind recall [--limit 5] [--lens <name>] [--json] [--include-observations] <query>\n")
 		os.Exit(1)
 	}
 	query := strings.Join(rest, " ")
@@ -546,6 +560,59 @@ func runRecall(args []string) {
 		os.Exit(1)
 	}
 	defer mgr.Close()
+
+	// Fast-path: Mentor Cognitive Lens (sub-5ms lock-free WAL read, max 2 cards, <=120 tokens/nudge)
+	if strings.EqualFold(strings.TrimSpace(*lensName), "mentor") {
+		var sdks []string
+		if strings.TrimSpace(*sdkHints) != "" {
+			for _, part := range strings.Split(*sdkHints, ",") {
+				if trimmed := strings.TrimSpace(part); trimmed != "" {
+					sdks = append(sdks, trimmed)
+				}
+			}
+		}
+		mentorLens := lenses.NewSQLiteMentorLens(mgr.Store(), embedding.NewLocalHashEmbedder(128))
+		nudges, err := mentorLens.MatchContext(context.Background(), query, sdks, *limit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error recalling mentor nudges: %v\n", err)
+			os.Exit(1)
+		}
+		if *asJSON {
+			if nudges == nil {
+				nudges = []lenses.MentorNudge{}
+			}
+			enc := json.NewEncoder(os.Stdout)
+			_ = enc.Encode(map[string]any{"lens": "mentor", "query": query, "nudges": nudges})
+			return
+		}
+		if len(nudges) == 0 {
+			fmt.Println("No matching security mentor nudges found. Import capsules with `coppermind capsule import <file>`.")
+			return
+		}
+		fmt.Println(lenses.FormatMentorNudges(nudges))
+		return
+	}
+
+	// Fast-path: PO & Requirements Cognitive Lens (sub-5ms ephemeral read-only, max 3 criteria, <=180 tokens)
+	if strings.EqualFold(strings.TrimSpace(*lensName), "requirements") || strings.EqualFold(strings.TrimSpace(*lensName), "po-mentor") {
+		reqLens := lenses.NewSQLiteRequirementsLens(mgr.Store(), embedding.NewLocalHashEmbedder(128))
+		criteria, err := reqLens.SuggestCriteriaContext(context.Background(), query, nil, *limit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error suggesting requirements criteria: %v\n", err)
+			os.Exit(1)
+		}
+		if *asJSON {
+			out, err := lenses.FormatRequirementsJSON(criteria, *showWhy)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error formatting requirements JSON: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println(out)
+			return
+		}
+		fmt.Println(lenses.FormatRequirementsMarkdown(criteria, *showWhy))
+		return
+	}
 
 	results, err := mgr.Recall(context.Background(), brain.RecallRequest{
 		SessionID:           *session,
@@ -1709,4 +1776,503 @@ func runRadar(args []string) {
 		fmt.Fprintf(os.Stderr, "Unknown radar action %q. Usage: coppermind radar <sync|detect|list|export-capsule>\n", action)
 		os.Exit(1)
 	}
+}
+
+func runCapsule(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: coppermind capsule <keygen|sign|pack|import|list|verify|export> [options]\n")
+		os.Exit(1)
+	}
+
+	action := args[0]
+	cmdArgs := args[1:]
+
+	switch action {
+	case "keygen":
+		fs := flag.NewFlagSet("capsule keygen", flag.ExitOnError)
+		outDir := fs.String("out", "", "Output directory for ed25519.key (0600) and ed25519.pub")
+		force := fs.Bool("force", false, "Overwrite existing regular key files (symlinks are always refused)")
+		_ = fs.Parse(cmdArgs)
+
+		if strings.TrimSpace(*outDir) == "" {
+			fmt.Fprintf(os.Stderr, "Error: --out <dir> is required\nUsage: coppermind capsule keygen --out <dir> [--force]\n")
+			os.Exit(1)
+		}
+		kp, err := capsule.GenerateEd25519Keypair(*outDir, *force)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Keygen REJECTED (fail-closed): %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Generated local Ed25519 capsule signing keypair\n")
+		fmt.Printf("  • Private Key (0600): %s\n", kp.PrivateKeyPath)
+		fmt.Printf("  • Public Key  (0644): %s\n", kp.PublicKeyPath)
+		fmt.Printf("  • Public Key Hex    : %s\n", kp.PublicKeyHex)
+
+	case "sign":
+		fs := flag.NewFlagSet("capsule sign", flag.ExitOnError)
+		inPath := fs.String("in", "", "Input Mentor (bonjoski-mentor-v1) or Requirements (bonjoski-requirements-v1) manifest JSON")
+		keyPath := fs.String("key", "", "Path to Ed25519 private key file (ed25519.key) or 64-byte hex key")
+		outPath := fs.String("out", "", "Output path (.capsule tar.gz archive or signed .json manifest)")
+		_ = fs.Parse(cmdArgs)
+
+		if strings.TrimSpace(*inPath) == "" || strings.TrimSpace(*keyPath) == "" {
+			fmt.Fprintf(os.Stderr, "Error: --in and --key are required\nUsage: coppermind capsule sign --in <manifest.json> --key <ed25519.key> [--out <signed.capsule>]\n")
+			os.Exit(1)
+		}
+		res, err := capsule.SignCapsuleFile(*inPath, *keyPath, *outPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Capsule sign REJECTED (fail-closed): %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Signed %s capsule %s@%s (%d items) -> %s\n", res.SchemaVersion, res.Name, res.Version, res.ItemCount, res.OutputPath)
+		fmt.Printf("  • Format: %s\n", res.Format)
+		fmt.Printf("  • Provenance: %s\n", res.Provenance)
+		fmt.Printf("  • Authority Tier: %s\n", res.AuthorityTier)
+		fmt.Printf("  • Merkle Root: %s\n", res.MerkleRoot)
+
+	case "pack":
+		fs := flag.NewFlagSet("capsule pack", flag.ExitOnError)
+		inPath := fs.String("in", "", "Input Mentor or Requirements manifest JSON")
+		keyPath := fs.String("key", "", "Optional Ed25519 private key file (ed25519.key) or hex to sign while packing")
+		outPath := fs.String("out", "", "Output .capsule tar.gz archive path")
+		allowUnsigned := fs.Bool("allow-unsigned", false, "Allow packing an unsigned local draft capsule (tagged TAINT_UNVERIFIED_DRAFT)")
+		_ = fs.Parse(cmdArgs)
+
+		if strings.TrimSpace(*inPath) == "" {
+			fmt.Fprintf(os.Stderr, "Error: --in is required\nUsage: coppermind capsule pack --in <manifest.json> [--key <ed25519.key>] [--allow-unsigned] [--out <out.capsule>]\n")
+			os.Exit(1)
+		}
+		res, err := capsule.PackCapsuleFile(*inPath, *keyPath, *outPath, *allowUnsigned)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Capsule pack REJECTED (fail-closed): %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Packed %s capsule %s@%s (%d items) -> %s\n", res.SchemaVersion, res.Name, res.Version, res.ItemCount, res.OutputPath)
+		fmt.Printf("  • Provenance: %s\n", res.Provenance)
+		fmt.Printf("  • Authority Tier: %s\n", res.AuthorityTier)
+		fmt.Printf("  • Merkle Root: %s\n", res.MerkleRoot)
+
+	case "import":
+		fs := flag.NewFlagSet("capsule import", flag.ExitOnError)
+		dataDir := fs.String("data-dir", "", "Data directory")
+		projectName := fs.String("project", "", "Target project vault")
+		allowUnsigned := fs.Bool("allow-unsigned", false, "Allow importing an unsigned local draft capsule (tagged TAINT_UNVERIFIED_DRAFT)")
+		pubKeySpec := fs.String("pubkey", "", "Optional Ed25519 public key file (ed25519.pub) or hex string to require for signature verification")
+		_ = fs.Parse(cmdArgs)
+
+		rest := fs.Args()
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: mentor capsule file path is required\nUsage: coppermind capsule import [--allow-unsigned] [--pubkey <ed25519.pub|hex>] <capsule.mentor.json|.capsule>\n")
+			os.Exit(1)
+		}
+		capsulePath := rest[0]
+
+		var reqPub ed25519.PublicKey
+		if strings.TrimSpace(*pubKeySpec) != "" {
+			loadedPub, err := capsule.LoadEd25519PublicKey(*pubKeySpec)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid --pubkey: %v\n", err)
+				os.Exit(1)
+			}
+			reqPub = loadedPub
+		}
+
+		mgr, activeProj, err := initManager(*dataDir, *projectName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		defer mgr.Close()
+
+		accessor, ok := mgr.Store().(capsule.SQLiteAccessor)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "Error: mentor capsules require local SQLite WAL storage (COPPERMIND_PROFILE=local)\n")
+			os.Exit(1)
+		}
+
+		var (
+			imported *capsule.ImportedMentorCapsule
+		)
+		if capsule.DetectCapsuleSchema(capsulePath) == capsule.RequirementsSchemaVersion {
+			imported, err = capsule.ImportRequirementsCapsuleFileToStore(context.Background(), accessor, capsulePath, capsule.MentorImportOptions{
+				RequiredPubKey: reqPub,
+				AllowUnsigned:  *allowUnsigned,
+			})
+		} else {
+			imported, err = capsule.ImportMentorCapsuleFileToStore(context.Background(), accessor, capsulePath, capsule.MentorImportOptions{
+				RequiredPubKey: reqPub,
+				AllowUnsigned:  *allowUnsigned,
+			})
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Mentor capsule import REJECTED (fail-closed): %v\n", err)
+			os.Exit(1)
+		}
+
+		prefix := imported.MerkleRoot
+		if len(prefix) > 12 {
+			prefix = prefix[:12]
+		}
+		fmt.Printf("✓ Imported Security Mentor Capsule %s@%s into vault %q\n", imported.Name, imported.Version, activeProj)
+		fmt.Printf("  • Cards: %d\n", imported.CardCount)
+		fmt.Printf("  • Authority Tier: %s (advisory; cannot override TIER_0/TIER_1)\n", imported.AuthorityTier)
+		fmt.Printf("  • Provenance: %s\n", imported.Provenance)
+		fmt.Printf("  • Merkle Root: %s...\n", prefix)
+
+	case "list", "ls":
+		fs := flag.NewFlagSet("capsule list", flag.ExitOnError)
+		dataDir := fs.String("data-dir", "", "Data directory")
+		projectName := fs.String("project", "", "Target project vault")
+		_ = fs.Parse(cmdArgs)
+
+		mgr, activeProj, err := initManager(*dataDir, *projectName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		defer mgr.Close()
+
+		accessor, ok := mgr.Store().(capsule.SQLiteAccessor)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "Error: mentor capsules require local SQLite WAL storage (COPPERMIND_PROFILE=local)\n")
+			os.Exit(1)
+		}
+
+		caps, err := capsule.ListMentorCapsules(context.Background(), accessor)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error listing mentor capsules: %v\n", err)
+			os.Exit(1)
+		}
+		if len(caps) == 0 {
+			fmt.Printf("No custom Security Mentor Capsules imported in vault %q (18 embedded v1.0 mentor cards + 10 PO criteria are active zero-config).\n", activeProj)
+			return
+		}
+		fmt.Printf("Imported Security Mentor Capsules in vault %q (%d):\n", activeProj, len(caps))
+		for _, c := range caps {
+			prefix := c.MerkleRoot
+			if len(prefix) > 12 {
+				prefix = prefix[:12]
+			}
+			fmt.Printf("  • %s@%s (%d cards) [%s | %s | merkle:%s]\n",
+				c.Name, c.Version, c.CardCount, c.AuthorityTier, c.Provenance, prefix)
+		}
+
+	case "verify":
+		fs := flag.NewFlagSet("capsule verify", flag.ExitOnError)
+		allowUnsigned := fs.Bool("allow-unsigned", false, "Allow verifying an unsigned local draft capsule")
+		pubKeySpec := fs.String("pubkey", "", "Optional Ed25519 public key file (ed25519.pub) or hex string to require for verification")
+		_ = fs.Parse(cmdArgs)
+
+		rest := fs.Args()
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: capsule file path is required\nUsage: coppermind capsule verify [--allow-unsigned] [--pubkey <ed25519.pub|hex>] <file>\n")
+			os.Exit(1)
+		}
+
+		var reqPub ed25519.PublicKey
+		if strings.TrimSpace(*pubKeySpec) != "" {
+			loadedPub, err := capsule.LoadEd25519PublicKey(*pubKeySpec)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid --pubkey: %v\n", err)
+				os.Exit(1)
+			}
+			reqPub = loadedPub
+		}
+
+		ver, err := capsule.VerifyCapsuleFile(rest[0], capsule.MentorImportOptions{
+			RequiredPubKey: reqPub,
+			AllowUnsigned:  *allowUnsigned,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Verification FAILED (fail-closed): %v\n", err)
+			os.Exit(1)
+		}
+		kindLabel := "Security Mentor Capsule"
+		itemLabel := "cards"
+		if ver.SchemaVersion == capsule.RequirementsSchemaVersion {
+			kindLabel = "Requirements Capsule"
+			itemLabel = "criteria"
+		}
+		fmt.Printf("✓ Verified %s %s@%s (%d %s)\n", kindLabel, ver.Name, ver.Version, ver.ItemCount, itemLabel)
+		fmt.Printf("  • Provenance: %s\n", ver.Provenance)
+		fmt.Printf("  • Authority Tier: %s\n", ver.AuthorityTier)
+		fmt.Printf("  • Merkle Root: %s\n", ver.MerkleRoot)
+
+	case "export":
+		fs := flag.NewFlagSet("capsule export", flag.ExitOnError)
+		dataDir := fs.String("data-dir", "", "Data directory")
+		projectName := fs.String("project", "", "Target project vault")
+		name := fs.String("name", "", "Imported mentor capsule name to export from SQLite")
+		fromPath := fs.String("from", "", "Optional source .mentor.json path to package/sign into .capsule")
+		outPath := fs.String("out", "", "Output path (.capsule or .mentor.json)")
+		signKeySpec := fs.String("sign-key", "", "Optional Ed25519 private key file path or 64-byte hex")
+		_ = fs.Parse(cmdArgs)
+
+		if *outPath == "" {
+			fmt.Fprintf(os.Stderr, "Error: --out is required\nUsage: coppermind capsule export (--name <capsule> | --from <file>) --out <out.capsule>\n")
+			os.Exit(1)
+		}
+
+		var privKey ed25519.PrivateKey
+		if strings.TrimSpace(*signKeySpec) != "" {
+			loadedPriv, err := capsule.LoadEd25519PrivateKey(*signKeySpec)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid --sign-key: %v\n", err)
+				os.Exit(1)
+			}
+			privKey = loadedPriv
+		}
+
+		var (
+			manifest *capsule.MentorCapsuleManifest
+			err      error
+		)
+		if *fromPath != "" {
+			manifest, err = capsule.ReadMentorCapsuleFile(*fromPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Export FAILED: %v\n", err)
+				os.Exit(1)
+			}
+		} else if *name != "" {
+			mgr, _, initErr := initManager(*dataDir, *projectName)
+			if initErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", initErr)
+				os.Exit(1)
+			}
+			defer mgr.Close()
+			accessor, ok := mgr.Store().(capsule.SQLiteAccessor)
+			if !ok {
+				fmt.Fprintf(os.Stderr, "Error: mentor capsules require local SQLite WAL storage\n")
+				os.Exit(1)
+			}
+			manifest, err = capsule.GetMentorCapsuleManifestFromStore(context.Background(), accessor, *name)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Export FAILED: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: either --name or --from is required\n")
+			os.Exit(1)
+		}
+
+		if strings.HasSuffix(strings.ToLower(*outPath), ".json") {
+			err = capsule.ExportMentorCapsuleJSON(manifest, *outPath, privKey)
+		} else {
+			err = capsule.ExportMentorCapsule(manifest, *outPath, privKey)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Export REJECTED (fail-closed): %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Exported verified Security Mentor Capsule %s@%s to %s\n", manifest.Name, manifest.Version, *outPath)
+		fmt.Printf("  • Merkle Root: %s\n", manifest.MerkleRoot)
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown capsule action %q. Usage: coppermind capsule <keygen|sign|pack|import|list|verify|export>\n", action)
+		os.Exit(1)
+	}
+}
+
+func runDistill(args []string) {
+	fs := flag.NewFlagSet("distill", flag.ExitOnError)
+	fromFile := fs.String("from-file", "", "Path to sanitized lesson-to-capsule.md file (bounded 256KB)")
+	id := fs.String("id", "", "Kebab-case MentorCard ID slug (e.g. ai-tool-07-negative-refund)")
+	domain := fs.String("domain", "", "Domain (deterministic-web | ai-app-rag | mcp-tools | secrets)")
+	title := fs.String("title", "", "Plain-English title (<= 120 chars)")
+	pattern := fs.String("pattern", "", "What broke (1 generic sentence, zero proprietary info)")
+	analogy := fs.String("analogy", "", "Deterministic engineering analogy (<= 160 chars)")
+	fix := fs.String("fix", "", "Actionable secure default / 1-line fix-forward pattern (<= 180 chars)")
+	why := fs.String("why", "", "Concise 1-sentence reason / impact (<= 200 chars)")
+	triggersCSV := fs.String("triggers", "", "Comma-separated keywords/triggers (e.g. refund,mcp,tool)")
+	reqTriggersCSV := fs.String("req-triggers", "", "Optional 5-Q trigger flags (auth_data_money,ai_rag_context,ai_state_mutation,supply_chain_mcp,secrets_pii)")
+	given := fs.String("given", "", "Optional explicit Given clause for AbuseCaseCriterion")
+	when := fs.String("when", "", "Optional explicit When clause for AbuseCaseCriterion")
+	then := fs.String("then", "", "Optional explicit Then clause for AbuseCaseCriterion")
+	verifyCmd := fs.String("verify-cmd", "", "Allowlisted local bonjoski verify_cmd (e.g. aegisbox test --ai-safety)")
+	kataRef := fs.String("kata-ref", "", "Optional local aegisbox kata reference")
+	cwe := fs.String("cwe", "", "Optional CWE or OWASP identifier (e.g. OWASP-LLM01)")
+	probeCategory := fs.String("probe-category", "", "Optional aegisbox probe category (indirect_prompt_injection, rag_cross_tenant_bleed, tool_arg_path_traversal, tool_arg_ssrf, mcp_scope_escalation, secret_egress_canary)")
+	probePayload := fs.String("probe-payload", "", "Optional minimal sanitized reproducer payload")
+	expectedSignal := fs.String("expected-signal", "", "Optional expected signal for aegisbox custom probe")
+	noProbe := fs.Bool("no-probe", false, "Omit the optional aegisbox custom probe stub")
+	outDir := fs.String("out-dir", "", "Optional output directory to write mentor-card, abuse-case, and aegisbox-probe JSON files")
+	_ = fs.Parse(args)
+
+	in := capsule.DistillInput{IncludeProbe: !*noProbe}
+	if strings.TrimSpace(*fromFile) != "" {
+		parsed, err := capsule.ParseLessonMarkdownFile(*fromFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Distill REJECTED (fail-closed): %v\n", err)
+			os.Exit(1)
+		}
+		in = parsed
+		in.IncludeProbe = !*noProbe
+	}
+
+	if strings.TrimSpace(*id) != "" {
+		in.ID = *id
+	}
+	if strings.TrimSpace(*domain) != "" {
+		in.Domain = *domain
+	}
+	if strings.TrimSpace(*title) != "" {
+		in.Title = *title
+	}
+	if strings.TrimSpace(*pattern) != "" {
+		in.Pattern = *pattern
+	}
+	if strings.TrimSpace(*analogy) != "" {
+		in.Analogy = *analogy
+	}
+	if strings.TrimSpace(*fix) != "" {
+		in.Fix = *fix
+	}
+	if strings.TrimSpace(*why) != "" {
+		in.Why = *why
+	}
+	if strings.TrimSpace(*triggersCSV) != "" {
+		var trigs []string
+		for _, part := range strings.Split(*triggersCSV, ",") {
+			if t := strings.TrimSpace(part); t != "" {
+				trigs = append(trigs, t)
+			}
+		}
+		in.Triggers = trigs
+	}
+	if strings.TrimSpace(*reqTriggersCSV) != "" {
+		parsedFlags, err := capsule.ParseTriggerFlags(*reqTriggersCSV)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Distill REJECTED (fail-closed): %v\n", err)
+			os.Exit(1)
+		}
+		in.ReqTriggers = parsedFlags
+	}
+	if strings.TrimSpace(*given) != "" {
+		in.Given = *given
+	}
+	if strings.TrimSpace(*when) != "" {
+		in.When = *when
+	}
+	if strings.TrimSpace(*then) != "" {
+		in.Then = *then
+	}
+	if strings.TrimSpace(*verifyCmd) != "" {
+		in.VerifyCmd = *verifyCmd
+	}
+	if strings.TrimSpace(*kataRef) != "" {
+		in.KataRef = *kataRef
+	}
+	if strings.TrimSpace(*cwe) != "" {
+		in.CWEOrOWASP = *cwe
+	}
+	if strings.TrimSpace(*probeCategory) != "" {
+		in.ProbeCategory = *probeCategory
+	}
+	if strings.TrimSpace(*probePayload) != "" {
+		in.ProbePayload = *probePayload
+	}
+	if strings.TrimSpace(*expectedSignal) != "" {
+		in.ExpectedSignal = *expectedSignal
+	}
+
+	res, err := capsule.DistillLesson(in)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Distill REJECTED (fail-closed): %v\n", err)
+		os.Exit(1)
+	}
+
+	if strings.TrimSpace(*outDir) != "" {
+		written, err := capsule.WriteDistillArtifacts(*outDir, res)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Distill write FAILED: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Distilled sanitized lesson %q into flywheel artifacts:\n", res.MentorCard.ID)
+		fmt.Printf("  • MentorCard         : %s\n", written.MentorCardPath)
+		fmt.Printf("  • AbuseCaseCriterion : %s\n", written.AbuseCasePath)
+		if written.ProbeStubPath != "" {
+			fmt.Printf("  • Aegisbox Probe Stub: %s\n", written.ProbeStubPath)
+		}
+		return
+	}
+
+	out, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error formatting distill output: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(out))
+}
+
+func runRequirements(args []string) {
+	fs := flag.NewFlagSet("requirements", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	projectName := fs.String("project", "", "Target project vault")
+	story := fs.String("story", "", "User story or feature description text (ephemeral; never persisted)")
+	storyFile := fs.String("story-file", "", "Path to local PRD or story file (strict 256KB cap; ephemeral; never persisted)")
+	triggersCSV := fs.String("triggers", "", "Optional comma-separated 5-Q triggers (auth_data_money,ai_rag_context,ai_state_mutation,supply_chain_mcp,secrets_pii)")
+	asJSON := fs.Bool("json", false, "Emit machine-readable JSON output")
+	includeWhy := fs.Bool("why", false, "Include 1-sentence plain-English business impact and optional kata reference")
+	limit := fs.Int("limit", capsule.MaxRequirementsCriteria, "Maximum criteria to return (hard ceiling: 3)")
+	_ = fs.Parse(args)
+
+	storyText := strings.TrimSpace(*story)
+	if *storyFile != "" {
+		fileContent, err := capsule.ReadStoryFileBounded(*storyFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading --story-file: %v\n", err)
+			os.Exit(1)
+		}
+		if storyText != "" {
+			storyText = storyText + "\n" + fileContent
+		} else {
+			storyText = fileContent
+		}
+	}
+	if storyText == "" && len(fs.Args()) > 0 {
+		storyText = strings.Join(fs.Args(), " ")
+	}
+
+	triggers, err := capsule.ParseTriggerFlags(*triggersCSV)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing --triggers: %v\n", err)
+		os.Exit(1)
+	}
+
+	if strings.TrimSpace(storyText) == "" && len(triggers) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: provide --story, --story-file, or --triggers\nUsage: coppermind requirements [--story \"...\"] [--story-file ./prd.md] [--triggers ai_rag_context,ai_state_mutation] [--json] [--why]\n")
+		os.Exit(1)
+	}
+
+	// Strictly read-only & ephemeral: only open local SQLite if the vault DB already exists
+	// (so custom imported requirements capsules are picked up), and NEVER persist storyText.
+	var store brain.MemoryStore
+	if getProfile() != "cluster" {
+		dbPath := getDBPath(*dataDir, *projectName)
+		if info, statErr := os.Stat(dbPath); statErr == nil && !info.IsDir() {
+			if st, openErr := sqlite.NewSQLiteStore(dbPath); openErr == nil {
+				store = st
+				defer st.Close()
+			}
+		}
+	}
+
+	reqLens := lenses.NewSQLiteRequirementsLens(store, embedding.NewLocalHashEmbedder(128))
+	criteria, err := reqLens.SuggestCriteriaContext(context.Background(), storyText, triggers, *limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error generating requirements criteria: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *asJSON {
+		out, err := lenses.FormatRequirementsJSON(criteria, *includeWhy)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error formatting JSON: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(out)
+		return
+	}
+
+	fmt.Println(lenses.FormatRequirementsMarkdown(criteria, *includeWhy))
 }

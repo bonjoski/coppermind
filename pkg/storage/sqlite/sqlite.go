@@ -31,6 +31,7 @@ const (
 	opStore writeOpType = iota
 	opDelete
 	opSupersede
+	opCustomWrite
 )
 
 type supersedeReq struct {
@@ -47,6 +48,7 @@ type writeRequest struct {
 	node         *brain.MemoryNode
 	nodeID       string
 	supersedeReq *supersedeReq
+	customFn     func(tx *sql.Tx) error
 	errCh        chan error
 }
 
@@ -142,6 +144,64 @@ func initSchema(db *sql.DB) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_supersessions_superseded ON memory_supersessions(superseded_id);
 	CREATE INDEX IF NOT EXISTS idx_supersessions_superseding ON memory_supersessions(superseding_id);
+
+	CREATE TABLE IF NOT EXISTS mentor_capsules (
+		name TEXT PRIMARY KEY,
+		version TEXT NOT NULL,
+		schema_version TEXT NOT NULL,
+		author TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		imported_at INTEGER NOT NULL,
+		authority_tier TEXT NOT NULL DEFAULT 'TIER_2_MENTOR_CAPSULE',
+		provenance TEXT NOT NULL,
+		merkle_root TEXT NOT NULL,
+		signature TEXT NOT NULL DEFAULT '',
+		public_key TEXT NOT NULL DEFAULT '',
+		card_count INTEGER NOT NULL DEFAULT 0
+	);
+
+	CREATE TABLE IF NOT EXISTS mentor_cards (
+		id TEXT PRIMARY KEY,
+		capsule_name TEXT NOT NULL,
+		capsule_version TEXT NOT NULL,
+		capsule_merkle_prefix TEXT NOT NULL,
+		domain TEXT NOT NULL,
+		triggers_json TEXT NOT NULL,
+		title TEXT NOT NULL,
+		deterministic_analogy TEXT NOT NULL DEFAULT '',
+		secure_default TEXT NOT NULL,
+		why_one_liner TEXT NOT NULL,
+		code_snippet TEXT NOT NULL DEFAULT '',
+		kata_ref TEXT NOT NULL DEFAULT '',
+		cwe_or_owasp TEXT NOT NULL DEFAULT '',
+		authority_tier TEXT NOT NULL DEFAULT 'TIER_2_MENTOR_CAPSULE',
+		provenance TEXT NOT NULL,
+		vector_blob BLOB,
+		FOREIGN KEY (capsule_name) REFERENCES mentor_capsules(name) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_mentor_cards_capsule ON mentor_cards(capsule_name);
+	CREATE INDEX IF NOT EXISTS idx_mentor_cards_domain ON mentor_cards(domain);
+
+	CREATE TABLE IF NOT EXISTS requirements_criteria (
+		id TEXT PRIMARY KEY,
+		capsule_name TEXT NOT NULL,
+		capsule_version TEXT NOT NULL,
+		capsule_merkle_prefix TEXT NOT NULL,
+		triggers_json TEXT NOT NULL,
+		keywords_json TEXT NOT NULL,
+		plain_title TEXT NOT NULL,
+		given_clause TEXT NOT NULL,
+		when_clause TEXT NOT NULL,
+		then_clause TEXT NOT NULL,
+		why_one_liner TEXT NOT NULL,
+		verify_cmd TEXT NOT NULL,
+		kata_ref TEXT NOT NULL DEFAULT '',
+		authority_tier TEXT NOT NULL DEFAULT 'TIER_2_MENTOR_CAPSULE',
+		provenance TEXT NOT NULL,
+		vector_blob BLOB,
+		FOREIGN KEY (capsule_name) REFERENCES mentor_capsules(name) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_requirements_criteria_capsule ON requirements_criteria(capsule_name);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return err
@@ -226,6 +286,8 @@ func (s *SQLiteStore) writeWorker() {
 				err = s.execDelete(req.nodeID)
 			case opSupersede:
 				err = s.execSupersede(req.supersedeReq)
+			case opCustomWrite:
+				err = s.execCustomWrite(req.customFn)
 			}
 			req.errCh <- err
 		case <-s.stopCh:
@@ -239,11 +301,58 @@ func (s *SQLiteStore) writeWorker() {
 					err = s.execDelete(req.nodeID)
 				case opSupersede:
 					err = s.execSupersede(req.supersedeReq)
+				case opCustomWrite:
+					err = s.execCustomWrite(req.customFn)
 				}
 				req.errCh <- err
 			}
 			return
 		}
+	}
+}
+
+func (s *SQLiteStore) execCustomWrite(fn func(tx *sql.Tx) error) error {
+	if fn == nil {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DB returns the underlying WAL-enabled *sql.DB for lock-free concurrent reads.
+func (s *SQLiteStore) DB() *sql.DB {
+	return s.db
+}
+
+// RunWriteTx executes fn inside a transaction serialized through the single-writer ring channel.
+func (s *SQLiteStore) RunWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	errCh := make(chan error, 1)
+	req := writeRequest{
+		op:       opCustomWrite,
+		customFn: fn,
+		errCh:    errCh,
+	}
+
+	select {
+	case s.writeCh <- req:
+		select {
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.stopCh:
+		return fmt.Errorf("store is closed")
 	}
 }
 

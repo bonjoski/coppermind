@@ -1,0 +1,291 @@
+{
+  "schema_version": "bonjoski-requirements-v1",
+  "name": "po-abuse-case-criteria",
+  "version": "1.0.0",
+  "author": "bonjoski",
+  "created_at": "2026-11-22T00:00:00Z",
+  "authority_tier": "TIER_2_MENTOR_CAPSULE",
+  "merkle_root": "c327f274619f42a6a6335cabd9d07edfa4da9a7a9eeeea42fd1d4ce08eee8a57",
+  "criteria": [
+    {
+      "id": "req-det-01-tenant-object-authz",
+      "triggers": [
+        "auth_data_money"
+      ],
+      "keywords": [
+        "login",
+        "auth",
+        "account",
+        "customer",
+        "tenant",
+        "profile",
+        "invoice",
+        "order",
+        "record",
+        "permission",
+        "role",
+        "multi-tenant",
+        "access control"
+      ],
+      "plain_title": "Block Cross-Customer Access",
+      "given": "User A requests User B's record ID,",
+      "when": "the API reads or updates it,",
+      "then": "session ownership check denies it (403).",
+      "why_one_liner": "Checking login status alone lets any signed-in user read or edit another customer's records simply by swapping an ID.",
+      "verify_cmd": "aegisbox test --authz",
+      "kata_ref": "kata-01-idor-tenant-check"
+    },
+    {
+      "id": "req-det-02-server-side-billing-limits",
+      "triggers": [
+        "auth_data_money"
+      ],
+      "keywords": [
+        "billing",
+        "payment",
+        "checkout",
+        "price",
+        "discount",
+        "coupon",
+        "balance",
+        "money",
+        "credit",
+        "refund",
+        "transfer",
+        "subscription",
+        "stripe"
+      ],
+      "plain_title": "Enforce Prices Server-Side",
+      "given": "a client alters price or discount,",
+      "when": "checkout or refund runs,",
+      "then": "server recalculates from trusted records.",
+      "why_one_liner": "Trusting browser-supplied prices or balances allows attackers to complete free orders or issue unauthorized refunds.",
+      "verify_cmd": "aegisbox test --billing",
+      "kata_ref": "kata-02-server-price-check"
+    },
+    {
+      "id": "req-det-03-dependency-vetting",
+      "triggers": [
+        "supply_chain_mcp"
+      ],
+      "keywords": [
+        "package",
+        "library",
+        "dependency",
+        "npm",
+        "pip",
+        "sdk",
+        "third-party",
+        "plugin",
+        "external api",
+        "integration",
+        "vendor",
+        "install"
+      ],
+      "plain_title": "Vet New Packages First",
+      "given": "a story adds a library or SDK,",
+      "when": "the lockfile updates,",
+      "then": "provenance checks pass with no typosquats.",
+      "why_one_liner": "Unvetted or lookalike packages can execute malicious install scripts on developer machines and CI runners.",
+      "verify_cmd": "argus vet --diff",
+      "kata_ref": "kata-05-supply-chain-vet"
+    },
+    {
+      "id": "req-det-04-keyless-secret-storage",
+      "triggers": [
+        "secrets_pii"
+      ],
+      "keywords": [
+        "api key",
+        "secret",
+        "credential",
+        "token",
+        "password",
+        "oauth",
+        "webhook secret",
+        "env",
+        "signing key",
+        "database password",
+        "openai key"
+      ],
+      "plain_title": "Keep API Keys Out of Git",
+      "given": "a feature calls an API or DB,",
+      "when": "the service runs locally,",
+      "then": "keys inject at runtime; zero secrets in git.",
+      "why_one_liner": "Hardcoded keys or committed .env files are harvested rapidly and lead to immediate billing abuse or data breaches.",
+      "verify_cmd": "locksmith run -- env",
+      "kata_ref": "kata-04-keyless-ai-sdk"
+    },
+    {
+      "id": "req-det-05-pii-log-redaction",
+      "triggers": [
+        "secrets_pii"
+      ],
+      "keywords": [
+        "pii",
+        "email",
+        "phone",
+        "address",
+        "ssn",
+        "personal data",
+        "log",
+        "logging",
+        "telemetry",
+        "audit",
+        "export",
+        "privacy",
+        "redact",
+        "credit card"
+      ],
+      "plain_title": "Scrub Customer PII from Logs",
+      "given": "a request has emails or cards,",
+      "when": "logs or errors are written,",
+      "then": "sensitive fields redact before storage.",
+      "why_one_liner": "Unredacted error logs quietly copy customer personal data and session tokens into shared debugging tools.",
+      "verify_cmd": "bomhound check",
+      "kata_ref": "kata-04-egress-redaction"
+    },
+    {
+      "id": "req-ai-01-rag-tenant-filter",
+      "triggers": [
+        "ai_rag_context",
+        "auth_data_money"
+      ],
+      "keywords": [
+        "rag",
+        "vector",
+        "search",
+        "summarize",
+        "ticket",
+        "tickets",
+        "knowledge base",
+        "document",
+        "retrieval",
+        "embedding",
+        "assistant",
+        "chatbot",
+        "ai",
+        "llm"
+      ],
+      "plain_title": "Isolate AI Search by Tenant",
+      "given": "Customer A queries past tickets,",
+      "when": "search fetches AI context,",
+      "then": "DB filters tenant_id = A before model call.",
+      "why_one_liner": "Relying on prompt wording to hide other customers' text fails when summaries or crafted questions pull it through.",
+      "verify_cmd": "aegisbox test --ai-safety --rag",
+      "kata_ref": "kata-03-rag-tenant-leak"
+    },
+    {
+      "id": "req-ai-02-untrusted-text-fence",
+      "triggers": [
+        "ai_rag_context"
+      ],
+      "keywords": [
+        "ai",
+        "llm",
+        "prompt",
+        "summarize",
+        "summary",
+        "pdf",
+        "upload",
+        "email",
+        "comment",
+        "support",
+        "chatbot",
+        "rag",
+        "web page",
+        "assistant"
+      ],
+      "plain_title": "Fence User Text from AI Rules",
+      "given": "a ticket hides spoofed commands,",
+      "when": "the AI summarizes that text,",
+      "then": "text is fenced as data and ignored.",
+      "why_one_liner": "Mixing external documents directly into AI instructions lets attackers hijack the assistant through normal user content.",
+      "verify_cmd": "aegisbox test --ai-safety",
+      "kata_ref": "kata-03-rag-injection"
+    },
+    {
+      "id": "req-ai-03-deterministic-tool-caps",
+      "triggers": [
+        "ai_state_mutation",
+        "auth_data_money"
+      ],
+      "keywords": [
+        "refund",
+        "tool",
+        "agent",
+        "ai assistant",
+        "action",
+        "function calling",
+        "limit",
+        "cap",
+        "credit",
+        "payout",
+        "update",
+        "write",
+        "mutate",
+        "billing"
+      ],
+      "plain_title": "Enforce AI Action Caps in Code",
+      "given": "a ticket asks for a $500 refund,",
+      "when": "the AI calls the refund tool,",
+      "then": "server code enforces the $50 cap.",
+      "why_one_liner": "Prompts are not security boundaries; dollar caps and caller role checks must be enforced in deterministic server code.",
+      "verify_cmd": "aegisbox test --ai-safety --tools",
+      "kata_ref": "kata-03-llm-output-sink"
+    },
+    {
+      "id": "req-ai-04-confirm-destructive-actions",
+      "triggers": [
+        "ai_state_mutation"
+      ],
+      "keywords": [
+        "delete",
+        "remove",
+        "cancel",
+        "send email",
+        "webhook",
+        "notify",
+        "publish",
+        "agent",
+        "autonomous",
+        "ai",
+        "tool",
+        "state change",
+        "irreversible"
+      ],
+      "plain_title": "Approve Risky AI Actions",
+      "given": "AI proposes deleting or emailing,",
+      "when": "an irreversible action triggers,",
+      "then": "app pauses for human confirmation.",
+      "why_one_liner": "A single misunderstood prompt or injected message can trigger irreversible deletions or customer emails without a confirmation step.",
+      "verify_cmd": "aegisbox test --ai-safety --tools",
+      "kata_ref": "kata-06-ai-safety-harness"
+    },
+    {
+      "id": "req-ai-05-mcp-server-pinning",
+      "triggers": [
+        "supply_chain_mcp",
+        "ai_state_mutation"
+      ],
+      "keywords": [
+        "mcp",
+        "mcp server",
+        "connector",
+        "tool server",
+        "external tool",
+        "plugin",
+        "agent tool",
+        "third-party ai",
+        "integration"
+      ],
+      "plain_title": "Pin & Scope MCP Tool Servers",
+      "given": "a feature adds an MCP server,",
+      "when": "the tool server registers,",
+      "then": "version is pinned with least privilege.",
+      "why_one_liner": "Unpinned external tool servers can change behavior after install and inherit broad access to user workspaces or data.",
+      "verify_cmd": "soulcaster verify-patch",
+      "kata_ref": "kata-05-mcp-pinning"
+    }
+  ]
+}

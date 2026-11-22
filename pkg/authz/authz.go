@@ -18,20 +18,22 @@ var (
 type AuthorityTier int
 
 const (
-	TierUnspecified   AuthorityTier = 0
-	Tier4Scratchpad   AuthorityTier = 10
-	Tier3Episodic     AuthorityTier = 50
-	Tier2Product      AuthorityTier = 70
-	Tier1Architecture AuthorityTier = 80
-	Tier0Sovereign    AuthorityTier = 100
+	TierUnspecified    AuthorityTier = 0
+	Tier4Scratchpad    AuthorityTier = 10
+	Tier3Episodic      AuthorityTier = 50
+	Tier2MentorCapsule AuthorityTier = 60
+	Tier2Product       AuthorityTier = 70
+	Tier1Architecture  AuthorityTier = 80
+	Tier0Sovereign     AuthorityTier = 100
 )
 
 const (
-	TierName0Sovereign    = "TIER_0_SOVEREIGN"
-	TierName1Architecture = "TIER_1_ARCHITECTURE"
-	TierName2Product      = "TIER_2_PRODUCT"
-	TierName3Episodic     = "TIER_3_EPISODIC"
-	TierName4Scratchpad   = "TIER_4_SCRATCHPAD"
+	TierName0Sovereign     = "TIER_0_SOVEREIGN"
+	TierName1Architecture  = "TIER_1_ARCHITECTURE"
+	TierName2Product       = "TIER_2_PRODUCT"
+	TierName2MentorCapsule = "TIER_2_MENTOR_CAPSULE"
+	TierName3Episodic      = "TIER_3_EPISODIC"
+	TierName4Scratchpad    = "TIER_4_SCRATCHPAD"
 )
 
 // LifecycleStatus defines the state of a memory in the active consensus.
@@ -54,6 +56,8 @@ func ParseAuthorityTier(name string) AuthorityTier {
 		return Tier1Architecture
 	case TierName2Product, "TIER_2", "PRODUCT":
 		return Tier2Product
+	case TierName2MentorCapsule, "MENTOR_CAPSULE", "MENTOR":
+		return Tier2MentorCapsule
 	case TierName3Episodic, "TIER_3", "EPISODIC":
 		return Tier3Episodic
 	case TierName4Scratchpad, "TIER_4", "SCRATCHPAD", "WORKING":
@@ -72,6 +76,8 @@ func TierToString(tier AuthorityTier, category ...string) string {
 		return TierName1Architecture
 	case Tier2Product:
 		return TierName2Product
+	case Tier2MentorCapsule:
+		return TierName2MentorCapsule
 	case Tier3Episodic:
 		return TierName3Episodic
 	case Tier4Scratchpad:

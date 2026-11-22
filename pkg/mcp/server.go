@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/capsule"
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/lenses"
 	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
@@ -23,14 +25,16 @@ import (
 
 // Server implements a native Model Context Protocol (MCP) server over STDIO or arbitrary streams.
 type Server struct {
-	manager    *brain.Manager
-	projectMgr *project.Manager
-	broker     queue.Broker
-	worker     *worker.CognitiveWorker
-	inMu       sync.Mutex
-	outMu      sync.Mutex
-	writer     io.Writer
-	startTime  time.Time
+	manager          *brain.Manager
+	projectMgr       *project.Manager
+	mentorLens       *lenses.SQLiteMentorLens
+	requirementsLens *lenses.SQLiteRequirementsLens
+	broker           queue.Broker
+	worker           *worker.CognitiveWorker
+	inMu             sync.Mutex
+	outMu            sync.Mutex
+	writer           io.Writer
+	startTime        time.Time
 }
 
 // NewServer creates a new MCP server wrapping the brain manager.
@@ -38,11 +42,24 @@ func NewServer(manager *brain.Manager, out io.Writer) *Server {
 	if out == nil {
 		out = os.Stdout
 	}
+	var ml *lenses.SQLiteMentorLens
+	var rl *lenses.SQLiteRequirementsLens
+	if manager != nil {
+		embedder := embedding.NewLocalHashEmbedder(128)
+		ml = lenses.NewSQLiteMentorLens(manager.Store(), embedder)
+		rl = lenses.NewSQLiteRequirementsLens(manager.Store(), embedder)
+	} else {
+		embedder := embedding.NewLocalHashEmbedder(128)
+		ml = lenses.NewSQLiteMentorLens(nil, embedder)
+		rl = lenses.NewSQLiteRequirementsLens(nil, embedder)
+	}
 	return &Server{
-		manager:    manager,
-		projectMgr: project.NewManager(""),
-		writer:     out,
-		startTime:  time.Now(),
+		manager:          manager,
+		projectMgr:       project.NewManager(""),
+		mentorLens:       ml,
+		requirementsLens: rl,
+		writer:           out,
+		startTime:        time.Now(),
 	}
 }
 
@@ -174,17 +191,20 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_recall",
-			Description: "Perform semantic and hybrid search over stored memories in a project vault, optionally filtering by cognitive lens or auto-attaching observations.",
+			Description: "Perform semantic and hybrid search over stored memories in a project vault, optionally filtering by cognitive lens (including lens='mentor' for passive security nudges and lens='requirements' for ephemeral PO abuse-case acceptance criteria) or auto-attaching observations.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
-					"query": { "type": "string", "description": "Natural language query to search memory for." },
+					"query": { "type": "string", "description": "Natural language query or ephemeral user story text to search/match." },
 					"project": { "type": "string", "description": "Optional isolated project vault name (e.g. github, personal, work)." },
 					"category": { "type": "string", "description": "Optional category filter." },
 					"session_id": { "type": "string", "description": "Optional session filter." },
-					"limit": { "type": "integer", "description": "Max results to return (default 5)." },
+					"limit": { "type": "integer", "description": "Max results to return (default 5; hard ceiling 2 for lens='mentor', 3 for lens='requirements')." },
 					"min_score": { "type": "number", "description": "Minimum similarity score threshold (default 0.0)." },
-					"lens": { "type": "string", "description": "Optional cognitive lens filter to retrieve observations from a specific persona (e.g. security-architect, systems-architect, drift-auditor, synthesizer)." },
+					"lens": { "type": "string", "description": "Optional cognitive lens filter (e.g. mentor, requirements, security-architect, systems-architect, drift-auditor, synthesizer)." },
+					"detected_sdks": { "type": "array", "items": { "type": "string" }, "description": "Optional detected SDK/framework hints when lens='mentor' (e.g. ['openai', 'mcp', 'pgvector'])." },
+					"triggers": { "type": "array", "items": { "type": "string" }, "description": "Optional 5-Q blast-radius trigger flags when lens='requirements' (auth_data_money, ai_rag_context, ai_state_mutation, supply_chain_mcp, secrets_pii)." },
+					"include_why": { "type": "boolean", "description": "When lens='requirements', include plain-English 1-sentence business impact and optional kata link (default false)." },
 					"include_observations": { "type": "boolean", "description": "Whether to auto-attach linked cognitive lens observations to recalled memories (default true)." },
 					"include_superseded": { "type": "boolean", "description": "Whether to include superseded historical memories in results (default false)." },
 					"tier": { "type": "string", "description": "Optional authority tier filter (e.g. TIER_1_ARCHITECTURE)." }
@@ -366,16 +386,19 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 
 func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
 	var input struct {
-		Project             string  `json:"project"`
-		Query               string  `json:"query"`
-		Category            string  `json:"category"`
-		SessionID           string  `json:"session_id"`
-		Limit               int     `json:"limit"`
-		MinScore            float32 `json:"min_score"`
-		Lens                string  `json:"lens"`
-		IncludeObservations *bool   `json:"include_observations"`
-		IncludeSuperseded   bool    `json:"include_superseded"`
-		Tier                string  `json:"tier"`
+		Project             string   `json:"project"`
+		Query               string   `json:"query"`
+		Category            string   `json:"category"`
+		SessionID           string   `json:"session_id"`
+		Limit               int      `json:"limit"`
+		MinScore            float32  `json:"min_score"`
+		Lens                string   `json:"lens"`
+		DetectedSDKs        []string `json:"detected_sdks"`
+		Triggers            []string `json:"triggers"`
+		IncludeWhy          bool     `json:"include_why"`
+		IncludeObservations *bool    `json:"include_observations"`
+		IncludeSuperseded   bool     `json:"include_superseded"`
+		Tier                string   `json:"tier"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -386,6 +409,57 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage) (*ToolCal
 		return nil, err
 	}
 	defer cleanup()
+
+	// Fast-path: Mentor Cognitive Lens (sub-5ms lock-free WAL read, hard ceiling 2 cards, <=120 tokens/nudge)
+	if strings.EqualFold(strings.TrimSpace(input.Lens), "mentor") {
+		mentorLens := s.mentorLens
+		if input.Project != "" || mentorLens == nil {
+			var st brain.MemoryStore
+			if mgr != nil {
+				st = mgr.Store()
+			}
+			mentorLens = lenses.NewSQLiteMentorLens(st, embedding.NewLocalHashEmbedder(128))
+		}
+		nudges, err := mentorLens.MatchContext(ctx, input.Query, input.DetectedSDKs, input.Limit)
+		if err != nil {
+			return nil, err
+		}
+		if len(nudges) == 0 {
+			return &ToolCallResult{
+				Content: []TextContent{{Type: "text", Text: "No matching security mentor nudges found. Import capsules with `coppermind capsule import <file>`."}},
+			}, nil
+		}
+		return &ToolCallResult{
+			Content: []TextContent{{Type: "text", Text: lenses.FormatMentorNudges(nudges)}},
+		}, nil
+	}
+
+	// Fast-path: PO & Requirements Cognitive Lens (sub-5ms ephemeral read-only, max 3 criteria, <=180 tokens)
+	if strings.EqualFold(strings.TrimSpace(input.Lens), "requirements") || strings.EqualFold(strings.TrimSpace(input.Lens), "po-mentor") {
+		reqLens := s.requirementsLens
+		if input.Project != "" || reqLens == nil {
+			var st brain.MemoryStore
+			if mgr != nil {
+				st = mgr.Store()
+			}
+			reqLens = lenses.NewSQLiteRequirementsLens(st, embedding.NewLocalHashEmbedder(128))
+		}
+		triggers := make([]capsule.TriggerFlag, 0, len(input.Triggers))
+		for _, t := range input.Triggers {
+			parsed, parseErr := capsule.ParseTriggerFlags(t)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			triggers = append(triggers, parsed...)
+		}
+		criteria, err := reqLens.SuggestCriteriaContext(ctx, input.Query, triggers, input.Limit)
+		if err != nil {
+			return nil, err
+		}
+		return &ToolCallResult{
+			Content: []TextContent{{Type: "text", Text: lenses.FormatRequirementsMarkdown(criteria, input.IncludeWhy)}},
+		}, nil
+	}
 
 	if input.Limit <= 0 {
 		input.Limit = 5
