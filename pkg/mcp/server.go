@@ -31,6 +31,8 @@ type Server struct {
 	projectMgr       *project.Manager
 	mentorLens       *lenses.SQLiteMentorLens
 	requirementsLens *lenses.SQLiteRequirementsLens
+	lensConfig       *lenses.LensesConfig
+	hostEval         *lenses.DefaultHostEvaluator
 	broker           queue.Broker
 	worker           *worker.CognitiveWorker
 	inMu             sync.Mutex
@@ -55,11 +57,15 @@ func NewServer(manager *brain.Manager, out io.Writer) *Server {
 		ml = lenses.NewSQLiteMentorLens(nil, embedder)
 		rl = lenses.NewSQLiteRequirementsLens(nil, embedder)
 	}
+	lensCfg := lenses.DefaultConfig()
+	hostEv, _ := lenses.NewDefaultHostEvaluator(manager, "default", lensCfg)
 	return &Server{
 		manager:          manager,
 		projectMgr:       project.NewManager(""),
 		mentorLens:       ml,
 		requirementsLens: rl,
+		lensConfig:       lensCfg,
+		hostEval:         hostEv,
 		writer:           out,
 		startTime:        time.Now(),
 	}
@@ -141,6 +147,10 @@ func (s *Server) handleMessage(ctx context.Context, msg *JSONRPCMessage) *JSONRP
 		return s.handleToolsList(msg)
 	case "tools/call":
 		return s.handleToolsCall(ctx, msg)
+	case "prompts/list":
+		return s.handlePromptsList(msg)
+	case "prompts/get":
+		return s.handlePromptsGet(ctx, msg)
 	case "ping":
 		resp, _ := NewSuccessResponse(msg.ID, map[string]string{"status": "ok"})
 		return resp
@@ -162,6 +172,9 @@ func (s *Server) handleInitialize(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		"capabilities": map[string]interface{}{
 			"tools": map[string]bool{
+				"listChanged": false,
+			},
+			"prompts": map[string]bool{
 				"listChanged": false,
 			},
 		},
@@ -262,6 +275,38 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 				"required": ["task_type"]
 			}`),
 		},
+		{
+			Name:        "coppermind_lens_prepare",
+			Description: "Prepare a zero-API-key host-evaluated cognitive lens prompt bundle with AST/regex pre-filtering, secret redaction, sibling-endpoint & ADR recall, XML <untrusted_artifact> fencing, and a single-use HMAC-SHA256 eval_token.",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"lens": { "type": "string", "enum": ["security-architect", "systems-architect", "drift-auditor", "synthesizer", "red-team", "devils-advocate"], "description": "Cognitive lens persona to prepare." },
+					"target_id": { "type": "string", "description": "Existing Coppermind memory node ID to inspect." },
+					"content": { "type": "string", "description": "Inline candidate code or artifact content to inspect (bounded to 6,000 chars and secret-redacted)." },
+					"file_path": { "type": "string", "description": "Optional workspace file path for differential sibling-endpoint retrieval." },
+					"project": { "type": "string", "description": "Optional isolated project vault name." },
+					"session_id": { "type": "string", "description": "Optional session/worktree identifier cryptographically bound into eval_token." },
+					"force": { "type": "boolean", "description": "Bypass zero-cost pre-filter gate even when no sensitive sinks match (default false)." }
+				},
+				"required": ["lens"]
+			}`),
+		},
+		{
+			Name:        "coppermind_lens_submit",
+			Description: "Validate a single-use HMAC-SHA256 eval_token and ingest host-evaluated JSON findings through deterministic NFKC/Stormcage quarantine, EnforcePoCGate, SHA-256 deduplication, TIER_3_DERIVED persistence, and optional BLPR-v1 receipt emission.",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"eval_token": { "type": "string", "description": "Single-use HMAC-SHA256 eval_token returned by coppermind_lens_prepare." },
+					"findings_json": { "description": "Strict JSON string or object matching {\"findings\": [...]} produced by the host AI model." },
+					"project": { "type": "string", "description": "Optional isolated project vault name (must match eval_token project if provided)." },
+					"session_id": { "type": "string", "description": "Session/worktree identifier (must match eval_token session_id when token is session-bound)." },
+					"emit_receipt": { "type": "boolean", "description": "When true and FABRIAL_RECEIPT_DIR is set, atomically emit a BLPR-v1 receipt (signed via LOCKSMITH_SOCKET when reachable)." }
+				},
+				"required": ["eval_token", "findings_json"]
+			}`),
+		},
 	}
 
 	resp, _ := NewSuccessResponse(msg.ID, map[string]interface{}{"tools": tools})
@@ -290,6 +335,10 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *JSONRPCMessage) *JSON
 		result, err = s.callDispatchTask(ctx, params.Arguments)
 	case "coppermind_status":
 		result, err = s.callStatus(ctx)
+	case "coppermind_lens_prepare":
+		result, err = s.callLensPrepare(ctx, params.Arguments, params.Meta)
+	case "coppermind_lens_submit":
+		result, err = s.callLensSubmit(ctx, params.Arguments, params.Meta)
 	default:
 		return NewErrorResponse(msg.ID, ErrCodeMethodNotFound, fmt.Sprintf("Tool %q not found", params.Name))
 	}
@@ -348,6 +397,39 @@ func classifyCoppermindError(toolName string, err error) *ToolCallResult {
 			Summary:        "Paused receipt emission: FABRIAL_RECEIPT_DIR failed symlink and containment verification.",
 			RemediationCmd: "fabrial doctor --fix",
 			Why:            "BLPR-v1 receipts must be written atomically inside a real, non-symlinked directory owned by the local user.",
+		})
+
+	case errors.Is(err, lenses.ErrEvalTokenInvalid),
+		errors.Is(err, lenses.ErrEvalTokenExpired),
+		errors.Is(err, lenses.ErrEvalTokenReplayed),
+		errors.Is(err, lenses.ErrEvalTokenSessionMismatch):
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_EVAL_TOKEN_DENY",
+			ExitCode:       ExitCodePolicyDeny,
+			Retryable:      false,
+			Summary:        fmt.Sprintf("Paused %s: %s", SanitizeSingleLine(toolName), errMsg),
+			RemediationCmd: "coppermind_lens_prepare",
+			Why:            "Host-evaluated lens submissions require a fresh, unexpired, single-use HMAC-SHA256 eval_token bound to the active session.",
+		})
+
+	case errors.Is(err, lenses.ErrInvalidFindingsJSON):
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_LENS_INVALID_JSON",
+			ExitCode:       ExitCodePolicyDeny,
+			Retryable:      true,
+			Summary:        fmt.Sprintf("Paused %s: findings_json must be valid JSON matching {\"findings\": [...]}.", SanitizeSingleLine(toolName)),
+			RemediationCmd: "coppermind_lens_prepare",
+			Why:            "Coppermind only ingests deterministically parsed and PoC-gated JSON findings from host-evaluated lenses.",
+		})
+
+	case errors.Is(err, lenses.ErrUnknownLens):
+		return NewUBMCPv1ErrorResult(FixForwardError{
+			Code:           "COPPERMIND_VALIDATION_DENY",
+			ExitCode:       ExitCodePolicyDeny,
+			Retryable:      true,
+			Summary:        fmt.Sprintf("Paused %s: %s", SanitizeSingleLine(toolName), errMsg),
+			RemediationCmd: "coppermind status",
+			Why:            "Specify a configured lens such as security-architect, systems-architect, drift-auditor, or synthesizer.",
 		})
 
 	case isValidationPolicyError(errMsg):
@@ -902,4 +984,373 @@ func (s *Server) callStatus(ctx context.Context) (*ToolCallResult, error) {
 	return &ToolCallResult{
 		Content: []TextContent{{Type: "text", Text: status}},
 	}, nil
+}
+
+type canonicalPromptSpec struct {
+	Def      PromptDef
+	LensName string
+	Focus    string
+}
+
+var canonicalPrompts = []canonicalPromptSpec{
+	{
+		Def: PromptDef{
+			Name:        "coppermind:security-audit",
+			Description: "Lean 3-step differential authorization & reproducible PoC threat-model audit using your active AI session (zero extra API keys).",
+			Arguments: []PromptArgument{
+				{Name: "target_id", Description: "Optional existing Coppermind memory node ID to audit.", Required: false},
+				{Name: "file_path", Description: "Optional workspace file path for differential sibling-endpoint recall.", Required: false},
+				{Name: "content", Description: "Optional inline code or artifact content to audit directly.", Required: false},
+				{Name: "project", Description: "Optional isolated project vault name.", Required: false},
+			},
+		},
+		LensName: "security-architect",
+		Focus:    "differential authorization checks, untrusted data flows, and reproducible PoC verification",
+	},
+	{
+		Def: PromptDef{
+			Name:        "coppermind:systems-audit",
+			Description: "Hop-Tax, N=8 multi-agent concurrency, boundary leak, and lock-contention systems architecture audit (zero extra API keys).",
+			Arguments: []PromptArgument{
+				{Name: "target_id", Description: "Optional existing Coppermind memory node ID to audit.", Required: false},
+				{Name: "file_path", Description: "Optional workspace file path for architectural context recall.", Required: false},
+				{Name: "content", Description: "Optional inline code or architecture proposal content to audit directly.", Required: false},
+				{Name: "project", Description: "Optional isolated project vault name.", Required: false},
+			},
+		},
+		LensName: "systems-architect",
+		Focus:    "Hop-Tax overhead, N=8 multi-agent concurrency contention, layer leaks, and ADR boundaries",
+	},
+	{
+		Def: PromptDef{
+			Name:        "coppermind:drift-audit",
+			Description: "Implementation vs. stored TIER_0/TIER_1 ADR and convention drift audit (zero extra API keys).",
+			Arguments: []PromptArgument{
+				{Name: "target_id", Description: "Optional existing Coppermind memory node ID to audit.", Required: false},
+				{Name: "file_path", Description: "Optional workspace file path to inspect for ADR drift.", Required: false},
+				{Name: "content", Description: "Optional inline diff, code, or documentation content to audit directly.", Required: false},
+				{Name: "project", Description: "Optional isolated project vault name.", Required: false},
+			},
+		},
+		LensName: "drift-auditor",
+		Focus:    "contradictions with stored TIER_0/TIER_1 ADRs, superseded conventions, and stale documentation",
+	},
+}
+
+func (s *Server) handlePromptsList(msg *JSONRPCMessage) *JSONRPCMessage {
+	prompts := make([]PromptDef, 0, len(canonicalPrompts))
+	for _, spec := range canonicalPrompts {
+		prompts = append(prompts, spec.Def)
+	}
+	resp, _ := NewSuccessResponse(msg.ID, map[string]interface{}{"prompts": prompts})
+	return resp
+}
+
+func (s *Server) handlePromptsGet(ctx context.Context, msg *JSONRPCMessage) *JSONRPCMessage {
+	var params PromptGetParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return NewErrorResponse(msg.ID, ErrCodeInvalidParams, "Invalid prompts/get parameters")
+	}
+	name := strings.TrimSpace(params.Name)
+	var matched *canonicalPromptSpec
+	for i := range canonicalPrompts {
+		if canonicalPrompts[i].Def.Name == name {
+			matched = &canonicalPrompts[i]
+			break
+		}
+	}
+	if matched == nil {
+		return NewErrorResponse(msg.ID, ErrCodeInvalidParams, fmt.Sprintf("Unknown prompt %q", name))
+	}
+
+	targetID := strings.TrimSpace(params.Arguments["target_id"])
+	filePath := strings.TrimSpace(params.Arguments["file_path"])
+	content := params.Arguments["content"]
+	projectName := strings.TrimSpace(params.Arguments["project"])
+
+	var messageText string
+	if targetID != "" || strings.TrimSpace(content) != "" {
+		bundle, err := s.prepareLensBundle(ctx, lensPrepareInput{
+			Lens:     matched.LensName,
+			TargetID: targetID,
+			Content:  content,
+			FilePath: filePath,
+			Project:  projectName,
+			Force:    true,
+		}, nil)
+		if err != nil {
+			return NewErrorResponse(msg.ID, ErrCodeInvalidParams, SanitizeSingleLine(err.Error()))
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Run Coppermind zero-API-key %s audit (%s).\n\n", matched.Def.Name, matched.Focus))
+		sb.WriteString(bundle.SystemPrompt)
+		sb.WriteString("\n\n")
+		sb.WriteString(bundle.UserPrompt)
+		sb.WriteString(fmt.Sprintf("\n\nAfter producing strict JSON matching %s, call tool %q with eval_token=%q and your JSON in findings_json.",
+			bundle.OutputSchema, bundle.SubmitTool, bundle.EvalToken))
+		messageText = sb.String()
+	} else {
+		var argHints []string
+		argHints = append(argHints, fmt.Sprintf(`"lens": %q`, matched.LensName))
+		if filePath != "" {
+			argHints = append(argHints, fmt.Sprintf(`"file_path": %q`, filePath))
+		}
+		if projectName != "" {
+			argHints = append(argHints, fmt.Sprintf(`"project": %q`, projectName))
+		}
+		messageText = fmt.Sprintf(
+			"Execute Coppermind zero-API-key %s (%s) using your active session:\n"+
+				"1. Call MCP tool `coppermind_lens_prepare` with {%s} plus either `content` (the code/diff under review) or `target_id`.\n"+
+				"2. If `skipped` is true, report that the zero-cost pre-filter found no sensitive sinks and stop.\n"+
+				"3. Otherwise evaluate the fenced `<untrusted_artifact>` strictly according to `system_prompt` and `user_prompt`, outputting valid JSON matching `output_schema`.\n"+
+				"4. Submit the JSON findings and `eval_token` to `coppermind_lens_submit` so Coppermind enforces NFKC/Stormcage quarantine, PoC gating, SHA-256 deduplication, and TIER_3_DERIVED storage.",
+			matched.Def.Name, matched.Focus, strings.Join(argHints, ", "),
+		)
+	}
+
+	result := PromptGetResult{
+		Description: matched.Def.Description,
+		Messages: []PromptMessage{
+			{
+				Role: "user",
+				Content: TextContent{
+					Type: "text",
+					Text: messageText,
+				},
+			},
+		},
+	}
+	resp, _ := NewSuccessResponse(msg.ID, result)
+	return resp
+}
+
+type lensPrepareInput struct {
+	Lens      string `json:"lens"`
+	TargetID  string `json:"target_id"`
+	Content   string `json:"content"`
+	FilePath  string `json:"file_path"`
+	Project   string `json:"project"`
+	SessionID string `json:"session_id"`
+	Force     bool   `json:"force"`
+}
+
+func (s *Server) prepareLensBundle(ctx context.Context, input lensPrepareInput, meta *ToolCallMeta) (*lenses.PreparedLensBundle, error) {
+	if s.hostEval == nil {
+		return nil, fmt.Errorf("host evaluator is not initialized")
+	}
+
+	lensName := strings.TrimSpace(input.Lens)
+	if lensName == "" {
+		return nil, fmt.Errorf("%w: lens is required", lenses.ErrUnknownLens)
+	}
+	lensCfg, ok := s.lensConfig.GetLens(lensName)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", lenses.ErrUnknownLens, lensName)
+	}
+
+	targetID := strings.TrimSpace(input.TargetID)
+	if targetID == "" && strings.TrimSpace(input.Content) == "" {
+		return nil, fmt.Errorf("invalid arguments: either target_id or content is required")
+	}
+
+	effectiveSessionID := strings.TrimSpace(input.SessionID)
+	if effectiveSessionID == "" && meta != nil {
+		if meta.FabrialSessionID != "" {
+			effectiveSessionID = strings.TrimSpace(meta.FabrialSessionID)
+		} else if meta.SessionID != "" {
+			effectiveSessionID = strings.TrimSpace(meta.SessionID)
+		}
+	}
+
+	mgr, cleanup, err := s.getManagerForProject(input.Project)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	var candidate *brain.MemoryNode
+	if targetID != "" {
+		if mgr == nil || mgr.Store() == nil {
+			return nil, fmt.Errorf("memory store not available for target_id lookup")
+		}
+		node, getErr := mgr.Store().GetByID(ctx, targetID)
+		if getErr != nil || node == nil {
+			return nil, fmt.Errorf("validation failed: target_id %q not found", targetID)
+		}
+		cp := *node
+		if cp.Metadata != nil {
+			metaCopy := make(map[string]string, len(cp.Metadata)+1)
+			for k, v := range cp.Metadata {
+				metaCopy[k] = v
+			}
+			cp.Metadata = metaCopy
+		}
+		if strings.TrimSpace(input.FilePath) != "" {
+			if cp.Metadata == nil {
+				cp.Metadata = make(map[string]string)
+			}
+			cp.Metadata["file_path"] = strings.TrimSpace(input.FilePath)
+		}
+		if effectiveSessionID != "" {
+			cp.SessionID = effectiveSessionID
+		}
+		candidate = &cp
+	} else {
+		var nodeMeta map[string]string
+		if fp := strings.TrimSpace(input.FilePath); fp != "" {
+			nodeMeta = map[string]string{"file_path": fp}
+		}
+		candidate = &brain.MemoryNode{
+			SessionID:  effectiveSessionID,
+			Category:   "code",
+			Content:    input.Content,
+			Provenance: brain.ProvenanceLocalWorkspace,
+			Metadata:   nodeMeta,
+			CreatedAt:  time.Now().UTC(),
+		}
+	}
+
+	projName := strings.TrimSpace(input.Project)
+	if projName == "" {
+		projName = "default"
+	}
+
+	return s.hostEval.PrepareWithManager(ctx, mgr, projName, lensCfg, candidate, input.Force)
+}
+
+func (s *Server) callLensPrepare(ctx context.Context, args json.RawMessage, meta *ToolCallMeta) (*ToolCallResult, error) {
+	var input lensPrepareInput
+	if err := json.Unmarshal(args, &input); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	bundle, err := s.prepareLensBundle(ctx, input, meta)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, err := json.Marshal(bundle)
+	if err != nil {
+		return nil, fmt.Errorf("failed marshaling prepared lens bundle: %w", err)
+	}
+
+	return &ToolCallResult{
+		Content:           []TextContent{{Type: "text", Text: string(raw)}},
+		StructuredContent: bundle,
+	}, nil
+}
+
+func (s *Server) callLensSubmit(ctx context.Context, args json.RawMessage, meta *ToolCallMeta) (*ToolCallResult, error) {
+	if s.hostEval == nil {
+		return nil, fmt.Errorf("host evaluator is not initialized")
+	}
+
+	var input struct {
+		EvalToken    string          `json:"eval_token"`
+		FindingsJSON json.RawMessage `json:"findings_json"`
+		Project      string          `json:"project"`
+		SessionID    string          `json:"session_id"`
+		EmitReceipt  bool            `json:"emit_receipt"`
+	}
+	if err := json.Unmarshal(args, &input); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	if strings.TrimSpace(input.EvalToken) == "" {
+		return nil, lenses.ErrEvalTokenInvalid
+	}
+
+	rawFindings, err := decodeFindingsJSONArg(input.FindingsJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	effectiveSessionID := strings.TrimSpace(input.SessionID)
+	var conjoinerSIRID string
+	if meta != nil {
+		if effectiveSessionID == "" {
+			if meta.FabrialSessionID != "" {
+				effectiveSessionID = strings.TrimSpace(meta.FabrialSessionID)
+			} else if meta.SessionID != "" {
+				effectiveSessionID = strings.TrimSpace(meta.SessionID)
+			}
+		}
+		conjoinerSIRID = meta.ConjoinerSIRID
+	}
+
+	// Verify token claims up front (without consuming replay) to resolve isolated project vault safely.
+	claims, err := s.hostEval.VerifyTokenClaims(input.EvalToken)
+	if err != nil {
+		return nil, err
+	}
+
+	targetProject := strings.TrimSpace(input.Project)
+	if targetProject != "" && claims.Project != "" && targetProject != claims.Project {
+		return nil, fmt.Errorf("%w: project mismatch", lenses.ErrEvalTokenInvalid)
+	}
+	projectForMgr := targetProject
+	if projectForMgr == "" && claims.Project != "" && claims.Project != "default" {
+		projectForMgr = claims.Project
+	}
+
+	mgr, cleanup, err := s.getManagerForProject(projectForMgr)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	subRes, err := s.hostEval.SubmitWithManager(ctx, mgr, input.EvalToken, rawFindings, effectiveSessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	if input.EmitReceipt {
+		receiptSession := effectiveSessionID
+		if receiptSession == "" {
+			receiptSession = claims.SessionID
+		}
+		openHigh := countOpenHighObservations(ctx, mgr)
+		emitted, rErr := EmitIdeationReceipt(ctx, IdeationReceiptInput{
+			SessionID:            receiptSession,
+			ConjoinerSIRID:       conjoinerSIRID,
+			Lens:                 subRes.LensName,
+			Query:                fmt.Sprintf("host_eval:%s:%s", subRes.LensName, claims.TargetSHA256),
+			ResultsCount:         subRes.AcceptedCount,
+			OpenHighObservations: openHigh,
+		})
+		if rErr != nil {
+			return nil, rErr
+		}
+		if emitted != nil {
+			subRes.ReceiptID = emitted.ReceiptID
+		}
+	}
+
+	raw, err := json.Marshal(subRes)
+	if err != nil {
+		return nil, fmt.Errorf("failed marshaling submission result: %w", err)
+	}
+
+	return &ToolCallResult{
+		Content:           []TextContent{{Type: "text", Text: string(raw)}},
+		StructuredContent: subRes,
+	}, nil
+}
+
+func decodeFindingsJSONArg(raw json.RawMessage) (string, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "", fmt.Errorf("%w: findings_json is required", lenses.ErrInvalidFindingsJSON)
+	}
+	if strings.HasPrefix(trimmed, `"`) {
+		var str string
+		if err := json.Unmarshal(raw, &str); err != nil {
+			return "", fmt.Errorf("%w: %v", lenses.ErrInvalidFindingsJSON, err)
+		}
+		return str, nil
+	}
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return trimmed, nil
+	}
+	return "", fmt.Errorf("%w: findings_json must be a JSON string or object", lenses.ErrInvalidFindingsJSON)
 }

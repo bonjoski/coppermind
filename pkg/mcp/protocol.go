@@ -59,6 +59,38 @@ type ToolDef struct {
 	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
+// PromptArgument describes an optional or required argument accepted by an MCP prompt.
+type PromptArgument struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+}
+
+// PromptDef defines a prompt exposed via prompts/list.
+type PromptDef struct {
+	Name        string           `json:"name"`
+	Description string           `json:"description,omitempty"`
+	Arguments   []PromptArgument `json:"arguments,omitempty"`
+}
+
+// PromptGetParams defines the payload for prompts/get.
+type PromptGetParams struct {
+	Name      string            `json:"name"`
+	Arguments map[string]string `json:"arguments,omitempty"`
+}
+
+// PromptMessage represents a single role-attributed message in a prompts/get response.
+type PromptMessage struct {
+	Role    string      `json:"role"`
+	Content TextContent `json:"content"`
+}
+
+// PromptGetResult represents the standard result for prompts/get.
+type PromptGetResult struct {
+	Description string          `json:"description,omitempty"`
+	Messages    []PromptMessage `json:"messages"`
+}
+
 // ToolCallParams defines the payload for tools/call.
 type ToolCallParams struct {
 	Name      string          `json:"name"`
