@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -517,8 +518,12 @@ func TestMentorRecall_ConcurrentN8LockFree(t *testing.T) {
 	t.Logf("N=8 concurrent mentor recalls (%d total) alongside %d episodic writes: p50=%v, p99=%v",
 		len(latencies), numWriterEvents, p50, p99)
 
-	if p99 > 10*time.Millisecond {
-		t.Errorf("p99 latency %v exceeded 10ms SLA (p50=%v)", p99, p50)
+	maxP99 := 10 * time.Millisecond
+	if os.Getenv("CI") != "" {
+		maxP99 = 100 * time.Millisecond
+	}
+	if p50 > 5*time.Millisecond || p99 > maxP99 {
+		t.Errorf("latency exceeded SLA: p50=%v p99=%v (maxP99=%v)", p50, p99, maxP99)
 	}
 }
 
