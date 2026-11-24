@@ -4,37 +4,62 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/gitscope"
 	"github.com/bonjoski/coppermind/pkg/security"
+	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 )
 
-// IndexOptions configures codebase traversal and chunking.
+// IndexOptions configures codebase traversal and AST/structural incremental chunking.
 type IndexOptions struct {
 	MaxFileSize int64        // Maximum file size in bytes to index (default: 512KB)
-	MaxChunks   int          // Maximum total chunks to create per run (default: 1000)
+	MaxChunks   int          // Maximum total chunks to create per run (default: 10000)
 	SkipDirs    []string     // Extra directory names to skip
-	ChunkLines  int          // Target lines per chunk (default: 50)
-	Overlap     int          // Overlap lines between chunks (default: 5)
+	ChunkLines  int          // Target lines per structural fallback chunk (default: 50)
+	Overlap     int          // Overlap lines between fallback chunks (default: 5)
 	Category    string       // Target category (default: "code")
+	FullRebuild bool         // If true, ignore SHA-256 cache and re-index all candidate files
 	OnProgress  ProgressFunc // Optional callback for real-time indexing progress events
 }
 
 // IndexStats reports the outcome of a codebase indexing run.
 type IndexStats struct {
-	FilesScanned int           `json:"files_scanned"`
-	FilesIndexed int           `json:"files_indexed"`
-	FilesSkipped int           `json:"files_skipped"`
-	ChunksStored int           `json:"chunks_stored"`
-	Redactions   int           `json:"redactions"`
-	Duration     time.Duration `json:"duration"`
+	FilesScanned   int           `json:"files_scanned"`
+	FilesIndexed   int           `json:"files_indexed"`
+	FilesUnchanged int           `json:"files_unchanged"`
+	FilesSkipped   int           `json:"files_skipped"`
+	FilesPruned    int           `json:"files_pruned"`
+	ChunksStored   int           `json:"chunks_stored"`
+	ChunksPruned   int           `json:"chunks_pruned"`
+	Redactions     int           `json:"redactions"`
+	Duration       time.Duration `json:"duration"`
+}
+
+var (
+	repoLocksMu sync.Mutex
+	repoLocks   = make(map[string]*sync.Mutex)
+)
+
+func lockRepoIndex(absRoot string) func() {
+	repoLocksMu.Lock()
+	mu, ok := repoLocks[absRoot]
+	if !ok {
+		mu = &sync.Mutex{}
+		repoLocks[absRoot] = mu
+	}
+	repoLocksMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 var defaultSkippedDirs = map[string]bool{
@@ -96,7 +121,17 @@ type candidateFile struct {
 	ext     string
 }
 
-// IndexDirectory scans a directory tree, chunks source files, and indexes them into Coppermind.
+type incrementalIndexStore interface {
+	ListIndexedFiles(ctx context.Context, repoRoot string) (map[string]sqlite.IndexedFileRecord, error)
+	UpsertIndexedFile(ctx context.Context, rec sqlite.IndexedFileRecord) error
+	DeleteIndexedChunks(ctx context.Context, chunkIDs []string) error
+	PruneIndexedFile(ctx context.Context, repoRoot, relPath string, chunkIDs []string) error
+}
+
+// IndexDirectory scans a directory tree with os.OpenRoot symlink confinement, performs
+// AST/Markdown/structural chunking, skips unchanged files via SHA-256, swaps stale chunks on
+// modification, and prunes deleted files — isolated under session_id="index:<repo>" to preserve
+// episodic Merkle chains.
 func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opts IndexOptions) (*IndexStats, error) {
 	start := time.Now()
 	stats := &IndexStats{}
@@ -106,19 +141,41 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 		return nil, fmt.Errorf("invalid root directory %s: %w", rootDir, err)
 	}
 
-	info, err := os.Stat(absRoot)
+	fiRoot, err := os.Lstat(absRoot)
 	if err != nil {
 		return nil, fmt.Errorf("cannot access root directory %s: %w", absRoot, err)
 	}
-	if !info.IsDir() {
+	if fiRoot.Mode()&os.ModeSymlink != 0 {
+		// Resolve canonical root if caller passed a symlinked tmpdir (e.g. macOS /var -> /private/var),
+		// then confine all file reads inside that resolved root via os.OpenRoot.
+		resolved, rErr := filepath.EvalSymlinks(absRoot)
+		if rErr != nil {
+			return nil, fmt.Errorf("failed resolving root directory %s: %w", absRoot, rErr)
+		}
+		absRoot = resolved
+		fiRoot, err = os.Stat(absRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !fiRoot.IsDir() {
 		return nil, fmt.Errorf("path is not a directory: %s", absRoot)
 	}
+
+	unlock := lockRepoIndex(absRoot)
+	defer unlock()
+
+	rootFS, err := os.OpenRoot(absRoot)
+	if err != nil {
+		return nil, fmt.Errorf("failed opening confined root %s: %w", absRoot, err)
+	}
+	defer rootFS.Close()
 
 	if opts.MaxFileSize <= 0 {
 		opts.MaxFileSize = 512 * 1024 // 512KB
 	}
 	if opts.MaxChunks <= 0 {
-		opts.MaxChunks = 1000
+		opts.MaxChunks = 10000
 	}
 	if opts.ChunkLines <= 0 {
 		opts.ChunkLines = 50
@@ -131,22 +188,45 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 	}
 
 	scope := gitscope.Detect(absRoot)
-	branch := scope.Branch
-	if branch == "" {
-		branch = filepath.Base(absRoot)
+	repoName := scope.RepoName
+	if repoName == "" {
+		repoName = filepath.Base(absRoot)
+	}
+	// Dedicated index session isolates mutable code chunks from episodic Merkle hash chains.
+	indexSession := "index:" + repoName
+
+	// Load existing hash-incremental manifest if store supports it
+	var incStore incrementalIndexStore
+	existingManifest := make(map[string]sqlite.IndexedFileRecord)
+	if mgr != nil && mgr.Store() != nil {
+		if s, ok := mgr.Store().(incrementalIndexStore); ok {
+			incStore = s
+			if m, mErr := s.ListIndexedFiles(ctx, absRoot); mErr == nil {
+				existingManifest = m
+			}
+		}
 	}
 
-	// Phase 1: Fast discovery scan to establish candidate file manifest
+	// Phase 1: Fast discovery scan with strict symlink rejection
 	var candidates []candidateFile
+	seenRelPaths := make(map[string]bool)
 
 	walkErr := filepath.Walk(absRoot, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			stats.FilesSkipped++
 			return nil
 		}
-
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// Refuse symlinks fail-closed to prevent repo-escape indexing (e.g. evil.go -> ~/.ssh/id_rsa)
+		if fi.Mode()&os.ModeSymlink != 0 {
+			stats.FilesSkipped++
+			if fi.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 
 		base := fi.Name()
@@ -178,28 +258,25 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 			return nil
 		}
 
-		// Skip oversized files
+		// Skip oversized or empty files
 		if fi.Size() > opts.MaxFileSize || fi.Size() == 0 {
-			stats.FilesSkipped++
-			return nil
-		}
-
-		// Check for binary content (null bytes in first 512 bytes)
-		if isBinaryFile(path) {
 			stats.FilesSkipped++
 			return nil
 		}
 
 		relPath, rErr := filepath.Rel(absRoot, path)
 		if rErr != nil {
-			relPath = path
+			stats.FilesSkipped++
+			return nil
 		}
+		relSlash := filepath.ToSlash(relPath)
 
 		candidates = append(candidates, candidateFile{
 			path:    path,
-			relPath: relPath,
+			relPath: relSlash,
 			ext:     ext,
 		})
+		seenRelPaths[relSlash] = true
 
 		if opts.OnProgress != nil && stats.FilesScanned%25 == 0 {
 			opts.OnProgress(IndexProgress{
@@ -210,7 +287,6 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 				Elapsed:      time.Since(start),
 			})
 		}
-
 		return nil
 	})
 
@@ -229,13 +305,12 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 		})
 	}
 
-	// Phase 2: Active indexing loop
+	// Phase 2: Incremental AST/structural indexing loop
 	for _, cand := range candidates {
 		if ctx.Err() != nil {
 			stats.Duration = time.Since(start)
 			return stats, ctx.Err()
 		}
-
 		if stats.ChunksStored >= opts.MaxChunks {
 			break
 		}
@@ -243,12 +318,12 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 		if opts.OnProgress != nil {
 			var pct float64
 			if totalCandidates > 0 {
-				pct = (float64(stats.FilesIndexed) / float64(totalCandidates)) * 100.0
+				pct = (float64(stats.FilesIndexed+stats.FilesUnchanged) / float64(totalCandidates)) * 100.0
 			}
 			elapsed := time.Since(start)
 			var rate float64
 			if elapsed.Seconds() > 0 {
-				rate = float64(stats.FilesIndexed) / elapsed.Seconds()
+				rate = float64(stats.FilesIndexed+stats.FilesUnchanged) / elapsed.Seconds()
 			}
 			opts.OnProgress(IndexProgress{
 				Phase:        PhaseIndexing,
@@ -266,25 +341,44 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 			})
 		}
 
-		chunks, chunkErr := chunkFile(cand.path, opts.ChunkLines, opts.Overlap)
-		if chunkErr != nil {
+		raw, readErr := readConfinedFile(rootFS, cand.relPath, opts.MaxFileSize)
+		if readErr != nil || isBinaryBytes(raw) {
 			stats.FilesSkipped++
 			continue
 		}
 
+		sum := sha256.Sum256(raw)
+		shaHex := hex.EncodeToString(sum[:])
+
+		prevRec, existed := existingManifest[cand.relPath]
+		if !opts.FullRebuild && existed && prevRec.ContentSHA256 == shaHex {
+			stats.FilesUnchanged++
+			continue
+		}
+
+		// File is new or modified: remove stale chunks first before inserting fresh AST chunks
+		if existed && incStore != nil && len(prevRec.ChunkIDs) > 0 {
+			_ = incStore.DeleteIndexedChunks(ctx, prevRec.ChunkIDs)
+			stats.ChunksPruned += len(prevRec.ChunkIDs)
+		}
+
+		chunks := ChunkSource(cand.relPath, cand.ext, raw, opts.ChunkLines, opts.Overlap)
+		if len(chunks) == 0 {
+			stats.FilesSkipped++
+			continue
+		}
+
+		var newChunkIDs []string
 		fileIndexed := false
 		for _, chunk := range chunks {
 			if stats.ChunksStored >= opts.MaxChunks {
 				break
 			}
 
-			// Security: Run through credential quarantine & cognitive threat filter
 			sanitized, secErr := security.SanitizeMemory(chunk.Content)
 			if secErr != nil {
-				// Rejected due to raw private key or credential leak
 				continue
 			}
-
 			if sanitized.RedactedCount > 0 {
 				stats.Redactions += sanitized.RedactedCount
 			}
@@ -294,34 +388,68 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 				cat = "documentation"
 			}
 
-			contentFormatted := fmt.Sprintf("[%s:%d-%d]\n%s", cand.relPath, chunk.StartLine, chunk.EndLine, sanitized.SanitizedText)
+			header := fmt.Sprintf("[%s:%d-%d]", cand.relPath, chunk.StartLine, chunk.EndLine)
+			if chunk.Symbol != "" {
+				header = fmt.Sprintf("[%s:%d-%d | %s]", cand.relPath, chunk.StartLine, chunk.EndLine, chunk.Symbol)
+			}
+			contentFormatted := fmt.Sprintf("%s\n%s", header, sanitized.SanitizedText)
 
-			_, remErr := mgr.Remember(ctx, brain.RememberRequest{
-				SessionID:  branch,
+			meta := map[string]string{
+				"path":          cand.relPath,
+				"lang":          cand.ext,
+				"start_line":    fmt.Sprintf("%d", chunk.StartLine),
+				"end_line":      fmt.Sprintf("%d", chunk.EndLine),
+				"git_repo":      repoName,
+				"git_branch":    scope.Branch,
+				"indexed_at":    time.Now().UTC().Format(time.RFC3339),
+				"index_managed": "true",
+			}
+			if chunk.Symbol != "" {
+				meta["symbol"] = chunk.Symbol
+			}
+			if chunk.Kind != "" {
+				meta["chunk_kind"] = chunk.Kind
+			}
+
+			node, remErr := mgr.Remember(ctx, brain.RememberRequest{
+				SessionID:  indexSession,
 				Category:   cat,
 				Content:    contentFormatted,
 				Provenance: brain.ProvenanceLocalWorkspace,
-				Metadata: map[string]string{
-					"path":       cand.relPath,
-					"lang":       cand.ext,
-					"start_line": fmt.Sprintf("%d", chunk.StartLine),
-					"end_line":   fmt.Sprintf("%d", chunk.EndLine),
-					"git_repo":   scope.RepoName,
-					"git_branch": scope.Branch,
-					"indexed_at": time.Now().UTC().Format(time.RFC3339),
-				},
+				Metadata:   meta,
 			})
-
-			if remErr == nil {
+			if remErr == nil && node != nil {
 				stats.ChunksStored++
+				newChunkIDs = append(newChunkIDs, node.ID)
 				fileIndexed = true
 			}
 		}
 
 		if fileIndexed {
 			stats.FilesIndexed++
+			if incStore != nil {
+				_ = incStore.UpsertIndexedFile(ctx, sqlite.IndexedFileRecord{
+					RepoRoot:      absRoot,
+					RelPath:       cand.relPath,
+					ContentSHA256: shaHex,
+					ChunkIDs:      newChunkIDs,
+					IndexedAt:     time.Now(),
+				})
+			}
 		} else {
 			stats.FilesSkipped++
+		}
+	}
+
+	// Phase 3: Prune deleted files from manifest and vector/graph store
+	if incStore != nil && ctx.Err() == nil {
+		for relPath, rec := range existingManifest {
+			if !seenRelPaths[relPath] {
+				if err := incStore.PruneIndexedFile(ctx, absRoot, relPath, rec.ChunkIDs); err == nil {
+					stats.FilesPruned++
+					stats.ChunksPruned += len(rec.ChunkIDs)
+				}
+			}
 		}
 	}
 
@@ -330,14 +458,14 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 	if opts.OnProgress != nil {
 		var finalPct float64 = 100.0
 		if totalCandidates > 0 && stats.ChunksStored < opts.MaxChunks {
-			finalPct = (float64(stats.FilesIndexed) / float64(totalCandidates)) * 100.0
+			finalPct = (float64(stats.FilesIndexed+stats.FilesUnchanged) / float64(totalCandidates)) * 100.0
 			if finalPct > 100.0 {
 				finalPct = 100.0
 			}
 		}
 		var finalRate float64
 		if stats.Duration.Seconds() > 0 {
-			finalRate = float64(stats.FilesIndexed) / stats.Duration.Seconds()
+			finalRate = float64(stats.FilesIndexed+stats.FilesUnchanged) / stats.Duration.Seconds()
 		}
 		opts.OnProgress(IndexProgress{
 			Phase:        PhaseComplete,
@@ -358,89 +486,103 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 	return stats, nil
 }
 
+func readConfinedFile(root *os.Root, relPath string, maxBytes int64) ([]byte, error) {
+	f, err := root.Open(relPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing non-regular file %s", relPath)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("file exceeds max size %d", maxBytes)
+	}
+	return data, nil
+}
+
+func isBinaryBytes(data []byte) bool {
+	check := data
+	if len(check) > 512 {
+		check = check[:512]
+	}
+	return bytes.IndexByte(check, 0) != -1
+}
+
+// chunkFile is retained for backward compatibility with internal tests.
 type fileChunk struct {
 	StartLine int
 	EndLine   int
 	Content   string
 }
 
-func chunkFile(filePath string, targetLines, overlap int) ([]fileChunk, error) {
-	file, err := os.Open(filePath)
+func chunkFile(path string, targetLines, overlap int) ([]fileChunk, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer f.Close()
 
 	var lines []string
-	scanner := bufio.NewScanner(file)
-	// Allow large lines
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-
 	if len(lines) == 0 {
 		return nil, nil
 	}
 
-	if len(lines) <= targetLines {
-		return []fileChunk{
-			{
-				StartLine: 1,
-				EndLine:   len(lines),
-				Content:   strings.Join(lines, "\n"),
-			},
-		}, nil
-	}
-
 	var chunks []fileChunk
-	step := targetLines - overlap
-	if step <= 0 {
-		step = targetLines
-	}
-
-	for i := 0; i < len(lines); i += step {
-		end := i + targetLines
+	start := 0
+	for start < len(lines) {
+		end := start + targetLines
 		if end > len(lines) {
 			end = len(lines)
 		}
-
-		chunkLines := lines[i:end]
-		content := strings.TrimSpace(strings.Join(chunkLines, "\n"))
+		content := strings.TrimSpace(strings.Join(lines[start:end], "\n"))
 		if content != "" {
 			chunks = append(chunks, fileChunk{
-				StartLine: i + 1,
+				StartLine: start + 1,
 				EndLine:   end,
 				Content:   content,
 			})
 		}
-
-		if end == len(lines) {
+		if end >= len(lines) {
 			break
 		}
+		next := end - overlap
+		if next <= start {
+			next = end
+		}
+		start = next
 	}
-
 	return chunks, nil
 }
 
-func isBinaryFile(filePath string) bool {
-	f, err := os.Open(filePath)
+func isBinaryFile(path string) bool {
+	f, err := os.Open(path)
 	if err != nil {
 		return true
 	}
 	defer f.Close()
 
-	header := make([]byte, 512)
-	n, err := f.Read(header)
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
 	if err != nil && err != io.EOF {
 		return true
 	}
-
-	// If null byte exists in first 512 bytes, treat as binary
-	return bytes.IndexByte(header[:n], 0) != -1
+	return bytes.IndexByte(buf[:n], 0) != -1
 }

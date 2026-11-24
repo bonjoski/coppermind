@@ -85,6 +85,23 @@ type MemoryNode struct {
 	SupersedesID    string `json:"supersedes_id,omitempty"`
 	Rationale       string `json:"rationale,omitempty"`
 	AdvisoryRef     string `json:"advisory_ref,omitempty"`
+
+	// Cognitive Core v0.7 extensions (RFC-2026-11-24-55)
+	EmbeddingModel string    `json:"embedding_model,omitempty"`
+	EmbeddingDim   int       `json:"embedding_dim,omitempty"`
+	AccessCount    int       `json:"access_count,omitempty"`
+	LastAccessedAt time.Time `json:"last_accessed_at,omitempty"`
+	ContentSHA256  string    `json:"content_sha256,omitempty"`
+}
+
+// ConflictWarning alerts callers when a newly stored architectural memory may conflict
+// with an existing active TIER_0/TIER_1 invariant.
+type ConflictWarning struct {
+	ConflictingNodeID string  `json:"conflicting_node_id"`
+	AuthorityTier     string  `json:"authority_tier"`
+	Similarity        float32 `json:"similarity"`
+	Summary           string  `json:"summary"`
+	SuggestedAction   string  `json:"suggested_action"`
 }
 
 // MemoryFilter specifies search criteria for recall operations.
@@ -108,13 +125,24 @@ type MemoryFilter struct {
 	AuthorityTier     string `json:"authority_tier,omitempty"`
 	LifecycleStatus   string `json:"lifecycle_status,omitempty"`
 	IncludeSuperseded bool   `json:"include_superseded,omitempty"`
+
+	// Temporal, Graph & Reranking filters (RFC-2026-11-24-55 / RFC-2026-11-24-56)
+	CreatedAfter  *time.Time `json:"created_after,omitempty"`
+	CreatedBefore *time.Time `json:"created_before,omitempty"`
+	Hops          int        `json:"hops,omitempty"`
+	ActiveRepo    string     `json:"active_repo,omitempty"`
+	ActiveBranch  string     `json:"active_branch,omitempty"`
+	DisableMMR    bool       `json:"disable_mmr,omitempty"`
+	Explain       bool       `json:"explain,omitempty"`
 }
 
 // SearchResult contains a retrieved memory node and its relevance score.
 type SearchResult struct {
-	Node         *MemoryNode   `json:"node"`
-	Score        float32       `json:"score"` // Cosine similarity: [0.0, 1.0]
-	Observations []*MemoryNode `json:"observations,omitempty"`
+	Node         *MemoryNode     `json:"node"`
+	Score        float32         `json:"score"` // Normalized composite relevance: [0.0, 1.0]
+	Observations []*MemoryNode   `json:"observations,omitempty"`
+	Breakdown    *ScoreBreakdown `json:"breakdown,omitempty"`
+	GraphLinks   []string        `json:"graph_links,omitempty"`
 }
 
 // MemoryStore defines the persistent storage layer for cognitive memories.

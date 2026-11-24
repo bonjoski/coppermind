@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strings"
 	"unicode"
@@ -15,9 +16,24 @@ const (
 )
 
 // LocalHashEmbedder implements a deterministic L2-normalized subword/word n-gram semantic embedder.
-// It maps text tokens, bigrams, and character subwords into a fixed-dimension vector space using SHA projections.
+// It maps text tokens, bigrams, character subwords, and curated software/security concept clusters
+// into a fixed-dimension vector space using SHA projections.
 type LocalHashEmbedder struct {
 	dimension int
+}
+
+var conceptClusterIndex map[string][]int
+
+func init() {
+	conceptClusterIndex = make(map[string][]int)
+	for idx, group := range semanticConceptGroups {
+		for _, tok := range group {
+			t := strings.ToLower(strings.TrimSpace(tok))
+			if t != "" {
+				conceptClusterIndex[t] = append(conceptClusterIndex[t], idx)
+			}
+		}
+	}
 }
 
 // NewLocalHashEmbedder creates an embedder producing vectors of the given dimension.
@@ -33,6 +49,11 @@ func (e *LocalHashEmbedder) Dimension() int {
 	return e.dimension
 }
 
+// ModelName returns the canonical model identifier for LocalHashEmbedder.
+func (e *LocalHashEmbedder) ModelName() string {
+	return fmt.Sprintf("local-hash-%d", e.dimension)
+}
+
 // Embed generates an L2-normalized vector for input text.
 func (e *LocalHashEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
 	vec := make([]float32, e.dimension)
@@ -43,9 +64,16 @@ func (e *LocalHashEmbedder) Embed(_ context.Context, text string) ([]float32, er
 		return vec, nil
 	}
 
-	// Word unigrams, bigrams, and character subword n-grams (FastText style)
+	// Word unigrams, bigrams, character subword n-grams, and concept cluster projections
 	for i, w := range words {
 		e.projectFeature("w:"+w, 2.0, vec)
+
+		// Curated technical concept cluster projection for offline synonym awareness
+		if clusters, ok := conceptClusterIndex[w]; ok {
+			for _, cid := range clusters {
+				e.projectFeature(fmt.Sprintf("concept:%d", cid), 1.35, vec)
+			}
+		}
 
 		// Character n-grams (3 to 5 chars) for subword similarity
 		subword := "<" + w + ">"

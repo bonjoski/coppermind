@@ -128,6 +128,20 @@ func main() {
 		runProposals(cmdArgs)
 	case "radar":
 		runRadar(cmdArgs)
+	case "models":
+		runModels(cmdArgs)
+	case "reindex-vectors":
+		runReindexVectors(cmdArgs)
+	case "graph":
+		runGraph(cmdArgs)
+	case "brief":
+		runBrief(cmdArgs)
+	case "inbox":
+		runInbox(cmdArgs)
+	case "tui":
+		runTUI(cmdArgs)
+	case "ui":
+		runUI(cmdArgs)
 	case "status":
 		runStatus(cmdArgs)
 	case "version", "--version", "-v":
@@ -552,6 +566,10 @@ func runRecall(args []string) {
 	includeObs := fs.Bool("include-observations", true, "Auto-attach linked cognitive lens observations to primary recalled memories")
 	includeSuperseded := fs.Bool("include-superseded", false, "Include superseded historical memories in query results")
 	tier := fs.String("tier", "", "Filter by specific authority tier (e.g. TIER_1_ARCHITECTURE)")
+	since := fs.String("since", "", "Optional lower temporal bound (e.g. 24h, 7d, 30d, YYYY-MM-DD, RFC3339)")
+	before := fs.String("before", "", "Optional upper temporal bound (e.g. 24h, 7d, YYYY-MM-DD, RFC3339)")
+	hops := fs.Int("hops", 1, "Knowledge graph expansion depth (0, 1, or 2)")
+	explain := fs.Bool("explain", false, "Display per-signal ScoreBreakdown (hybrid, ACT-R, repo, graph, tier)")
 	asJSON := fs.Bool("json", false, "Emit machine-readable JSON output")
 	showWhy := fs.Bool("why", false, "Include detailed explanations where supported")
 	_ = fs.Parse(args)
@@ -623,6 +641,24 @@ func runRecall(args []string) {
 		return
 	}
 
+	var createdAfter, createdBefore *time.Time
+	if strings.TrimSpace(*since) != "" {
+		t, pErr := brain.ParseTemporalBound(*since, time.Now().UTC())
+		if pErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", pErr)
+			os.Exit(1)
+		}
+		createdAfter = &t
+	}
+	if strings.TrimSpace(*before) != "" {
+		t, pErr := brain.ParseTemporalBound(*before, time.Now().UTC())
+		if pErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", pErr)
+			os.Exit(1)
+		}
+		createdBefore = &t
+	}
+
 	results, err := mgr.Recall(context.Background(), brain.RecallRequest{
 		SessionID:           *session,
 		Category:            *category,
@@ -636,6 +672,10 @@ func runRecall(args []string) {
 		IncludeObservations: *includeObs,
 		IncludeSuperseded:   *includeSuperseded,
 		AuthorityTier:       *tier,
+		CreatedAfter:        createdAfter,
+		CreatedBefore:       createdBefore,
+		Hops:                *hops,
+		Explain:             *explain,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error recalling memory: %v\n", err)
@@ -669,6 +709,13 @@ func runRecall(args []string) {
 
 		fmt.Printf("%d. [Score: %.3f] [%s | %s | %s]\n",
 			i+1, r.Score, tierBadge, catBadge, r.Node.SessionID)
+		if *explain && r.Breakdown != nil {
+			fmt.Printf("   [explain: hybrid=%.2f actr=%.2f repo=%.2f graph=%.2f tier=%.2f]\n",
+				r.Breakdown.HybridScore, r.Breakdown.RecencyACTR, r.Breakdown.RepoAffinity, r.Breakdown.GraphBoost, r.Breakdown.TierWeight)
+		}
+		if len(r.GraphLinks) > 0 {
+			fmt.Printf("   [graph-links: %s]\n", strings.Join(r.GraphLinks, ", "))
+		}
 
 		if isLearning {
 			fmt.Println("   💡 ARCHITECTURAL LEARNING / INVARIANT:")
@@ -1202,6 +1249,8 @@ func runHook(args []string) {
 		} else {
 			fmt.Printf("• Coppermind episodic git hook is NOT installed in %s\n", *repo)
 		}
+	case "ingest-commit":
+		runHookIngestCommit(*repo, "", "", *jsonOut)
 	case "verify-diff":
 		prov, provErr := brain.ParseProvenanceTier(*provenanceStr)
 		if provErr != nil {
@@ -1862,6 +1911,10 @@ func runCapsule(args []string) {
 	cmdArgs := args[1:]
 
 	switch action {
+	case "pack-memories":
+		runCapsuleCartridgePack(cmdArgs)
+	case "merge":
+		runCapsuleCartridgeMerge(cmdArgs)
 	case "keygen":
 		fs := flag.NewFlagSet("capsule keygen", flag.ExitOnError)
 		outDir := fs.String("out", "", "Output directory for ed25519.key (0600) and ed25519.pub")

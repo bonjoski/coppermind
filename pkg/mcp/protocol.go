@@ -91,6 +91,31 @@ type PromptGetResult struct {
 	Messages    []PromptMessage `json:"messages"`
 }
 
+// ResourceDef defines a read-only resource exposed via resources/list.
+type ResourceDef struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	MimeType    string `json:"mimeType,omitempty"`
+}
+
+// ResourceReadParams defines the payload for resources/read.
+type ResourceReadParams struct {
+	URI string `json:"uri"`
+}
+
+// ResourceContent represents a single item returned by resources/read.
+type ResourceContent struct {
+	URI      string `json:"uri"`
+	MimeType string `json:"mimeType,omitempty"`
+	Text     string `json:"text"`
+}
+
+// ResourceReadResult represents the standard result for resources/read.
+type ResourceReadResult struct {
+	Contents []ResourceContent `json:"contents"`
+}
+
 // ToolCallParams defines the payload for tools/call.
 type ToolCallParams struct {
 	Name      string          `json:"name"`

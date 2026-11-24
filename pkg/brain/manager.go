@@ -3,10 +3,11 @@ package brain
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -64,10 +65,32 @@ type RecallRequest struct {
 	AuthorityTier     string `json:"authority_tier,omitempty"`
 	LifecycleStatus   string `json:"lifecycle_status,omitempty"`
 	IncludeSuperseded bool   `json:"include_superseded,omitempty"`
+
+	// Temporal, Graph & Reranking filters (RFC-2026-11-24-55 / RFC-2026-11-24-56)
+	CreatedAfter  *time.Time `json:"created_after,omitempty"`
+	CreatedBefore *time.Time `json:"created_before,omitempty"`
+	Hops          int        `json:"hops,omitempty"`
+	ActiveRepo    string     `json:"active_repo,omitempty"`
+	ActiveBranch  string     `json:"active_branch,omitempty"`
+	DisableMMR    bool       `json:"disable_mmr,omitempty"`
+	Explain       bool       `json:"explain,omitempty"`
 }
 
 // EventHook is invoked when a canonical memory is successfully stored.
 type EventHook func(ctx context.Context, topic string, node *MemoryNode)
+
+type accessEvent struct {
+	sessionID string
+	nodeID    string
+}
+
+type accessBatchStore interface {
+	IncrementAccessBatch(ctx context.Context, ids []string, accessedAt time.Time) error
+}
+
+type namedEmbedder interface {
+	ModelName() string
+}
 
 // Manager orchestrates the cognitive memory store, embedder, and scratchpad.
 type Manager struct {
@@ -76,6 +99,11 @@ type Manager struct {
 	scratchpad Scratchpad
 	validator  *MemoryValidator
 	eventHook  EventHook
+
+	accessCh   chan accessEvent
+	accessStop chan struct{}
+	accessWg   sync.WaitGroup
+	closeOnce  sync.Once
 }
 
 // NewManager creates a new brain manager with an embedded Stormcage-backed MemoryValidator,
@@ -96,11 +124,113 @@ func NewManager(store MemoryStore, embedder Embedder, scratchpad Scratchpad) *Ma
 		wrappedScratchpad = NewValidatedScratchpad(scratchpad, validator, "default", ProvenanceSharedDoc)
 	}
 
-	return &Manager{
+	mgr := &Manager{
 		store:      store,
 		embedder:   embedder,
 		scratchpad: wrappedScratchpad,
 		validator:  validator,
+		accessCh:   make(chan accessEvent, 256),
+		accessStop: make(chan struct{}),
+	}
+
+	if _, ok := store.(accessBatchStore); ok {
+		mgr.accessWg.Add(1)
+		go mgr.runAccessCoalescer()
+	}
+
+	return mgr
+}
+
+// Embedder returns the configured vector embedder.
+func (m *Manager) Embedder() Embedder {
+	return m.embedder
+}
+
+// EmbedderModelName returns the canonical model name of the active embedder.
+func (m *Manager) EmbedderModelName() string {
+	if m.embedder == nil {
+		return "unknown"
+	}
+	if named, ok := m.embedder.(namedEmbedder); ok && strings.TrimSpace(named.ModelName()) != "" {
+		return named.ModelName()
+	}
+	return fmt.Sprintf("local-hash-%d", m.embedder.Dimension())
+}
+
+func (m *Manager) runAccessCoalescer() {
+	defer m.accessWg.Done()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	cooldown := make(map[string]time.Time)
+	pending := make(map[string]struct{})
+	const cooldownWindow = 10 * time.Minute
+
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		batchStore, ok := m.store.(accessBatchStore)
+		if !ok {
+			clear(pending)
+			return
+		}
+		ids := make([]string, 0, len(pending))
+		for id := range pending {
+			ids = append(ids, id)
+		}
+		clear(pending)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = batchStore.IncrementAccessBatch(ctx, ids, time.Now())
+		cancel()
+	}
+
+	for {
+		select {
+		case ev := <-m.accessCh:
+			now := time.Now()
+			key := ev.sessionID + ":" + ev.nodeID
+			if last, ok := cooldown[key]; ok && now.Sub(last) < cooldownWindow {
+				continue
+			}
+			cooldown[key] = now
+			pending[ev.nodeID] = struct{}{}
+			if len(cooldown) > 4096 {
+				for k, ts := range cooldown {
+					if now.Sub(ts) >= cooldownWindow {
+						delete(cooldown, k)
+					}
+				}
+			}
+		case <-ticker.C:
+			flush()
+		case <-m.accessStop:
+			flush()
+			return
+		}
+	}
+}
+
+func (m *Manager) recordAccessAsync(sessionID string, results []*SearchResult) {
+	if m.accessCh == nil {
+		return
+	}
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	for _, r := range results {
+		if r == nil || r.Node == nil {
+			continue
+		}
+		// Security invariant: TAINT_* memories never accumulate ACT-R access reinforcement.
+		if r.Node.Provenance != ProvenanceLocalWorkspace {
+			continue
+		}
+		select {
+		case m.accessCh <- accessEvent{sessionID: sessionID, nodeID: r.Node.ID}:
+		default:
+			// Drop-if-full: zero backpressure on read path.
+		}
 	}
 }
 
@@ -238,6 +368,7 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		lifecycleStatus = string(authz.StatusActive)
 	}
 
+	contentSum := sha256.Sum256([]byte(normalized))
 	node := &MemoryNode{
 		ID:              id,
 		SessionID:       req.SessionID,
@@ -263,6 +394,9 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		SupersedesID:    req.SupersedesID,
 		Rationale:       req.Rationale,
 		AdvisoryRef:     req.AdvisoryRef,
+		EmbeddingModel:  m.EmbedderModelName(),
+		EmbeddingDim:    len(vec),
+		ContentSHA256:   hex.EncodeToString(contentSum[:]),
 	}
 
 	type superseder interface {
@@ -314,12 +448,21 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 		return nil, fmt.Errorf("embedding generation failed: %w", err)
 	}
 
+	targetLimit := req.Limit
+	if targetLimit <= 0 {
+		targetLimit = 10
+	}
+	candidateLimit := targetLimit * 4
+	if candidateLimit < 24 {
+		candidateLimit = 24
+	}
+
 	filter := MemoryFilter{
 		SessionID:           req.SessionID,
 		Category:            req.Category,
 		Provenance:          req.Provenance,
-		MinScore:            req.MinScore,
-		Limit:               req.Limit,
+		MinScore:            0, // Apply MinScore after composite normalization
+		Limit:               candidateLimit,
 		Hybrid:              req.Hybrid,
 		GitRepo:             req.GitRepo,
 		GitBranch:           req.GitBranch,
@@ -331,6 +474,13 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 		AuthorityTier:       req.AuthorityTier,
 		LifecycleStatus:     req.LifecycleStatus,
 		IncludeSuperseded:   req.IncludeSuperseded,
+		CreatedAfter:        req.CreatedAfter,
+		CreatedBefore:       req.CreatedBefore,
+		Hops:                req.Hops,
+		ActiveRepo:          req.ActiveRepo,
+		ActiveBranch:        req.ActiveBranch,
+		DisableMMR:          req.DisableMMR,
+		Explain:             req.Explain,
 	}
 
 	var results []*SearchResult
@@ -343,26 +493,68 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 		return nil, err
 	}
 
-	// Apply Epistemic Authority tier weighting boost (RFC-2026-11-15-33)
-	for _, r := range results {
-		weight := float32(1.0)
-		switch r.Node.AuthorityTier {
-		case "TIER_0_SOVEREIGN":
-			weight = 1.25
-		case "TIER_1_ARCHITECTURE", "TIER_2_PRODUCT":
-			weight = 1.00
-		case "TIER_2_MENTOR_CAPSULE":
-			weight = 0.85
-		case "TIER_3_EPISODIC":
-			weight = 0.75
-		case "TIER_4_SCRATCHPAD":
-			weight = 0.50
-		}
-		r.Score *= weight
+	// Optional bounded 1-2 hop Knowledge Graph expansion (RFC-2026-11-24-55)
+	type graphExpander interface {
+		ExpandGraphNeighbors(ctx context.Context, seedIDs []string, maxHops int, filter MemoryFilter) ([]*SearchResult, error)
 	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
+	if req.Hops > 0 && len(results) > 0 {
+		if expander, ok := m.store.(graphExpander); ok {
+			seedCount := len(results)
+			if seedCount > 5 {
+				seedCount = 5
+			}
+			seedIDs := make([]string, 0, seedCount)
+			seen := make(map[string]*SearchResult, len(results))
+			for i, r := range results {
+				if r != nil && r.Node != nil {
+					seen[r.Node.ID] = r
+					if i < seedCount {
+						seedIDs = append(seedIDs, r.Node.ID)
+					}
+				}
+			}
+			if neighbors, gErr := expander.ExpandGraphNeighbors(ctx, seedIDs, req.Hops, filter); gErr == nil {
+				for _, n := range neighbors {
+					if n == nil || n.Node == nil {
+						continue
+					}
+					if existing, exists := seen[n.Node.ID]; exists {
+						existing.GraphLinks = append(existing.GraphLinks, n.GraphLinks...)
+					} else {
+						seen[n.Node.ID] = n
+						results = append(results, n)
+					}
+				}
+			}
+		}
+	}
+
+	activeRepo := req.ActiveRepo
+	activeBranch := req.ActiveBranch
+	if activeRepo == "" && req.GitRepo != "" {
+		activeRepo = req.GitRepo
+		activeBranch = req.GitBranch
+	}
+
+	rerankCfg := DefaultRerankConfig()
+	rerankCfg.ActiveRepo = activeRepo
+	rerankCfg.ActiveBranch = activeBranch
+	rerankCfg.DisableMMR = req.DisableMMR
+	rerankCfg.Limit = targetLimit
+
+	results = RerankResults(results, rerankCfg)
+
+	if req.MinScore > 0 {
+		filtered := make([]*SearchResult, 0, len(results))
+		for _, r := range results {
+			if r.Score >= req.MinScore {
+				filtered = append(filtered, r)
+			}
+		}
+		results = filtered
+	}
+
+	m.recordAccessAsync(req.SessionID, results)
 
 	// Auto-attach observations if requested
 	if req.IncludeObservations && len(results) > 0 {
@@ -430,8 +622,14 @@ func (m *Manager) VerifySessionChain(ctx context.Context, sessionID string) (boo
 	return m.store.VerifySessionChain(ctx, sessionID)
 }
 
-// Close releases the underlying store resources.
+// Close stops background access coalescing and releases the underlying store resources.
 func (m *Manager) Close() error {
+	m.closeOnce.Do(func() {
+		if m.accessStop != nil {
+			close(m.accessStop)
+			m.accessWg.Wait()
+		}
+	})
 	return m.store.Close()
 }
 

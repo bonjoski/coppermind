@@ -6,7 +6,10 @@ import (
 )
 
 // NewEmbedderFromEnv inspects environment variables and instantiates the appropriate embedder.
-// Defaults to LocalHashEmbedder for zero-dependency, instantaneous offline operation.
+// Resolution order:
+//  1. Explicit COPPERMIND_EMBEDDER=ollama|openai (wrapped in ResilientEmbedder)
+//  2. Explicit COPPERMIND_EMBEDDER=static OR auto-detected verified CMVEC1 pack at DefaultStaticModelPath()
+//  3. LocalHashEmbedder(128) zero-dependency offline fallback (with concept-cluster synonym expansion)
 func NewEmbedderFromEnv() Embedder {
 	provider := strings.ToLower(strings.TrimSpace(os.Getenv("COPPERMIND_EMBEDDER")))
 
@@ -37,7 +40,24 @@ func NewEmbedderFromEnv() Embedder {
 		fallback := NewLocalHashEmbedder(dim)
 		return NewResilientEmbedder(primary, fallback)
 
+	case "static", "cmvec", "cmvec1":
+		packPath := DefaultStaticModelPath()
+		expectedSHA := strings.TrimSpace(os.Getenv("COPPERMIND_STATIC_MODEL_SHA256"))
+		if emb, err := LoadStaticEmbedder(packPath, expectedSHA); err == nil {
+			return emb
+		}
+		return NewLocalHashEmbedder(DefaultDimension)
+
+	case "hash", "local-hash":
+		return NewLocalHashEmbedder(DefaultDimension)
+
 	default:
+		// Auto-discover verified local CMVEC1 pack if installed via `coppermind models pull`
+		packPath := DefaultStaticModelPath()
+		expectedSHA := strings.TrimSpace(os.Getenv("COPPERMIND_STATIC_MODEL_SHA256"))
+		if emb, err := LoadStaticEmbedder(packPath, expectedSHA); err == nil {
+			return emb
+		}
 		return NewLocalHashEmbedder(DefaultDimension)
 	}
 }

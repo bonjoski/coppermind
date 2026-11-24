@@ -95,7 +95,7 @@ func CategoryToDefaultTier(category string) AuthorityTier {
 		return Tier0Sovereign
 	case "architecture", "convention", "tech_stack", "api_schema", "decision", "accepted-rfc", "ecosystem-architecture", "rfc", "adr", "learning", "architectural-learning", "lesson", "learnings":
 		return Tier1Architecture
-	case "product", "user_story", "acceptance_criteria", "spec", "business_logic":
+	case "product", "user_story", "acceptance_criteria", "spec", "business_logic", "dead_end", "anti_pattern":
 		return Tier2Product
 	case "working", "scratchpad", "agent_state", "mutex_lock":
 		return Tier4Scratchpad

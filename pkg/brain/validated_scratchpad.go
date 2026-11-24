@@ -63,6 +63,32 @@ func (s *ValidatedScratchpad) SetWithProvenance(ctx context.Context, key string,
 	return s.inner.Set(ctx, key, verdict.CleanedContent, ttl)
 }
 
+// CompareAndSwap validates newVal through the embedded Stormcage engine before delegating CAS.
+func (s *ValidatedScratchpad) CompareAndSwap(ctx context.Context, key, expectedVal, newVal string, ttl time.Duration) (bool, error) {
+	verdict, err := s.validator.ValidateScratchpadWrite(ctx, s.defaultSessionID, key, newVal, s.defaultProvenance)
+	if err != nil {
+		return false, err
+	}
+	type casImpl interface {
+		CompareAndSwap(ctx context.Context, key, expectedVal, newVal string, ttl time.Duration) (bool, error)
+	}
+	if cas, ok := s.inner.(casImpl); ok {
+		return cas.CompareAndSwap(ctx, key, expectedVal, verdict.CleanedContent, ttl)
+	}
+	// Fallback non-atomic CAS for backends lacking native CAS
+	cur, ok := s.Get(ctx, key)
+	if !ok {
+		cur = ""
+	}
+	if cur != expectedVal {
+		return false, nil
+	}
+	if err := s.inner.Set(ctx, key, verdict.CleanedContent, ttl); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Delete removes a key from the underlying scratchpad.
 func (s *ValidatedScratchpad) Delete(ctx context.Context, key string) error {
 	if s.inner == nil {

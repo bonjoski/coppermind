@@ -75,6 +75,43 @@ func (s *MemoryScratchpad) Set(_ context.Context, key string, val string, ttl ti
 	return nil
 }
 
+// CompareAndSwap atomically updates key only if its current non-expired value matches expectedVal
+// (empty expectedVal means create-if-absent/expired). Runs full secret quarantine & cognitive firewall
+// BEFORE acquiring the mutex so rejected payloads never stall peer workers.
+func (s *MemoryScratchpad) CompareAndSwap(_ context.Context, key, expectedVal, newVal string, ttl time.Duration) (bool, error) {
+	secRes, err := security.SanitizeMemory(newVal)
+	if err != nil {
+		return false, fmt.Errorf("scratchpad CAS rejected: %w", err)
+	}
+	val := secRes.SanitizedText
+	val, _ = security.SanitizeXMLDelimiters(val)
+	if threatRes, err := security.InspectCognitiveThreats(val); err == nil && threatRes != nil && threatRes.IsCritical {
+		return false, fmt.Errorf("scratchpad CAS rejected: %w: %s", security.ErrPromptInjectionRejected, strings.Join(threatRes.Flags, ", "))
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	curVal := ""
+	if it, exists := s.items[key]; exists && (it.expiresAt.IsZero() || now.Before(it.expiresAt)) {
+		curVal = it.value
+	}
+	if curVal != expectedVal {
+		return false, nil
+	}
+
+	var exp time.Time
+	if ttl > 0 {
+		exp = now.Add(ttl)
+	}
+	s.items[key] = item{
+		value:     val,
+		expiresAt: exp,
+	}
+	return true, nil
+}
+
 // Delete removes a key from working memory.
 func (s *MemoryScratchpad) Delete(_ context.Context, key string) error {
 	s.mu.Lock()

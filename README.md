@@ -196,6 +196,10 @@ Every primary developer use case is backed by dedicated, copy-pasteable recipes 
 | **Zero-API-Key Host-Evaluated Lenses** | Run security, systems, and ADR drift audits using your active IDE AI subscription (0 extra API keys, 0 Ollama RAM):<br/>`/coppermind:security-audit` or `coppermind_lens_prepare` → `coppermind_lens_submit` | [Guide](docs/use-cases/03-zero-api-key-host-evaluated-lenses.md) |
 | **Exporting Signed Knowledge Capsules** | Create immutable, signed `.capsule` archives linking memory to release tags:<br/>`coppermind export-capsule --sign` | [Guide](docs/use-cases/04-signed-knowledge-capsules.md) |
 | **Episodic Scratchpad Integrity & Observation Quarantine** | Verify Ed25519 signatures, defang XML tool reflections, and quarantine untrusted observations:<br/>`coppermind remember` && `coppermind recall` | [Guide](docs/use-cases/05-episodic-scratchpad-integrity.md) |
+| **Pure-Go Static Neural Recall & Temporal Filtering** | Install offline `CMVEC1` embeddings, reindex in micro-batches, and run temporal recall with `--explain`:<br/>`coppermind models pull sovereign-dev-256 && coppermind reindex-vectors && coppermind recall --since 7d --explain "<query>"` | [Guide](docs/use-cases/06-static-neural-recall-and-reranking.md) |
+| **Knowledge Graph Impact & Incremental AST Indexing** | AST-chunk Go/Markdown incrementally without Merkle breaks and trace file impact:<br/>`coppermind index . && coppermind graph impact pkg/mcp/server.go` | [Guide](docs/use-cases/07-knowledge-graph-and-ast-indexing.md) |
+| **`<8ms` Context Briefs, MCP Resources & Zero-Key Sleep Cycle** | Compile `<=800`-token workspace briefs, manage pending commit inbox, and consolidate episodic trails:<br/>`coppermind brief && coppermind inbox list` + `/coppermind:consolidate` | [Guide](docs/use-cases/08-context-brief-inbox-and-sleep-cycle.md) |
+| **Mergeable Cartridges & Local Brain Explorer (`tui`/`ui`)** | Export/merge selective Ed25519 `.capsule` v2 packs and inspect your brain locally on `127.0.0.1`:<br/>`coppermind capsule pack-memories --out pack.capsule && coppermind tui` | [Guide](docs/use-cases/09-mergeable-cartridges-and-brain-explorer.md) |
 
 ---
 
@@ -216,13 +220,13 @@ Add Coppermind to your agent's MCP configuration (`mcp_config.json` or `claude_d
 
 ---
 
-## Runtime Profiles: Profile A (Local) vs Profile B (Cluster)
+## Runtime Profiles: Profile A (Local) vs Profile B (Self-Hosted Lab)
 
-Coppermind features a **dual-profile runtime architecture** designed to meet the developer where they work: zero-dependency micro-appliance on local machines, or resilient high-throughput cluster on Kubernetes.
+Coppermind is engineered primarily as a **100% local, single-developer workstation micro-appliance** (Profile A, zero external dependencies) with an optional self-hosted local container stack (Profile B) for personal homelab/PostgreSQL `pgvector` experimentation.
 
-| Architectural Component | Profile A: Local Micro-Appliance (Default) | Profile B: Distributed Cluster Appliance |
+| Architectural Component | Profile A: Local Micro-Appliance (Default) | Profile B: Optional Self-Hosted Docker Stack |
 | :--- | :--- | :--- |
-| **Target Workload** | Individual developer laptops, CI runners, edge workstations | Multi-agent teams, Kubernetes clusters, enterprise pools |
+| **Target Workload** | Individual developer workstations & local agent sessions | Local Docker Compose / personal homelab `pgvector` testing |
 | **Activation Environment** | `COPPERMIND_PROFILE=local` (or unset) | `COPPERMIND_PROFILE=cluster` |
 | **Relational Storage** | Pure-Go SQLite in WAL mode (`coppermind.db`) | PostgreSQL 17 (`pgvector/pgvector:pg17`) |
 | **Vector Engine** | Embedded 128-dim subword vectorizer + FTS5 BM25 | `pgvector` HNSW cosine index (`vector(128)`) |

@@ -32,8 +32,8 @@ func TestInstallGitHook(t *testing.T) {
 		t.Fatalf("failed to read written hook: %v", err)
 	}
 
-	if !strings.Contains(string(data), "coppermind remember") {
-		t.Errorf("hook content does not contain coppermind remember command")
+	if !strings.Contains(string(data), "coppermind hook ingest-commit") {
+		t.Errorf("hook content does not contain coppermind hook ingest-commit command")
 	}
 
 	// Verify file permissions (must be executable 0755)
@@ -87,7 +87,7 @@ func TestGitHook_PreservesExistingUserHooks(t *testing.T) {
 	if !strings.Contains(str, "running custom corporate telemetry") {
 		t.Errorf("custom script was erased during install!")
 	}
-	if !strings.Contains(str, "coppermind remember") {
+	if !strings.Contains(str, "coppermind hook ingest-commit") {
 		t.Errorf("coppermind hook was not appended!")
 	}
 
@@ -103,7 +103,7 @@ func TestGitHook_PreservesExistingUserHooks(t *testing.T) {
 	if !strings.Contains(string(restored), "running custom corporate telemetry") {
 		t.Errorf("custom script was not preserved after uninstall: %s", string(restored))
 	}
-	if strings.Contains(string(restored), "coppermind remember") {
+	if strings.Contains(string(restored), "coppermind hook ingest-commit") {
 		t.Errorf("coppermind hook was not removed after uninstall!")
 	}
 }

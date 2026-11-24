@@ -16,12 +16,14 @@ import (
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/capsule"
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/graph"
 	"github.com/bonjoski/coppermind/pkg/lenses"
 	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/version"
 	"github.com/bonjoski/coppermind/pkg/worker"
 )
 
@@ -151,6 +153,10 @@ func (s *Server) handleMessage(ctx context.Context, msg *JSONRPCMessage) *JSONRP
 		return s.handlePromptsList(msg)
 	case "prompts/get":
 		return s.handlePromptsGet(ctx, msg)
+	case "resources/list":
+		return s.handleResourcesList(msg)
+	case "resources/read":
+		return s.handleResourcesRead(ctx, msg)
 	case "ping":
 		resp, _ := NewSuccessResponse(msg.ID, map[string]string{"status": "ok"})
 		return resp
@@ -168,13 +174,17 @@ func (s *Server) handleInitialize(msg *JSONRPCMessage) *JSONRPCMessage {
 		"protocolVersion": "2024-11-05",
 		"serverInfo": map[string]string{
 			"name":    "coppermind",
-			"version": "0.1.0",
+			"version": version.Version,
 		},
 		"capabilities": map[string]interface{}{
 			"tools": map[string]bool{
 				"listChanged": false,
 			},
 			"prompts": map[string]bool{
+				"listChanged": false,
+			},
+			"resources": map[string]bool{
+				"subscribe":   false,
 				"listChanged": false,
 			},
 		},
@@ -223,6 +233,9 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"include_observations": { "type": "boolean", "description": "Whether to auto-attach linked cognitive lens observations to recalled memories (default true)." },
 					"include_superseded": { "type": "boolean", "description": "Whether to include superseded historical memories in results (default false)." },
 					"tier": { "type": "string", "description": "Optional authority tier filter (e.g. TIER_1_ARCHITECTURE)." },
+					"since": { "type": "string", "description": "Optional lower temporal bound (e.g. 24h, 7d, 30d, YYYY-MM-DD, RFC3339)." },
+					"before": { "type": "string", "description": "Optional upper temporal bound (e.g. 24h, 7d, YYYY-MM-DD, RFC3339)." },
+					"hops": { "type": "integer", "description": "Optional knowledge graph expansion depth (0, 1, or 2; default 1)." },
 					"emit_receipt": { "type": "boolean", "description": "When true and FABRIAL_RECEIPT_DIR is set, atomically emit a BLPR-v1 ideation receipt (signed via LOCKSMITH_SOCKET when reachable)." }
 				},
 				"required": ["query"]
@@ -242,14 +255,15 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_scratchpad",
-			Description: "Interact with fast working memory (ephemeral key-value state, locks, and subagent coordination).",
+			Description: "Interact with fast working memory (ephemeral key-value state, locks, atomic CAS handoffs, and subagent coordination).",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
-					"action": { "type": "string", "enum": ["get", "set", "delete", "lock", "keys"] },
+					"action": { "type": "string", "enum": ["get", "set", "cas", "delete", "lock", "keys"] },
 					"key": { "type": "string", "description": "Key name." },
-					"value": { "type": "string", "description": "Value to set (for 'set' action)." },
-					"ttl_seconds": { "type": "integer", "description": "TTL in seconds for set or lock (default 300)." }
+					"value": { "type": "string", "description": "Value to set (for 'set' or 'cas' action)." },
+					"expected_value": { "type": "string", "description": "Expected current value for atomic 'cas' action (empty string = create-if-absent)." },
+					"ttl_seconds": { "type": "integer", "description": "TTL in seconds for set, cas, or lock (default 300)." }
 				},
 				"required": ["action"]
 			}`),
@@ -287,6 +301,7 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"file_path": { "type": "string", "description": "Optional workspace file path for differential sibling-endpoint retrieval." },
 					"project": { "type": "string", "description": "Optional isolated project vault name." },
 					"session_id": { "type": "string", "description": "Optional session/worktree identifier cryptographically bound into eval_token." },
+					"from_inbox": { "type": "boolean", "description": "When true, automatically pop the oldest pending commit review ticket from the zero-key Pending Lens Inbox." },
 					"force": { "type": "boolean", "description": "Bypass zero-cost pre-filter gate even when no sensitive sinks match (default false)." }
 				},
 				"required": ["lens"]
@@ -305,6 +320,32 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"emit_receipt": { "type": "boolean", "description": "When true and FABRIAL_RECEIPT_DIR is set, atomically emit a BLPR-v1 receipt (signed via LOCKSMITH_SOCKET when reachable)." }
 				},
 				"required": ["eval_token", "findings_json"]
+			}`),
+		},
+		{
+			Name:        "coppermind_consolidate_prepare",
+			Description: "Prepare a zero-API-key Sleep-Cycle memory consolidation bundle of up to 30 unconsolidated TIER_3_EPISODIC memories fenced inside <untrusted_artifact> tags with a single-use HMAC-SHA256 eval_token.",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"project": { "type": "string", "description": "Optional isolated project vault name." },
+					"session_id": { "type": "string", "description": "Optional session filter." },
+					"max_nodes": { "type": "integer", "description": "Max episodic candidates to bundle (default 30, ceiling 30)." }
+				}
+			}`),
+		},
+		{
+			Name:        "coppermind_consolidate_submit",
+			Description: "Validate a single-use HMAC-SHA256 consolidation eval_token, persist synthesized learnings strictly as PROPOSED/TIER_3_DERIVED, record contradiction graph edges, and supersede ONLY allowlisted TIER_3_EPISODIC candidates.",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"eval_token": { "type": "string", "description": "Single-use HMAC-SHA256 eval_token from coppermind_consolidate_prepare." },
+					"consolidation_json": { "description": "Strict JSON object matching {\"learnings\":[...],\"contradictions\":[...]}." },
+					"project": { "type": "string", "description": "Optional isolated project vault name." },
+					"session_id": { "type": "string", "description": "Optional session identifier." }
+				},
+				"required": ["eval_token", "consolidation_json"]
 			}`),
 		},
 	}
@@ -339,6 +380,10 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *JSONRPCMessage) *JSON
 		result, err = s.callLensPrepare(ctx, params.Arguments, params.Meta)
 	case "coppermind_lens_submit":
 		result, err = s.callLensSubmit(ctx, params.Arguments, params.Meta)
+	case "coppermind_consolidate_prepare":
+		result, err = s.callConsolidatePrepare(ctx, params.Arguments, params.Meta)
+	case "coppermind_consolidate_submit":
+		result, err = s.callConsolidateSubmit(ctx, params.Arguments, params.Meta)
 	default:
 		return NewErrorResponse(msg.ID, ErrCodeMethodNotFound, fmt.Sprintf("Tool %q not found", params.Name))
 	}
@@ -557,6 +602,9 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 	msg := fmt.Sprintf("Stored memory %s in vault %q [%s] (%s): %s", node.ID, targetProj, node.Category, node.Provenance, node.Content)
 	if node.SupersedesID != "" {
 		msg = fmt.Sprintf("Stored memory %s in vault %q (superseded %s, status: %s): %s", node.ID, targetProj, node.SupersedesID, node.LifecycleStatus, node.Content)
+	} else if warnings := graph.DetectConflicts(ctx, mgr, node); len(warnings) > 0 {
+		msg += fmt.Sprintf("\n⚠ Contradiction Radar: potential conflict with %s (%s, sim=%.2f): %s\n  Tip: %s",
+			warnings[0].ConflictingNodeID, warnings[0].AuthorityTier, warnings[0].Similarity, warnings[0].Summary, warnings[0].SuggestedAction)
 	}
 	return &ToolCallResult{
 		Content: []TextContent{{Type: "text", Text: msg}},
@@ -578,6 +626,9 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *Too
 		IncludeObservations *bool    `json:"include_observations"`
 		IncludeSuperseded   bool     `json:"include_superseded"`
 		Tier                string   `json:"tier"`
+		Since               string   `json:"since"`
+		Before              string   `json:"before"`
+		Hops                *int     `json:"hops"`
 		EmitReceipt         bool     `json:"emit_receipt"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
@@ -704,6 +755,31 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *Too
 		includeObs = *input.IncludeObservations
 	}
 
+	var createdAfter, createdBefore *time.Time
+	if strings.TrimSpace(input.Since) != "" {
+		t, pErr := brain.ParseTemporalBound(input.Since, time.Now().UTC())
+		if pErr != nil {
+			return nil, fmt.Errorf("validation failed: %w", pErr)
+		}
+		createdAfter = &t
+	}
+	if strings.TrimSpace(input.Before) != "" {
+		t, pErr := brain.ParseTemporalBound(input.Before, time.Now().UTC())
+		if pErr != nil {
+			return nil, fmt.Errorf("validation failed: %w", pErr)
+		}
+		createdBefore = &t
+	}
+	hops := 1
+	if input.Hops != nil {
+		hops = *input.Hops
+		if hops < 0 {
+			hops = 0
+		} else if hops > 2 {
+			hops = 2
+		}
+	}
+
 	results, err := mgr.Recall(ctx, brain.RecallRequest{
 		SessionID:           input.SessionID,
 		Category:            input.Category,
@@ -715,6 +791,9 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *Too
 		IncludeObservations: includeObs,
 		IncludeSuperseded:   input.IncludeSuperseded,
 		AuthorityTier:       input.Tier,
+		CreatedAfter:        createdAfter,
+		CreatedBefore:       createdBefore,
+		Hops:                hops,
 	})
 	if err != nil {
 		return nil, err
@@ -862,10 +941,11 @@ func (s *Server) callProject(ctx context.Context, args json.RawMessage) (*ToolCa
 
 func (s *Server) callScratchpad(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
 	var input struct {
-		Action     string `json:"action"`
-		Key        string `json:"key"`
-		Value      string `json:"value"`
-		TTLSeconds int    `json:"ttl_seconds"`
+		Action        string `json:"action"`
+		Key           string `json:"key"`
+		Value         string `json:"value"`
+		ExpectedValue string `json:"expected_value"`
+		TTLSeconds    int    `json:"ttl_seconds"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -888,6 +968,21 @@ func (s *Server) callScratchpad(ctx context.Context, args json.RawMessage) (*Too
 			return nil, err
 		}
 		text = fmt.Sprintf("Set %q successfully", input.Key)
+	case "cas":
+		ttl := time.Duration(input.TTLSeconds) * time.Second
+		casSp, ok := sp.(scratchpad.CASScratchpad)
+		if !ok {
+			return nil, fmt.Errorf("scratchpad backend does not support atomic CAS")
+		}
+		swapped, err := casSp.CompareAndSwap(ctx, input.Key, input.ExpectedValue, input.Value, ttl)
+		if err != nil {
+			return nil, err
+		}
+		if swapped {
+			text = fmt.Sprintf("CAS succeeded: updated %q atomically", input.Key)
+		} else {
+			text = fmt.Sprintf("CAS conflict: current value of %q did not match expected_value", input.Key)
+		}
 	case "delete":
 		if err := sp.Delete(ctx, input.Key); err != nil {
 			return nil, err
@@ -1035,6 +1130,18 @@ var canonicalPrompts = []canonicalPromptSpec{
 		LensName: "drift-auditor",
 		Focus:    "contradictions with stored TIER_0/TIER_1 ADRs, superseded conventions, and stale documentation",
 	},
+	{
+		Def: PromptDef{
+			Name:        "coppermind:consolidate",
+			Description: "Zero-API-key Sleep-Cycle memory consolidation distilling noisy episodic notes into PROPOSED learnings and flagging contradictions.",
+			Arguments: []PromptArgument{
+				{Name: "session_id", Description: "Optional session identifier to consolidate.", Required: false},
+				{Name: "project", Description: "Optional isolated project vault name.", Required: false},
+			},
+		},
+		LensName: "consolidator",
+		Focus:    "distilling noisy episodic logs into crisp durable learnings and detecting contradictions",
+	},
 }
 
 func (s *Server) handlePromptsList(msg *JSONRPCMessage) *JSONRPCMessage {
@@ -1069,7 +1176,13 @@ func (s *Server) handlePromptsGet(ctx context.Context, msg *JSONRPCMessage) *JSO
 	projectName := strings.TrimSpace(params.Arguments["project"])
 
 	var messageText string
-	if targetID != "" || strings.TrimSpace(content) != "" {
+	if matched.LensName == "consolidator" {
+		messageText = "Execute Coppermind zero-API-key Sleep-Cycle consolidation:\n" +
+			"1. Call MCP tool `coppermind_consolidate_prepare`.\n" +
+			"2. If `skipped` is true, report that no unconsolidated episodic memories are pending.\n" +
+			"3. Otherwise distill up to 5 crisp durable learnings and identify contradictions from the fenced `<untrusted_artifact>` batch.\n" +
+			"4. Call `coppermind_consolidate_submit` with `eval_token` and your strict JSON payload so Coppermind enforces TIER_0/1/2 immutability and stores PROPOSED learnings."
+	} else if targetID != "" || strings.TrimSpace(content) != "" {
 		bundle, err := s.prepareLensBundle(ctx, lensPrepareInput{
 			Lens:     matched.LensName,
 			TargetID: targetID,
@@ -1131,6 +1244,7 @@ type lensPrepareInput struct {
 	FilePath  string `json:"file_path"`
 	Project   string `json:"project"`
 	SessionID string `json:"session_id"`
+	FromInbox bool   `json:"from_inbox"`
 	Force     bool   `json:"force"`
 }
 
@@ -1148,9 +1262,33 @@ func (s *Server) prepareLensBundle(ctx context.Context, input lensPrepareInput, 
 		return nil, fmt.Errorf("%w: %q", lenses.ErrUnknownLens, lensName)
 	}
 
+	mgr, cleanup, err := s.getManagerForProject(input.Project)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
 	targetID := strings.TrimSpace(input.TargetID)
+	if input.FromInbox && targetID == "" && strings.TrimSpace(input.Content) == "" {
+		if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok {
+			tkt, pErr := sqlStore.PeekOldestPendingTicket(ctx, lensName)
+			if pErr != nil {
+				return nil, pErr
+			}
+			if tkt == nil {
+				return &lenses.PreparedLensBundle{
+					Skipped:    true,
+					SkipReason: "inbox_empty",
+					LensName:   lensName,
+				}, nil
+			}
+			targetID = tkt.MemoryID
+			input.Force = true // Commit already matched pre-filter when queued
+		}
+	}
+
 	if targetID == "" && strings.TrimSpace(input.Content) == "" {
-		return nil, fmt.Errorf("invalid arguments: either target_id or content is required")
+		return nil, fmt.Errorf("invalid arguments: either target_id, content, or from_inbox=true is required")
 	}
 
 	effectiveSessionID := strings.TrimSpace(input.SessionID)
@@ -1161,12 +1299,6 @@ func (s *Server) prepareLensBundle(ctx context.Context, input lensPrepareInput, 
 			effectiveSessionID = strings.TrimSpace(meta.SessionID)
 		}
 	}
-
-	mgr, cleanup, err := s.getManagerForProject(input.Project)
-	if err != nil {
-		return nil, err
-	}
-	defer cleanup()
 
 	var candidate *brain.MemoryNode
 	if targetID != "" {
@@ -1304,6 +1436,13 @@ func (s *Server) callLensSubmit(ctx context.Context, args json.RawMessage, meta 
 		return nil, err
 	}
 
+	// Atomically close any matching pending inbox ticket for (lens, target_id)
+	if claims.TargetID != "" {
+		if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok {
+			_ = sqlStore.ResolvePendingTicketsByMemory(ctx, claims.LensName, claims.TargetID)
+		}
+	}
+
 	if input.EmitReceipt {
 		receiptSession := effectiveSessionID
 		if receiptSession == "" {
@@ -1353,4 +1492,87 @@ func decodeFindingsJSONArg(raw json.RawMessage) (string, error) {
 		return trimmed, nil
 	}
 	return "", fmt.Errorf("%w: findings_json must be a JSON string or object", lenses.ErrInvalidFindingsJSON)
+}
+
+func (s *Server) callConsolidatePrepare(ctx context.Context, args json.RawMessage, meta *ToolCallMeta) (*ToolCallResult, error) {
+	if s.hostEval == nil {
+		return nil, fmt.Errorf("host evaluator is not initialized")
+	}
+	var input struct {
+		Project   string `json:"project"`
+		SessionID string `json:"session_id"`
+		MaxNodes  int    `json:"max_nodes"`
+	}
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &input); err != nil {
+			return nil, fmt.Errorf("invalid arguments: %w", err)
+		}
+	}
+	mgr, cleanup, err := s.getManagerForProject(input.Project)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	sessionID := strings.TrimSpace(input.SessionID)
+	if sessionID == "" && meta != nil && meta.SessionID != "" {
+		sessionID = strings.TrimSpace(meta.SessionID)
+	}
+	proj := strings.TrimSpace(input.Project)
+	if proj == "" {
+		proj = "default"
+	}
+
+	bundle, err := s.hostEval.PrepareConsolidation(ctx, mgr, proj, sessionID, input.MaxNodes)
+	if err != nil {
+		return nil, err
+	}
+	raw, _ := json.Marshal(bundle)
+	return &ToolCallResult{
+		Content:           []TextContent{{Type: "text", Text: string(raw)}},
+		StructuredContent: bundle,
+	}, nil
+}
+
+func (s *Server) callConsolidateSubmit(ctx context.Context, args json.RawMessage, meta *ToolCallMeta) (*ToolCallResult, error) {
+	if s.hostEval == nil {
+		return nil, fmt.Errorf("host evaluator is not initialized")
+	}
+	var input struct {
+		EvalToken         string          `json:"eval_token"`
+		ConsolidationJSON json.RawMessage `json:"consolidation_json"`
+		Project           string          `json:"project"`
+		SessionID         string          `json:"session_id"`
+	}
+	if err := json.Unmarshal(args, &input); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	rawJSON, err := decodeFindingsJSONArg(input.ConsolidationJSON)
+	if err != nil {
+		return nil, err
+	}
+	mgr, cleanup, err := s.getManagerForProject(input.Project)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	sessionID := strings.TrimSpace(input.SessionID)
+	if sessionID == "" && meta != nil && meta.SessionID != "" {
+		sessionID = strings.TrimSpace(meta.SessionID)
+	}
+	proj := strings.TrimSpace(input.Project)
+	if proj == "" {
+		proj = "default"
+	}
+
+	res, err := s.hostEval.SubmitConsolidation(ctx, mgr, proj, input.EvalToken, rawJSON, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	raw, _ := json.Marshal(res)
+	return &ToolCallResult{
+		Content:           []TextContent{{Type: "text", Text: string(raw)}},
+		StructuredContent: res,
+	}, nil
 }

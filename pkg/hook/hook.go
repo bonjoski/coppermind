@@ -15,38 +15,9 @@ const mergeHookMarkerEnd = "# <<< coppermind episodic diff integrity hook <<<"
 
 const hookPayload = `# >>> coppermind episodic capture hook >>>
 if command -v coppermind >/dev/null 2>&1; then
-    COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null)
-    COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null | head -n 1)
-    COMMIT_AUTHOR=$(git log -1 --pretty=%an 2>/dev/null)
-    REPO_NAME=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
-    BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-    DIFF_SUMMARY=$(git diff-tree --no-commit-id --name-status -r HEAD 2>/dev/null | head -n 20)
-    SIGNER_KEY=$(git log -1 --pretty=%GK 2>/dev/null)
-    SIG_VALID=$(git log -1 --pretty=%G? 2>/dev/null)
-    AUTHOR_ROLE="developer"
-    PROVENANCE="TAINT_SHARED_DOC"
-    if [ "$SIG_VALID" = "G" ] || [ "$SIG_VALID" = "U" ]; then
-        AUTHOR_ROLE="architect"
-        PROVENANCE="TRUST_LOCAL_WORKSPACE"
-    fi
-    if [ -n "$COMMIT_HASH" ]; then
-        # Verify diff hunks in-process via Stormcage semantic taint engine before episodic ingestion
-        coppermind hook verify-diff \
-            --repo "$(git rev-parse --show-toplevel 2>/dev/null)" \
-            --ref "$COMMIT_HASH" \
-            --session "$REPO_NAME" \
-            --provenance "$PROVENANCE" >/dev/null 2>&1 && \
-        coppermind remember \
-            --session "$REPO_NAME" \
-            --category "git_commit" \
-            --provenance "$PROVENANCE" \
-            --author "$COMMIT_AUTHOR" \
-            --role "$AUTHOR_ROLE" \
-            "Git commit $COMMIT_HASH on branch '$BRANCH_NAME' by $COMMIT_AUTHOR: $COMMIT_MSG
-Changed files:
-$DIFF_SUMMARY" >/dev/null 2>&1 &
-        # Asynchronously evaluate security-architect lens on recent commit
-        coppermind dispatch reflect --lens security-architect --since 10m >/dev/null 2>&1 &
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$REPO_ROOT" ]; then
+        coppermind hook ingest-commit --repo "$REPO_ROOT" >/dev/null 2>&1 &
     fi
 fi
 # <<< coppermind episodic capture hook <<<
