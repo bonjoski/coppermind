@@ -54,10 +54,30 @@ type writeRequest struct {
 
 // SQLiteStore implements brain.MemoryStore backed by pure-Go SQLite with WAL mode and a non-blocking write worker.
 type SQLiteStore struct {
-	db       *sql.DB
-	writeCh  chan writeRequest
-	stopCh   chan struct{}
-	workerWg sync.WaitGroup
+	db             *sql.DB
+	writeCh        chan writeRequest
+	stopCh         chan struct{}
+	workerWg       sync.WaitGroup
+	preWriteHookMu sync.RWMutex
+	preWriteHook   func(ctx context.Context, node *brain.MemoryNode) error
+}
+
+// SetPreWriteHook registers an in-process integrity verification hook invoked before any
+// MemoryNode is enqueued into the SQLite WAL single-writer ring channel (zero WAL lock contention).
+func (s *SQLiteStore) SetPreWriteHook(fn func(ctx context.Context, node *brain.MemoryNode) error) {
+	s.preWriteHookMu.Lock()
+	defer s.preWriteHookMu.Unlock()
+	s.preWriteHook = fn
+}
+
+func (s *SQLiteStore) runPreWriteHook(ctx context.Context, node *brain.MemoryNode) error {
+	s.preWriteHookMu.RLock()
+	fn := s.preWriteHook
+	s.preWriteHookMu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(ctx, node)
 }
 
 // NewSQLiteStore opens or initializes a SQLite database at dbPath.
@@ -648,9 +668,17 @@ func (s *SQLiteStore) execDelete(nodeID string) error {
 }
 
 // Store queues a node for serialized write without blocking readers.
+// Runs any registered pre-write integrity hook (e.g. embedded Stormcage MemoryValidator)
+// BEFORE acquiring the single-writer WAL ring channel to eliminate lock contention under N=8 concurrency.
 func (s *SQLiteStore) Store(ctx context.Context, node *brain.MemoryNode) error {
+	if node == nil {
+		return fmt.Errorf("node cannot be nil")
+	}
 	if node.ID == "" {
 		return fmt.Errorf("node ID cannot be empty")
+	}
+	if err := s.runPreWriteHook(ctx, node); err != nil {
+		return err
 	}
 	if node.CreatedAt.IsZero() {
 		node.CreatedAt = time.Now()
@@ -725,8 +753,14 @@ func (s *SQLiteStore) Supersede(
 	rationale, advisoryRef string,
 	authorIdentity, authorRole string,
 ) error {
+	if supersedingNode == nil {
+		return fmt.Errorf("superseding node cannot be nil")
+	}
 	if supersedingNode.ID == "" {
 		return fmt.Errorf("node ID cannot be empty")
+	}
+	if err := s.runPreWriteHook(ctx, supersedingNode); err != nil {
+		return err
 	}
 	if supersedingNode.CreatedAt.IsZero() {
 		supersedingNode.CreatedAt = time.Now()

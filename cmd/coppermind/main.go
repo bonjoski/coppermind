@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -164,7 +166,7 @@ Commands:
   project      Manage isolated vaults (list, use, create, delete)
   config       Display or update persistent configuration (provider, model, endpoint)
   doctor       Execute the 11-pillar diagnostic inspection suite
-  hook         Manage Git post-commit capture and lens hooks (install, uninstall, status, check)
+  hook         Manage Git episodic capture and Stormcage diff integrity hooks (install, uninstall, status, check, verify-diff)
   observations List, filter, and resolve cognitive lens observations (alias: obs)
   proposals    Review, approve, or reject quarantined memory proposals
   radar        Synchronize or inspect industry standards and threat intelligence feeds
@@ -434,7 +436,14 @@ func runRemember(args []string) {
 	advisory := fs.String("advisory", "", "Advisory reference (e.g. ADR-042)")
 	role := fs.String("role", "", "Author role for epistemic validation (e.g. architect, product_owner, developer)")
 	author := fs.String("author", "", "Author identity (email, handle, or key thumbprint)")
+	provenanceStr := fs.String("provenance", string(brain.ProvenanceLocalWorkspace), "Provenance taint tier (TRUST_LOCAL_WORKSPACE, TAINT_SHARED_DOC, TAINT_EXTERNAL_USER, TAINT_UNTRUSTED_WEB)")
 	_ = fs.Parse(args)
+
+	provenance, provErr := brain.ParseProvenanceTier(*provenanceStr)
+	if provErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", provErr)
+		os.Exit(1)
+	}
 
 	rest := fs.Args()
 	if len(rest) == 0 {
@@ -495,7 +504,7 @@ func runRemember(args []string) {
 		SessionID:       *session,
 		Category:        *category,
 		Content:         content,
-		Provenance:      brain.ProvenanceLocalWorkspace,
+		Provenance:      provenance,
 		TTL:             *ttl,
 		AuthorityTier:   authz.TierToString(tier),
 		LifecycleStatus: string(status),
@@ -693,16 +702,17 @@ func runScratchpad(args []string) {
 		os.Exit(1)
 	}
 	action := args[0]
-	var sp brain.Scratchpad
+	var rawSP brain.Scratchpad
 	if getProfile() == "cluster" {
 		redisAddr := os.Getenv("COPPERMIND_REDIS_ADDR")
 		if redisAddr == "" {
 			redisAddr = "127.0.0.1:6379"
 		}
-		sp = scratchpad.NewRedisScratchpad(redisAddr)
+		rawSP = scratchpad.NewRedisScratchpad(redisAddr)
 	} else {
-		sp = scratchpad.NewMemoryScratchpad()
+		rawSP = scratchpad.NewMemoryScratchpad()
 	}
+	sp := brain.NewValidatedScratchpad(rawSP, brain.NewMemoryValidator(), "cli-scratchpad", brain.ProvenanceSharedDoc)
 	ctx := context.Background()
 
 	switch action {
@@ -725,7 +735,10 @@ func runScratchpad(args []string) {
 			fmt.Println("Usage: coppermind scratchpad set <key> <value>")
 			os.Exit(1)
 		}
-		_ = sp.Set(ctx, args[1], args[2], 0)
+		if err := sp.Set(ctx, args[1], args[2], 0); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 		fmt.Printf("Set %q\n", args[1])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown scratchpad action: %q\n", action)
@@ -1150,13 +1163,18 @@ func runDoctor(args []string) {
 
 func runHook(args []string) {
 	if len(args) < 1 {
-		fmt.Println("Usage: coppermind hook <install|uninstall|status|check> [--repo <path>]")
+		fmt.Println("Usage: coppermind hook <install|uninstall|status|check|verify-diff> [--repo <path>]")
 		os.Exit(1)
 	}
 
 	action := args[0]
 	fs := flag.NewFlagSet("hook "+action, flag.ExitOnError)
 	repo := fs.String("repo", ".", "Repository root directory")
+	ref := fs.String("ref", "HEAD", "Git revision or range to inspect (e.g. HEAD or ORIG_HEAD..HEAD)")
+	session := fs.String("session", "default", "Session or repository name for taint tracking")
+	provenanceStr := fs.String("provenance", string(brain.ProvenanceSharedDoc), "Provenance taint tier for diff verification")
+	fromStdin := fs.Bool("stdin", false, "Read unified git diff content from standard input")
+	jsonOut := fs.Bool("json", false, "Emit structured JSON verdict")
 	_ = fs.Parse(args[1:])
 
 	switch action {
@@ -1166,13 +1184,13 @@ func runHook(args []string) {
 			fmt.Fprintf(os.Stderr, "Failed to install git hook: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✓ Successfully installed automated episodic git commit hook!\n• Hook Path: %s\n", hookPath)
+		fmt.Printf("✓ Successfully installed automated episodic git capture & diff integrity hooks!\n• Hook Path: %s\n", hookPath)
 	case "uninstall", "remove":
 		if err := hook.UninstallGitHook(*repo); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to uninstall git hook: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✓ Successfully uninstalled git commit hook from %s\n", *repo)
+		fmt.Printf("✓ Successfully uninstalled git commit & merge integrity hooks from %s\n", *repo)
 	case "status":
 		installed, err := hook.StatusGitHook(*repo)
 		if err != nil {
@@ -1183,6 +1201,62 @@ func runHook(args []string) {
 			fmt.Printf("✓ Coppermind episodic git hook is ACTIVE in %s\n", *repo)
 		} else {
 			fmt.Printf("• Coppermind episodic git hook is NOT installed in %s\n", *repo)
+		}
+	case "verify-diff":
+		prov, provErr := brain.ParseProvenanceTier(*provenanceStr)
+		if provErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", provErr)
+			os.Exit(1)
+		}
+
+		var diffText string
+		signed := prov == brain.ProvenanceLocalWorkspace
+		if *fromStdin {
+			data, err := io.ReadAll(io.LimitReader(os.Stdin, 2*1024*1024))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to read diff from stdin: %v\n", err)
+				os.Exit(1)
+			}
+			diffText = string(data)
+		} else {
+			var gitArgs []string
+			if strings.Contains(*ref, "..") {
+				gitArgs = []string{"-C", *repo, "diff", "--no-color", *ref}
+			} else {
+				gitArgs = []string{"-C", *repo, "show", "--no-color", "--format=", *ref}
+			}
+			out, err := exec.Command("git", gitArgs...).Output()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to read git diff for %q in %s: %v\n", *ref, *repo, err)
+				os.Exit(1)
+			}
+			diffText = string(out)
+		}
+
+		repoName := filepath.Base(*repo)
+		validator := brain.NewMemoryValidator()
+		verdict, err := validator.VerifyGitDiff(context.Background(), *session, diffText, "", signed, repoName, *ref)
+		if err != nil {
+			if *jsonOut {
+				enc, _ := json.MarshalIndent(map[string]any{
+					"status":     "rejected",
+					"error":      err.Error(),
+					"provenance": prov,
+					"ref":        *ref,
+				}, "", "  ")
+				fmt.Println(string(enc))
+			} else {
+				fmt.Fprintf(os.Stderr, "🚨 Episodic Memory Integrity Hook REJECTED diff (%s): %v\n", *ref, err)
+			}
+			os.Exit(1)
+		}
+
+		if *jsonOut {
+			enc, _ := json.MarshalIndent(verdict, "", "  ")
+			fmt.Println(string(enc))
+		} else {
+			fmt.Printf("✓ Diff verified by embedded Stormcage engine (decision=%s taint=%s score=%.2f quarantined=%t digest=%s)\n",
+				verdict.StormcageDecision, verdict.EffectiveTaint, verdict.TaintScore, verdict.Quarantined, verdict.IntegrityDigest[:12])
 		}
 	case "check":
 		repoRoot := *repo
@@ -1209,7 +1283,7 @@ func runHook(args []string) {
 			}
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown hook action: %q. Expected 'install', 'uninstall', 'status', or 'check'\n", action)
+		fmt.Fprintf(os.Stderr, "Unknown hook action: %q. Expected 'install', 'uninstall', 'status', 'check', or 'verify-diff'\n", action)
 		os.Exit(1)
 	}
 }

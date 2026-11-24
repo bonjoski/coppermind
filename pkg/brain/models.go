@@ -2,7 +2,11 @@ package brain
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
+
+	stormtaint "github.com/bonjoski/stormcage/pkg/taint"
 )
 
 // ProvenanceTier defines the security and trust classification of ingested context.
@@ -10,9 +14,43 @@ type ProvenanceTier string
 
 const (
 	ProvenanceLocalWorkspace ProvenanceTier = "TRUST_LOCAL_WORKSPACE"
+	ProvenanceSharedDoc      ProvenanceTier = "TAINT_SHARED_DOC"
 	ProvenanceExternalUser   ProvenanceTier = "TAINT_EXTERNAL_USER"
 	ProvenanceUntrustedWeb   ProvenanceTier = "TAINT_UNTRUSTED_WEB"
 )
+
+// ParseProvenanceTier validates and normalizes a provenance tier string.
+func ParseProvenanceTier(raw string) (ProvenanceTier, error) {
+	switch ProvenanceTier(strings.ToUpper(strings.TrimSpace(raw))) {
+	case ProvenanceLocalWorkspace:
+		return ProvenanceLocalWorkspace, nil
+	case ProvenanceSharedDoc:
+		return ProvenanceSharedDoc, nil
+	case ProvenanceExternalUser:
+		return ProvenanceExternalUser, nil
+	case ProvenanceUntrustedWeb:
+		return ProvenanceUntrustedWeb, nil
+	default:
+		return "", fmt.Errorf("invalid provenance tier %q (expected TRUST_LOCAL_WORKSPACE, TAINT_SHARED_DOC, TAINT_EXTERNAL_USER, or TAINT_UNTRUSTED_WEB)", raw)
+	}
+}
+
+// ToStormcageTaint maps Coppermind's ProvenanceTier to Stormcage's canonical TaintLevel.
+// Unknown or spoofed tiers fail closed to TAINT_UNTRUSTED_WEB.
+func (p ProvenanceTier) ToStormcageTaint() stormtaint.TaintLevel {
+	switch p {
+	case ProvenanceLocalWorkspace:
+		return stormtaint.TRUST_LOCAL_WORKSPACE
+	case ProvenanceSharedDoc:
+		return stormtaint.TAINT_SHARED_DOC
+	case ProvenanceExternalUser:
+		return stormtaint.TAINT_EXTERNAL_USER
+	case ProvenanceUntrustedWeb:
+		return stormtaint.TAINT_UNTRUSTED_WEB
+	default:
+		return stormtaint.TAINT_UNTRUSTED_WEB
+	}
+}
 
 // MemoryNode represents an atomic unit of episodic or semantic memory.
 type MemoryNode struct {

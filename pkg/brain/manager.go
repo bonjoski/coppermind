@@ -78,14 +78,38 @@ type Manager struct {
 	eventHook  EventHook
 }
 
-// NewManager creates a new brain manager.
+// NewManager creates a new brain manager with an embedded Stormcage-backed MemoryValidator,
+// auto-wiring the pre-write integrity hook on compatible stores (e.g. SQLiteStore WAL pipeline)
+// and wrapping the working-memory Scratchpad for fail-closed prompt injection defense.
 func NewManager(store MemoryStore, embedder Embedder, scratchpad Scratchpad) *Manager {
+	validator := NewMemoryValidator()
+
+	type preWriteHookable interface {
+		SetPreWriteHook(fn func(ctx context.Context, node *MemoryNode) error)
+	}
+	if hookable, ok := store.(preWriteHookable); ok {
+		hookable.SetPreWriteHook(validator.ValidateNodeForStorage)
+	}
+
+	var wrappedScratchpad Scratchpad
+	if scratchpad != nil {
+		wrappedScratchpad = NewValidatedScratchpad(scratchpad, validator, "default", ProvenanceSharedDoc)
+	}
+
 	return &Manager{
 		store:      store,
 		embedder:   embedder,
-		scratchpad: scratchpad,
-		validator:  NewMemoryValidator(),
+		scratchpad: wrappedScratchpad,
+		validator:  validator,
 	}
+}
+
+// Validator returns the embedded Stormcage-backed MemoryValidator for direct diff or scratchpad audits.
+func (m *Manager) Validator() *MemoryValidator {
+	if m.validator == nil {
+		m.validator = NewMemoryValidator()
+	}
+	return m.validator
 }
 
 // SetEventHook registers an event listener for memory lifecycle events.

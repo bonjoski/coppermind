@@ -2,7 +2,7 @@
 
 > **Use Case ID:** `COP-UC-05`  
 > **Target Audience:** Multi-Agent Systems Engineers, Autonomous Agent Authors, SecOps  
-> **Platform Engine:** MemoryValidator, Pre-Write Delimiter Defanging & Epistemic Authority Quarantine  
+> **Platform Engine:** Embedded Stormcage In-Process Semantic Taint Engine (`pkg/brain/memory_validator.go`), SQLite WAL Pre-Write Hook, `ValidatedScratchpad`, & Git Diff Verification Hook (`RFC-2026-11-24-54`)  
 
 ---
 
@@ -97,6 +97,27 @@ req := brain.RememberRequest{
     },
 }
 ```
+
+### Step 3: Verify Incoming Third-Party Git Diffs & Install Integrity Hooks
+
+Install both `post-commit` (provenance-aware GPG signature classification) and `post-merge` (automatic `ORIG_HEAD..HEAD` diff verification) hooks into any repository:
+
+```bash
+# Install episodic capture + post-merge third-party diff integrity hooks
+coppermind hook install --repo .
+
+# Verify a third-party commit or PR diff on demand via embedded Stormcage (<5ms, zero WAN)
+coppermind hook verify-diff --repo . --ref ORIG_HEAD..HEAD --provenance TAINT_SHARED_DOC --json
+
+# Or pipe an external patch directly on stdin
+git diff origin/main...pr-branch | coppermind hook verify-diff --stdin --provenance TAINT_EXTERNAL_USER
+```
+
+### Step 4: SQLite WAL Pre-Write Hook & Validated Scratchpad
+
+`brain.NewManager(store, embedder, sp)` automatically:
+1. Wires `validator.ValidateNodeForStorage` into `SQLiteStore.SetPreWriteHook(...)`, verifying every node **before** it enters the single-writer WAL ring channel (zero SQLite lock contention under $N=8$ parallel worktrees; `<5µs` integrity-digest fast path for nodes already vetted by `Manager.Remember`).
+2. Wraps the working-memory `Scratchpad` in `brain.NewValidatedScratchpad(...)` so every `Set` call is scanned in-process by Stormcage (blocking Unicode tag smuggling `U+E0000`, Base64/Hex cloaked prompt injections, XML tool reflection, and `ws://127.0.0.1` pivots).
 
 ---
 
