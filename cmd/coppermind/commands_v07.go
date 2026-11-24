@@ -128,6 +128,7 @@ func runGraph(args []string) {
 	dataDir := fs.String("data-dir", "", "Data directory")
 	project := fs.String("project", "", "Project vault")
 	hops := fs.Int("hops", 1, "Graph traversal hops (1 or 2)")
+	relation := fs.String("relation", "", "Optional relation filter (e.g. touches_file, touches_symbol, references_rfc, contradicts)")
 	limit := fs.Int("limit", 15, "Max results")
 	_ = fs.Parse(args[1:])
 
@@ -173,6 +174,9 @@ func runGraph(args []string) {
 		}
 		fmt.Printf("Direct Edges for %s (%d):\n", target, len(edges))
 		for _, e := range edges {
+			if *relation != "" && !strings.EqualFold(string(e.Relation), *relation) {
+				continue
+			}
 			dest := e.TargetID
 			if dest == "" {
 				dest = e.TargetEntity
@@ -287,6 +291,61 @@ func runInbox(args []string) {
 		fmt.Printf("✓ Dismissed inbox ticket %s\n", fs.Arg(0))
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown inbox action %q (expected list or dismiss)\n", action)
+		os.Exit(1)
+	}
+}
+
+func runConsolidate(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: coppermind consolidate <prepare [--session <s]> [--max-nodes 30] | submit --token <tok> --json <payload>>")
+		os.Exit(1)
+	}
+	action := args[0]
+	fs := flag.NewFlagSet("consolidate "+action, flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Project vault")
+	session := fs.String("session", "", "Optional session filter")
+	maxNodes := fs.Int("max-nodes", lenses.ConsolidationMaxCandidates, "Max episodic candidates (<=30)")
+	token := fs.String("token", "", "HMAC eval_token (for submit)")
+	payload := fs.String("json", "", "Strict JSON consolidation payload (for submit)")
+	_ = fs.Parse(args[1:])
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	ev, err := lenses.NewDefaultHostEvaluator(mgr, activeProj, lenses.DefaultConfig())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing host evaluator: %v\n", err)
+		os.Exit(1)
+	}
+
+	switch action {
+	case "prepare":
+		bundle, err := ev.PrepareConsolidation(context.Background(), mgr, activeProj, *session, *maxNodes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Consolidation prepare failed: %v\n", err)
+			os.Exit(1)
+		}
+		out, _ := json.MarshalIndent(bundle, "", "  ")
+		fmt.Println(string(out))
+	case "submit":
+		if strings.TrimSpace(*token) == "" || strings.TrimSpace(*payload) == "" {
+			fmt.Fprintln(os.Stderr, "Usage: coppermind consolidate submit --token <eval_token> --json '<json>'")
+			os.Exit(1)
+		}
+		res, err := ev.SubmitConsolidation(context.Background(), mgr, activeProj, *token, *payload, *session)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Consolidation submit rejected: %v\n", err)
+			os.Exit(1)
+		}
+		out, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(out))
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown consolidate action %q (expected prepare or submit)\n", action)
 		os.Exit(1)
 	}
 }

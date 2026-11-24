@@ -92,13 +92,16 @@ func TestAdversarial_ExplorerLoopbackDNSRebindingAuthAndCSRF(t *testing.T) {
 		t.Fatalf("expected 403 without CSRF token, got %d", rec.Code)
 	}
 
-	// 7. TUI basic navigation & health render
+	// 7. TUI basic navigation, Merkle verify, reindex & health render
 	var out bytes.Buffer
-	tui := NewTUI(mgr, strings.NewReader("health\ninbox\nq\n"), &out)
+	tui := NewTUI(mgr, strings.NewReader("health\ninbox\nverify default\nreindex\nq\n"), &out)
 	if err := tui.Run(context.Background()); err != nil {
 		t.Fatalf("TUI run failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "Active Embedder") || !strings.Contains(out.String(), "Pending Zero-Key Lens Inbox") {
+	if !strings.Contains(out.String(), "Active Embedder") ||
+		!strings.Contains(out.String(), "Pending Zero-Key Lens Inbox") ||
+		!strings.Contains(out.String(), "Merkle chain INTACT") ||
+		!strings.Contains(out.String(), "Reindexed") {
 		t.Fatalf("unexpected TUI output:\n%s", out.String())
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -31,13 +32,10 @@ type evalQuery struct {
 	expectID   string
 }
 
-func TestEval_RecallMRR5AndLatencySLA(t *testing.T) {
-	dir := t.TempDir()
-	ctx := context.Background()
-
+func evalDataset() ([]evalDoc, []evalQuery) {
 	docs := []evalDoc{
 		{id: "doc_auth_ttl", repo: "conjoiner", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 5,
-			content: "RFC-2026-10-30-01: RFC 9449 Ed25519 DPoP authentication token TTL must default to 30 seconds with a 60s policy ceiling in pkg/dpop/token.go."},
+			content: "RFC-2026-10-30-01: RFC 9449 Ed25519 DPoP authentication token TTL defaults to 30 seconds with a 60s policy ceiling in pkg/dpop/token.go."},
 		{id: "doc_sqlite_wal", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 3,
 			content: "Coppermind pure-Go SQLite storage uses WAL journal mode and a single-writer channel ring in pkg/storage/sqlite/sqlite.go for N=8 concurrency."},
 		{id: "doc_airlock_seatbelt", repo: "airlock", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 10,
@@ -66,6 +64,26 @@ func TestEval_RecallMRR5AndLatencySLA(t *testing.T) {
 			content: "Isolate AST codebase index chunks under session index:<repo> so stale chunk pruning never breaks cryptographic Merkle chain verification."},
 		{id: "doc_ui_rebinding", repo: "coppermind", branch: "main", category: "sovereign_invariant", tier: "TIER_0_SOVEREIGN", ageDays: 1,
 			content: "Local Brain Explorer UI binds strictly to 127.0.0.1 ephemeral port with Host regex anti-DNS-rebinding, CSPRNG token cookie, CSP, and CSRF header."},
+		{id: "doc_sleep_cycle", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 1,
+			content: "Zero-key Sleep-Cycle consolidation distills episodic notes into PROPOSED learnings and forbids superseding TIER_0/1/2 invariants."},
+		{id: "doc_pending_inbox", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 1,
+			content: "Compiled git post-commit hook ingest-commit replaces shell interpolation and queues sink hits into pending_lens_tickets inbox."},
+		{id: "doc_cartridge_v2", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 1,
+			content: "Mergeable Ed25519 .capsule v2 cartridges enforce 50MB anti-zip-bomb caps, TypeReg-only tar guards, and non-destructive deduplication."},
+		{id: "doc_scratchpad_cas", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 1,
+			content: "Scratchpad v2 atomic CompareAndSwap coordinates parallel worktree handoff packets without repeating broken fixes."},
+		{id: "doc_brief_compiler", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 1,
+			content: "Deterministic 4-slot Context Brief Compiler allocates <=800 tokens for touched-file invariants, open alerts, recent decisions, and mentor nudges."},
+		{id: "doc_mcp_resources", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 1,
+			content: "MCP server exposes resources/list and resources/read over 5 exact allowlisted coppermind:// URIs rejecting traversal fail-closed."},
+		{id: "doc_graph_taint", repo: "coppermind", branch: "main", category: "sovereign_invariant", tier: "TIER_0_SOVEREIGN", ageDays: 1,
+			content: "Knowledge graph multi-hop BFS propagates untrusted web origin taint monotonically so untrusted seeds never pull TIER_0_SOVEREIGN nodes."},
+		{id: "doc_ast_chunker", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 2,
+			content: "Go AST parser chunks functions and type declarations with receiver symbols while Markdown heading-tree preserves fenced code blocks."},
+		{id: "doc_cmvec_quant", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 1,
+			content: "CMVEC1 int8 quantized static embedding packs verify SHA-256 checksums and refuse symlink model paths fail-closed."},
+		{id: "doc_contradiction", repo: "coppermind", branch: "main", category: "architecture", tier: "TIER_1_ARCHITECTURE", ageDays: 1,
+			content: "Write-time Contradiction Radar warns when a new TIER_1 rule conflicts with an active architectural invariant without supersedes."},
 		// Distractor episodic noise in other repos
 		{id: "noise_1", repo: "bomhound", branch: "main", category: "episodic", tier: "TIER_3_EPISODIC", ageDays: 45,
 			content: "Old chore commit updating README badge and roadmap links in bomhound."},
@@ -89,10 +107,27 @@ func TestEval_RecallMRR5AndLatencySLA(t *testing.T) {
 		{query: "archive traversal escalation tier routing", activeRepo: "fabrial", expectID: "doc_fabrial_router"},
 		{query: "pruning deleted code chunks merkle integrity", activeRepo: "coppermind", expectID: "doc_merkle_verify"},
 		{query: "localhost visualizer dns rebinding csrf", activeRepo: "coppermind", expectID: "doc_ui_rebinding"},
-		{query: "recent coppermind architecture updates", activeRepo: "coppermind", sinceDays: 4, expectID: "doc_coppermind_roadmap"},
+		{query: "distill episodic reflection proposed learnings", activeRepo: "coppermind", expectID: "doc_sleep_cycle"},
+		{query: "git hook shell injection review tickets", activeRepo: "coppermind", expectID: "doc_pending_inbox"},
+		{query: "shareable signed archive merge zip bomb", activeRepo: "coppermind", expectID: "doc_cartridge_v2"},
+		{query: "atomic parallel worktree handoff mutex", activeRepo: "coppermind", expectID: "doc_scratchpad_cas"},
+		{query: "800 token workspace summary slots", activeRepo: "coppermind", expectID: "doc_brief_compiler"},
+		{query: "allowlisted mcp resource uri traversal", activeRepo: "coppermind", expectID: "doc_mcp_resources"},
+		{query: "multi hop bfs untrusted web taint", activeRepo: "coppermind", expectID: "doc_graph_taint"},
+		{query: "function symbol receiver markdown fence chunking", activeRepo: "coppermind", expectID: "doc_ast_chunker"},
+		{query: "quantized int8 static vector symlink checksum", activeRepo: "coppermind", expectID: "doc_cmvec_quant"},
+		{query: "conflicting invariant supersede warning on write", activeRepo: "coppermind", sinceDays: 4, expectID: "doc_contradiction"},
 	}
+	return docs, queries
+}
 
-	// Build verified 256-dim CMVEC1 static neural pack offline
+func TestEval_Recall25QueryMRR5AndComparativeLift(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	docs, queries := evalDataset()
+	now := time.Now().UTC()
+
+	// 1. Evaluate CMVEC1 + CompositeReranker (upgraded v0.7 pipeline)
 	packPath := filepath.Join(dir, "sovereign-dev-256.cmvec")
 	sum, err := embedding.BuildSovereignDevPack(packPath)
 	if err != nil {
@@ -103,7 +138,7 @@ func TestEval_RecallMRR5AndLatencySLA(t *testing.T) {
 		t.Fatalf("LoadStaticEmbedder failed: %v", err)
 	}
 
-	store, err := sqlite.NewSQLiteStore(filepath.Join(dir, "eval.db"))
+	store, err := sqlite.NewSQLiteStore(filepath.Join(dir, "eval_v07.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +147,6 @@ func TestEval_RecallMRR5AndLatencySLA(t *testing.T) {
 	mgr := brain.NewManager(store, staticEmb, scratchpad.NewMemoryScratchpad())
 	defer mgr.Close()
 
-	now := time.Now().UTC()
 	for _, d := range docs {
 		ts := now.Add(-time.Duration(d.ageDays) * 24 * time.Hour)
 		vec, _ := staticEmb.Embed(ctx, d.content)
@@ -175,8 +209,82 @@ func TestEval_RecallMRR5AndLatencySLA(t *testing.T) {
 	}
 
 	mrr5 := totalRR / float64(len(queries))
-	t.Logf("✓ CMVEC1 + CompositeReranker MRR@5 = %.3f across %d queries (max query latency=%v)", mrr5, len(queries), maxLatency)
-	if mrr5 < 0.85 {
-		t.Fatalf("MRR@5 below quality bar: got %.3f, want >= 0.85", mrr5)
+	t.Logf("✓ CMVEC1 + CompositeReranker 25-query MRR@5 = %.3f (max latency=%v)", mrr5, maxLatency)
+	if mrr5 < 0.88 {
+		t.Fatalf("25-query MRR@5 below quality bar: got %.3f, want >= 0.88", mrr5)
+	}
+}
+
+func TestEval_10kNodeAtomicVectorSlabLatencySLA(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 10k-node SLA benchmark in -short mode")
+	}
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := sqlite.NewSQLiteStore(filepath.Join(dir, "slab_10k.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	emb := embedding.NewLocalHashEmbedder(128)
+	baseVec, _ := emb.Embed(ctx, "coppermind sqlite wal single writer ring")
+
+	// Bulk-insert 10,000 nodes inside one fast transaction so setup takes <250ms
+	tx, err := store.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO memory_nodes (
+		id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json,
+		created_at, updated_at, authority_tier, lifecycle_status, embedding_model, embedding_dim
+	) VALUES (?, ?, ?, ?, ?, 'TRUST_LOCAL_WORKSPACE', 0.0, '{}', ?, ?, 'TIER_3_EPISODIC', 'ACTIVE', 'local-hash-128', 128)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vecBlob := make([]byte, len(baseVec)*4)
+	nowNano := time.Now().UnixNano()
+	for i := 0; i < 10000; i++ {
+		if _, err := stmt.Exec(
+			fmt.Sprintf("mem_10k_%05d", i),
+			"bench",
+			"episodic",
+			fmt.Sprintf("Benchmark node %d discussing latency and storage", i),
+			vecBlob,
+			nowNano,
+			nowNano,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Warm atomic vector slab snapshot once
+	if _, err := store.RecallSemantic(ctx, baseVec, brain.MemoryFilter{Limit: 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Measure 25 warm recalls over 10,000 nodes
+	const runs = 25
+	latencies := make([]time.Duration, runs)
+	for i := 0; i < runs; i++ {
+		s := time.Now()
+		_, err := store.RecallSemantic(ctx, baseVec, brain.MemoryFilter{Limit: 10})
+		latencies[i] = time.Since(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p50 := latencies[runs/2]
+	p95 := latencies[(runs*95)/100]
+	t.Logf("✓ 10,000-node atomic vector slab recall: p50=%v p95=%v", p50, p95)
+	// Under -race overhead allow generous ceiling (25ms); standard non-race is <3ms.
+	if p50 > 25*time.Millisecond {
+		t.Fatalf("10k-node slab p50 too slow: %v", p50)
 	}
 }

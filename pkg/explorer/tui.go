@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
+	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 )
 
 // TUI provides a lightweight, zero-dependency interactive terminal Brain Explorer
-// across 4 tabs: Search (with ScoreBreakdown), Graph, Inbox & Observations, and Vault Health.
+// across 4 tabs: Search (with ScoreBreakdown), Graph, Inbox & Observations (with curation),
+// and Vault Health (with Merkle verify & live reindex-vectors).
 type TUI struct {
 	mgr   *brain.Manager
 	store *sqlite.SQLiteStore
@@ -75,29 +78,91 @@ func (t *TUI) Run(ctx context.Context) error {
 			} else {
 				fmt.Fprintf(t.out, "✓ Resolved observation %s\n", arg)
 			}
+		case "approve":
+			t.curateProposal(ctx, arg, string(authz.StatusActive), authz.TierName1Architecture)
+		case "reject":
+			t.curateProposal(ctx, arg, string(authz.StatusRejected), "")
+		case "dismiss":
+			if arg == "" || t.store == nil {
+				fmt.Fprintln(t.out, "Usage: dismiss <ticket_id>")
+				continue
+			}
+			if err := t.store.ResolvePendingTicket(ctx, arg, "dismissed"); err != nil {
+				fmt.Fprintf(t.out, "Error: %v\n", err)
+			} else {
+				fmt.Fprintf(t.out, "✓ Dismissed inbox ticket %s\n", arg)
+			}
+		case "verify":
+			if arg == "" {
+				arg = "default"
+			}
+			ok, cnt, badID, err := t.mgr.VerifySessionChain(ctx, arg)
+			if err != nil || !ok {
+				fmt.Fprintf(t.out, "✗ Merkle verification FAILED for %q at %s: %v\n", arg, badID, err)
+			} else {
+				fmt.Fprintf(t.out, "✓ Merkle chain INTACT for session %q (%d verified nodes)\n", arg, cnt)
+			}
+		case "reindex":
+			if t.store == nil {
+				fmt.Fprintln(t.out, "Reindex requires SQLite backend.")
+				continue
+			}
+			stats, err := t.store.ReindexVectors(ctx, t.mgr.Embedder(), t.mgr.EmbedderModelName(), 128, false)
+			if err != nil {
+				fmt.Fprintf(t.out, "Reindex failed: %v\n", err)
+			} else {
+				fmt.Fprintf(t.out, "✓ Reindexed %d/%d nodes with %s in %s\n",
+					stats.Reindexed, stats.TotalNodes, stats.ModelName, stats.Duration.Round(time.Millisecond))
+			}
 		default:
-			// Treat bare text as an instant search query for zero-friction exploration
 			t.renderSearch(ctx, line)
 		}
 	}
+}
+
+func (t *TUI) curateProposal(ctx context.Context, id, newStatus, newTier string) {
+	if id == "" {
+		fmt.Fprintln(t.out, "Usage: approve|reject <proposal_id>")
+		return
+	}
+	node, err := t.mgr.Store().GetByID(ctx, id)
+	if err != nil || node == nil {
+		fmt.Fprintf(t.out, "Proposal %q not found\n", id)
+		return
+	}
+	node.LifecycleStatus = newStatus
+	if newTier != "" {
+		node.AuthorityTier = newTier
+	}
+	node.UpdatedAt = time.Now()
+	if err := t.mgr.Store().Store(ctx, node); err != nil {
+		fmt.Fprintf(t.out, "Error updating proposal: %v\n", err)
+		return
+	}
+	fmt.Fprintf(t.out, "✓ Updated %s -> lifecycle=%s tier=%s\n", id, node.LifecycleStatus, node.AuthorityTier)
 }
 
 func (t *TUI) renderHeader(ctx context.Context) {
 	cnt, _ := t.mgr.Count(ctx, "")
 	fmt.Fprintf(t.out, "╔══════════════════════════════════════════════════════════════╗\n")
 	fmt.Fprintf(t.out, "║  🧠 Coppermind Brain Explorer TUI (%4d memories | %s)\n", cnt, t.mgr.EmbedderModelName())
-	fmt.Fprintf(t.out, "║  Tabs: [1] search <q>  [2] graph <id|file>  [3] inbox  [4] health  [q] quit\n")
+	fmt.Fprintf(t.out, "║  [1] search <q>  [2] graph <id|file>  [3] inbox  [4] health  [q] quit\n")
 	fmt.Fprintf(t.out, "╚══════════════════════════════════════════════════════════════╝\n")
 }
 
 func (t *TUI) renderHelp() {
 	fmt.Fprintln(t.out, "Commands:")
-	fmt.Fprintln(t.out, "  search <query>       Hybrid + 1-hop graph recall with ScoreBreakdown")
-	fmt.Fprintln(t.out, "  graph <id|file>      Inspect 1-2 hop graph edges or file impact")
-	fmt.Fprintln(t.out, "  inbox                Show open high/crit observations & pending commit tickets")
-	fmt.Fprintln(t.out, "  resolve <obs_id>     Mark a cognitive lens observation resolved")
-	fmt.Fprintln(t.out, "  health               Show vector model coverage & vault stats")
-	fmt.Fprintln(t.out, "  q                    Exit TUI")
+	fmt.Fprintln(t.out, "  search <query>         Hybrid + 1-hop graph recall with ScoreBreakdown")
+	fmt.Fprintln(t.out, "  graph <id|file>        Inspect 1-2 hop graph edges or file impact")
+	fmt.Fprintln(t.out, "  inbox                  Show open observations, PROPOSED learnings & pending tickets")
+	fmt.Fprintln(t.out, "  resolve <obs_id>       Mark a cognitive lens observation resolved")
+	fmt.Fprintln(t.out, "  approve <proposal_id>  Promote a PROPOSED learning to TIER_1_ARCHITECTURE")
+	fmt.Fprintln(t.out, "  reject <proposal_id>   Reject a PROPOSED learning")
+	fmt.Fprintln(t.out, "  dismiss <ticket_id>    Dismiss a pending commit inbox ticket")
+	fmt.Fprintln(t.out, "  verify [session]       Audit cryptographic Merkle chain for a session")
+	fmt.Fprintln(t.out, "  reindex                Re-embed mismatched nodes with active embedder")
+	fmt.Fprintln(t.out, "  health                 Show vector model coverage & vault stats")
+	fmt.Fprintln(t.out, "  q                      Exit TUI")
 }
 
 func (t *TUI) renderSearch(ctx context.Context, query string) {
@@ -193,8 +258,9 @@ func (t *TUI) renderHealth(ctx context.Context) {
 
 func truncateTUI(s string, max int) string {
 	clean := strings.Join(strings.Fields(s), " ")
-	if len(clean) <= max {
+	runes := []rune(clean)
+	if len(runes) <= max {
 		return clean
 	}
-	return clean[:max-3] + "..."
+	return string(runes[:max-3]) + "..."
 }

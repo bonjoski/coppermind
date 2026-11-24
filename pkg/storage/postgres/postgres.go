@@ -489,6 +489,16 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 		args = append(args, filter.AuthorityTier)
 		idx++
 	}
+	if filter.CreatedAfter != nil {
+		query += fmt.Sprintf(" AND created_at >= $%d", idx)
+		args = append(args, filter.CreatedAfter.UnixNano())
+		idx++
+	}
+	if filter.CreatedBefore != nil {
+		query += fmt.Sprintf(" AND created_at <= $%d", idx)
+		args = append(args, filter.CreatedBefore.UnixNano())
+		idx++
+	}
 
 	query += fmt.Sprintf(" ORDER BY vector_data <=> $1 ASC LIMIT $%d", idx)
 	limit := filter.Limit

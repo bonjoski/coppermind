@@ -841,6 +841,9 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *Too
 
 		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] [%s | %s | %s]\n",
 			i+1, r.Score, tierBadge, catBadge, r.Node.Provenance))
+		if len(r.GraphLinks) > 0 {
+			sb.WriteString(fmt.Sprintf("   [linked via: %s]\n", strings.Join(r.GraphLinks, ", ")))
+		}
 		if isLearning {
 			sb.WriteString("   💡 ARCHITECTURAL LEARNING / INVARIANT:\n")
 		}

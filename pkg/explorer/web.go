@@ -381,59 +381,124 @@ const embeddedExplorerHTML = `<!doctype html>
 <title>Coppermind — Local Brain Explorer</title>
 <style>
   body { margin:0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#0d1117; color:#e6edf3; }
-  header { padding:14px 20px; border-bottom:1px solid #30363d; display:flex; align-items:center; justify-content:space-between; }
-  h1 { margin:0; font-size:16px; color:#f0883e; }
-  .stats { font-size:12px; color:#8b949e; }
-  main { display:grid; grid-template-columns: 380px 1fr; height: calc(100vh - 54px); }
+  header { padding:12px 20px; border-bottom:1px solid #30363d; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  h1 { margin:0; font-size:15px; color:#f0883e; }
+  .tabs { display:flex; gap:6px; }
+  .tab { background:#161b22; color:#c9d1d9; border:1px solid #30363d; border-radius:6px; padding:5px 10px; cursor:pointer; font-family:inherit; font-size:12px; }
+  .tab.active { border-color:#f0883e; color:#f0883e; }
+  .stats { font-size:11px; color:#8b949e; }
+  main { display:grid; grid-template-columns: 400px 1fr; height: calc(100vh - 54px); }
   aside { border-right:1px solid #30363d; padding:14px; overflow-y:auto; }
   input { width:100%; box-sizing:border-box; padding:8px; background:#161b22; color:#e6edf3; border:1px solid #30363d; border-radius:6px; font-family:inherit; }
   .card { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:10px; margin-top:10px; font-size:12px; }
   .badge { display:inline-block; padding:2px 6px; border-radius:4px; font-size:10px; background:#21262d; color:#f0883e; margin-right:6px; }
+  .btn { background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:4px; padding:4px 8px; cursor:pointer; font-family:inherit; font-size:11px; margin-top:6px; margin-right:6px; }
+  .btn:hover { border-color:#f0883e; }
   canvas { width:100%; height:100%; display:block; background:#090c10; }
 </style>
 </head>
 <body>
 <header>
-  <h1>🧠 Coppermind Local Brain Explorer (127.0.0.1)</h1>
+  <h1>🧠 Coppermind Brain Explorer</h1>
+  <div class="tabs">
+    <button class="tab active" data-tab="search">Search</button>
+    <button class="tab" data-tab="obs">Observations</button>
+    <button class="tab" data-tab="inbox">Inbox</button>
+    <button class="tab" data-tab="verify">Merkle Verify</button>
+  </div>
   <div class="stats" id="stats">Loading vault health...</div>
 </header>
 <main>
-  <aside>
-    <input id="q" placeholder="Search hybrid + graph recall (press Enter)..." />
-    <div id="results"></div>
-  </aside>
+  <aside id="panel"></aside>
   <canvas id="graph"></canvas>
 </main>
 <script>
+let csrfToken = '';
+let allowCurate = false;
 const statsEl = document.getElementById('stats');
-const resEl = document.getElementById('results');
-const qEl = document.getElementById('q');
+const panelEl = document.getElementById('panel');
 const canvas = document.getElementById('graph');
 const ctx = canvas.getContext('2d');
+
+function escapeHtml(s) { return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 async function loadHealth() {
   const r = await fetch('/api/v1/health');
   const d = await r.json();
-  statsEl.textContent = 'Memories: ' + d.total_memories + ' | Model: ' + d.active_model + ' | Open Obs: ' + d.open_high_obs + ' | Inbox: ' + d.pending_inbox + (d.allow_curate ? ' | Curate ON' : ' | Read-Only');
+  csrfToken = d.csrf_token || '';
+  allowCurate = !!d.allow_curate;
+  statsEl.textContent = 'Memories: ' + d.total_memories + ' | ' + d.active_model + ' | Obs: ' + d.open_high_obs + ' | Inbox: ' + d.pending_inbox + (allowCurate ? ' | Curate ON' : ' | Read-Only');
+}
+
+function showSearchTab() {
+  panelEl.innerHTML = '<input id="q" placeholder="Hybrid + Graph recall (press Enter)..." /><div id="results"></div>';
+  const qEl = document.getElementById('q');
+  qEl.addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(qEl.value); });
 }
 
 async function runSearch(query) {
   const r = await fetch('/api/v1/search?q=' + encodeURIComponent(query));
   const d = await r.json();
+  const resEl = document.getElementById('results');
   resEl.innerHTML = '';
   (d.results || []).forEach(item => {
     const div = document.createElement('div');
     div.className = 'card';
     const b = item.breakdown || {};
-    div.innerHTML = '<div><span class="badge">' + (item.node.authority_tier || '') + '</span><span class="badge">' + (item.score || 0).toFixed(3) + '</span></div>'
-      + '<div style="margin-top:6px;white-space:pre-wrap;">' + escapeHtml((item.node.content || '').slice(0, 220)) + '</div>'
+    div.innerHTML = '<div><span class="badge">' + escapeHtml(item.node.authority_tier) + '</span><span class="badge">' + (item.score||0).toFixed(3) + '</span></div>'
+      + '<div style="margin-top:6px;white-space:pre-wrap;">' + escapeHtml((item.node.content||'').slice(0, 220)) + '</div>'
       + '<div style="margin-top:6px;color:#8b949e;font-size:11px;">hybrid=' + (b.hybrid_score||0).toFixed(2) + ' actr=' + (b.recency_actr||0).toFixed(2) + ' repo=' + (b.repo_affinity||0).toFixed(2) + '</div>';
     div.onclick = () => loadGraph(item.node.id);
     resEl.appendChild(div);
   });
 }
 
-function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function showObsTab() {
+  const r = await fetch('/api/v1/observations?status=open');
+  const d = await r.json();
+  panelEl.innerHTML = '<div style="font-size:12px;color:#8b949e;">Open Observations (' + (d.count||0) + ')</div>';
+  (d.observations || []).forEach(o => {
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = '<div><span class="badge">' + escapeHtml(o.severity) + '</span><span class="badge">' + escapeHtml(o.source_lens) + '</span></div>'
+      + '<div style="margin-top:6px;">' + escapeHtml((o.content||'').slice(0, 220)) + '</div>';
+    if (allowCurate) {
+      const btn = document.createElement('button');
+      btn.className = 'btn';
+      btn.textContent = 'Resolve';
+      btn.onclick = async () => {
+        await fetch('/api/v1/observations/' + encodeURIComponent(o.id) + '/resolve', { method:'POST', headers:{'X-Coppermind-CSRF': csrfToken} });
+        await loadHealth();
+        showObsTab();
+      };
+      div.appendChild(btn);
+    }
+    panelEl.appendChild(div);
+  });
+}
+
+async function showInboxTab() {
+  const r = await fetch('/api/v1/inbox');
+  const d = await r.json();
+  panelEl.innerHTML = '<div style="font-size:12px;color:#8b949e;">Pending Zero-Key Commit Lens Inbox (' + (d.count||0) + ')</div>';
+  (d.tickets || []).forEach(t => {
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = '<div><span class="badge">' + escapeHtml(t.lens_name) + '</span><span class="badge">' + escapeHtml(t.branch_name) + '</span></div>'
+      + '<div style="margin-top:6px;">' + escapeHtml(t.summary) + '</div>';
+    panelEl.appendChild(div);
+  });
+}
+
+function showVerifyTab() {
+  panelEl.innerHTML = '<input id="sess" value="default" placeholder="Session ID to Merkle-verify..." /><button class="btn" id="vbtn">Verify Session Chain</button><div id="vout"></div>';
+  document.getElementById('vbtn').onclick = async () => {
+    const s = document.getElementById('sess').value || 'default';
+    const r = await fetch('/api/v1/verify/' + encodeURIComponent(s));
+    const d = await r.json();
+    document.getElementById('vout').innerHTML = '<div class="card">' + (d.verified ? '✓ INTACT (' + d.count + ' nodes)' : '✗ FAILED: ' + escapeHtml(d.error)) + '</div>';
+  };
+}
 
 async function loadGraph(center) {
   const r = await fetch('/api/v1/graph' + (center ? '?center=' + encodeURIComponent(center) : ''));
@@ -460,8 +525,20 @@ async function loadGraph(center) {
   });
 }
 
-qEl.addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(qEl.value); });
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const t = btn.dataset.tab;
+    if (t === 'search') showSearchTab();
+    else if (t === 'obs') showObsTab();
+    else if (t === 'inbox') showInboxTab();
+    else if (t === 'verify') showVerifyTab();
+  };
+});
+
 loadHealth();
+showSearchTab();
 loadGraph('');
 </script>
 </body>

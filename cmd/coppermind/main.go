@@ -138,6 +138,8 @@ func main() {
 		runBrief(cmdArgs)
 	case "inbox":
 		runInbox(cmdArgs)
+	case "consolidate":
+		runConsolidate(cmdArgs)
 	case "tui":
 		runTUI(cmdArgs)
 	case "ui":
@@ -425,6 +427,13 @@ func runMCP(args []string) {
 				sb.WriteString(fmt.Sprintf("%d. [%s] (%s): %s\n", i+1, strings.ToUpper(obs.Severity), obs.SourceLens, obs.Content))
 			}
 			_ = mgr.Scratchpad().Set(ctx, "active_observations", sb.String(), 24*time.Hour)
+		}
+		if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok {
+			if tkts, tErr := sqlStore.ListPendingTickets(ctx, "", "pending", 10); tErr == nil && len(tkts) > 0 {
+				summary := fmt.Sprintf("%d pending zero-key commit lens ticket(s) — oldest [%s]: %s. Run /coppermind:security-audit or coppermind_lens_prepare(from_inbox=true).",
+					len(tkts), tkts[0].LensName, tkts[0].Summary)
+				_ = mgr.Scratchpad().Set(ctx, "pending_inbox", summary, 24*time.Hour)
+			}
 		}
 	}
 
@@ -787,6 +796,86 @@ func runScratchpad(args []string) {
 			os.Exit(1)
 		}
 		fmt.Printf("Set %q\n", args[1])
+	case "cas":
+		if len(args) < 4 {
+			fmt.Println("Usage: coppermind scratchpad cas <key> <expected_value> <new_value>")
+			os.Exit(1)
+		}
+		swapped, err := sp.CompareAndSwap(ctx, args[1], args[2], args[3], 5*time.Minute)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if swapped {
+			fmt.Printf("✓ CAS succeeded for %q\n", args[1])
+		} else {
+			fmt.Fprintf(os.Stderr, "✗ CAS conflict for %q (current value did not match expected)\n", args[1])
+			os.Exit(1)
+		}
+	case "handoff":
+		if len(args) < 2 {
+			fmt.Println("Usage: coppermind scratchpad handoff <set --worktree <wt> --goal <g> --next <n> [--dead-end <d>] | get <worktree>>")
+			os.Exit(1)
+		}
+		switch args[1] {
+		case "set":
+			hfs := flag.NewFlagSet("scratchpad handoff set", flag.ExitOnError)
+			wt := hfs.String("worktree", "default", "Worktree identifier")
+			agent := hfs.String("agent", "cli", "Agent identifier")
+			goal := hfs.String("goal", "", "Current task goal")
+			nextStep := hfs.String("next", "", "Next recommended step")
+			deadEnd := hfs.String("dead-end", "", "Optional comma-separated dead-ends tried")
+			files := hfs.String("files", "", "Optional comma-separated touched files")
+			_ = hfs.Parse(args[2:])
+			var deadEnds, touched []string
+			if strings.TrimSpace(*deadEnd) != "" {
+				for _, p := range strings.Split(*deadEnd, ",") {
+					if tr := strings.TrimSpace(p); tr != "" {
+						deadEnds = append(deadEnds, tr)
+					}
+				}
+			}
+			if strings.TrimSpace(*files) != "" {
+				for _, p := range strings.Split(*files, ",") {
+					if tr := strings.TrimSpace(p); tr != "" {
+						touched = append(touched, tr)
+					}
+				}
+			}
+			encoded, err := scratchpad.EncodeHandoff(scratchpad.HandoffPacket{
+				AgentID:       *agent,
+				Worktree:      *wt,
+				Goal:          *goal,
+				TouchedFiles:  touched,
+				DeadEndsTried: deadEnds,
+				NextStep:      *nextStep,
+				UpdatedAt:     time.Now().UTC(),
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			key := scratchpad.HandoffKey(*wt)
+			if err := sp.Set(ctx, key, encoded, 30*time.Minute); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("✓ Stored structured handoff packet at %q\n", key)
+		case "get":
+			wt := "default"
+			if len(args) >= 3 {
+				wt = args[2]
+			}
+			val, ok := sp.Get(ctx, scratchpad.HandoffKey(wt))
+			if !ok {
+				fmt.Printf("No active handoff packet for worktree %q\n", wt)
+				return
+			}
+			fmt.Println(val)
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown handoff subcommand %q (expected set or get)\n", args[1])
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown scratchpad action: %q\n", action)
 		os.Exit(1)
