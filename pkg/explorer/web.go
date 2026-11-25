@@ -569,7 +569,7 @@ const embeddedExplorerHTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Coppermind — Local Brain Explorer</title>
+<title>Coppermind — Local Memory Explorer</title>
 <style>
   body { margin:0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#0d1117; color:#e6edf3; }
   header { padding:10px 18px; border-bottom:1px solid #30363d; display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
@@ -597,7 +597,7 @@ const embeddedExplorerHTML = `<!doctype html>
 </head>
 <body>
 <header>
-  <h1>🧠 Coppermind Brain Explorer</h1>
+  <h1>🧠 Coppermind Memory Explorer</h1>
   <div class="tabs">
     <button class="tab active" data-tab="search">Search</button>
     <button class="tab" data-tab="timeline">Timeline</button>

@@ -1,4 +1,8 @@
+# Coppermind (`bonjoski/coppermind`)
 
+> Local-first AI memory system that gives your coding agents persistent, searchable, tamper-evident memory across sessions—with zero cloud dependencies.
+
+- Core stack: Pure-Go SQLite WAL (Profile A) or optional PostgreSQL 17 + pgvector / Redis (Profile B), MCP STDIO/SSE server, hybrid vector/BM25 search, lightweight knowledge graph, working scratchpad, signed `.capsule` cartridges, and Stormcage prompt-injection/secret quarantine.
 
 ## Paved-Road Integration (`2026-11-22`: Mentor Capsules, PO Requirements & `BLPR-v1`)
 - Passive ideation mentor & PO requirements: `coppermind recall --lens mentor [--json]`, `coppermind requirements [--triggers ...] [--json]`, `coppermind distill`

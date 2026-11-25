@@ -574,7 +574,7 @@ func runUI(args []string) {
 		fmt.Fprintf(os.Stderr, "Failed starting local explorer: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "🧠 Coppermind Local Brain Explorer listening strictly on 127.0.0.1\n  • Open: %s\n  • Mode: read-only=%t (Ctrl+C to stop)\n",
+	fmt.Fprintf(os.Stderr, "🧠 Coppermind Local Memory Explorer listening strictly on 127.0.0.1\n  • Open: %s\n  • Mode: read-only=%t (Ctrl+C to stop)\n",
 		url, !*allowCurate)
 
 	sigCh := make(chan os.Signal, 1)

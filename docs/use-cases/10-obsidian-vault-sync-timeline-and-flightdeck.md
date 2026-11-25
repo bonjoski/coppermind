@@ -1,4 +1,4 @@
-# Use Case 10: Local Obsidian/ADR Vault Sync, Git-Tag Temporal Recall, Brain Explorer v2 & Flightdeck Post-Mortems
+# Use Case 10: Local Obsidian/ADR Vault Sync, Git-Tag Temporal Recall, Memory Explorer v2 & Flightdeck Post-Mortems
 
 > **Status:** Available in `coppermind v0.8.0+` (`RFC-2026-11-24-57`)  
 > **Scope:** 100% local, single-developer workstation DevEx — zero cloud sync, zero external API keys, read-only filesystem ingestion.
@@ -69,7 +69,7 @@ coppermind capsule merge --pubkey ./keys/ed25519.pub fabrial-arch.capsule
 
 ---
 
-## 4. Brain Explorer v2 (`coppermind ui` & `coppermind tui`)
+## 4. Memory Explorer v2 (`coppermind ui` & `coppermind tui`)
 
 Inspect memory clusters, walk supersession chains, browse your chronological episodic timeline, approve/reject `PROPOSED` learnings, and prune noisy chunks:
 
@@ -103,7 +103,7 @@ Convert failed shell/agent command traces paired with their recovery commands in
 coppermind ingest-flightdeck --repo coppermind ./flightdeck-trace.jsonl
 ```
 
-Traces are capped at `16 MiB`, refuse symlinks fail-closed, and pass every stderr/command payload through secret redaction and Stormcage cognitive threat quarantine before storage.
+Traces are capped at `16 MiB`, refuse symlinks fail-closed, and pass every stderr/command payload through secret redaction and Stormcage prompt-injection quarantine before storage.
 
 ---
 

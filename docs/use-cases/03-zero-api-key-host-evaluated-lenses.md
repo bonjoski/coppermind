@@ -1,4 +1,4 @@
-# Recipe: Zero-API-Key Host-Evaluated Cognitive Lenses
+# Recipe: Zero-API-Key Host-Evaluated Memory Lenses
 
 > **Use Case ID:** `COP-UC-03C`  
 > **Target Audience:** Individual Developers, Security Engineers, Systems Architects  
@@ -8,7 +8,7 @@
 
 ## 1. Problem Statement
 
-Traditional cognitive lenses require either a separate metered LLM API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`) or 4–16 GB of local RAM/VRAM running Ollama. Yet most developers are **already authenticated** to a frontier reasoning model inside Claude Code, Cursor, Gemini CLI, OpenAI Codex CLI, or VS Code Copilot through their existing subscription.
+Traditional memory lenses require either a separate metered LLM API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`) or 4–16 GB of local RAM/VRAM running Ollama. Yet most developers are **already authenticated** to a frontier reasoning model inside Claude Code, Cursor, Gemini CLI, OpenAI Codex CLI, or VS Code Copilot through their existing subscription.
 
 Coppermind's **Zero-API-Key Host-Evaluated Lenses** let your active AI coding session perform the lens reasoning directly while keeping **100% of security invariants deterministic inside Go**—with zero extra API keys, zero local Ollama overhead, and zero interactive MCP sampling modal popups.
 

@@ -66,7 +66,7 @@ Over MCP, your assistant calls `coppermind_recall` with `lens="mentor"` (which a
 
 Every `capsule import` runs through Coppermind's **Two-Gate Import Quarantine**:
 1. **Merkle Root + Ed25519 Signature Verification** (signed `.capsule` archives import cleanly as `TRUST_SIGNED_CAPSULE` without `--allow-unsigned`; unsigned drafts require `--allow-unsigned` and are tagged `TAINT_UNVERIFIED_DRAFT`).
-2. **Cognitive Firewall + Secret Quarantine** (NFKC + homoglyph smuggling scan, OWASP LLM01 injection defense, secret redaction/rejection, and `TIER_2_MENTOR_CAPSULE` authority lock).
+2. **Memory Firewall + Secret Quarantine** (NFKC + homoglyph smuggling scan, OWASP LLM01 injection defense, secret redaction/rejection, and `TIER_2_MENTOR_CAPSULE` authority lock).
 
 Both **Mentor** (`bonjoski-mentor-v1`) and **Requirements** (`bonjoski-requirements-v1`) manifests are supported:
 
@@ -121,7 +121,7 @@ This emits three validated JSON files inside `./distilled`:
 2. `<id>.abuse-case.json` — Validated `AbuseCaseCriterion` (`Given / When / Then` + allowlisted `verify_cmd`).
 3. `<id>.aegisbox-probe.json` — Custom probe stub (`probe_id`, `category`, `payload`, `expected_signal`, `fix_patch_hint`, `why_one_liner`) compatible with `aegisbox test --ai-safety --probes-file`.
 
-**Fail-Closed Quarantine Gate:** Every field (and raw markdown file) is scanned through Coppermind's cognitive firewall (OWASP LLM01, NFKC/homoglyph, HTML/XSS rejection), Shannon-entropy & credential regex secret quarantine, strict `verify_cmd` verb allowlisting, and RFC1918 (`10.*`, `192.168.*`, `172.16-31.*`) + private domain (`.corp`, `.internal`) leak detection—aborting fail-closed with zero canary bytes leaked.
+**Fail-Closed Quarantine Gate:** Every field (and raw markdown file) is scanned through Coppermind's memory firewall (OWASP LLM01, NFKC/homoglyph, HTML/XSS rejection), Shannon-entropy & credential regex secret quarantine, strict `verify_cmd` verb allowlisting, and RFC1918 (`10.*`, `192.168.*`, `172.16-31.*`) + private domain (`.corp`, `.internal`) leak detection—aborting fail-closed with zero canary bytes leaked.
 
 ---
 

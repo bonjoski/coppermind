@@ -4,16 +4,16 @@
 [![SLSA 2](https://slsa.dev/images/gh-badge-level2.svg)](https://slsa.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-> **Portable Cognitive AI Brain & Sovereign Agent Memory Runtime**  
-> *Zero-SaaS, MCP-native long-term episodic/semantic memory, hybrid vector retrieval, and fast working scratchpad for autonomous AI agents.*
+> **Local-First AI Memory System for Coding Agents**  
+> *A local-first AI memory system that gives your coding agents persistent, searchable, tamper-evident memory across sessions—with zero cloud dependencies.*
 
 ---
 
 ## Overview
 
-In Brandon Sanderson's *Mistborn*, Feruchemists store memories, mental speed, and knowledge inside copper metalminds—retrieving them with perfect fidelity.
+In Brandon Sanderson's *Mistborn*, Feruchemists store memories inside copper metalminds and tap them later with perfect fidelity.
 
-**Coppermind** is a self-sovereign, portable cognitive AI brain engineered as an **MCP-native daemon**. It solves the "amnesiac agent" crisis by giving autonomous AI coding agents (Claude Code, Cursor, Antigravity, OpenCode, Aider) a persistent, zero-dependency cognitive memory runtime that runs locally on developer workstations or scales into distributed team clusters.
+**Coppermind** is a local-first, self-sovereign **AI memory system** built as an **MCP-native daemon**. It solves the "amnesiac agent" problem by giving AI coding agents (Claude Code, Cursor, Antigravity, OpenCode, Aider) persistent, searchable, tamper-evident memory—combining SQLite/pgvector hybrid search, a lightweight knowledge graph, a fast working scratchpad, signed memory cartridges, and host-evaluated memory lenses—running 100% locally on developer workstations or in an optional self-hosted Docker stack.
 
 ```mermaid
 flowchart TD
@@ -24,10 +24,10 @@ flowchart TD
     subgraph CoppermindRuntime ["Coppermind MCP Core (Go 1.27+)"]
         MCP["MCP JSON-RPC 2.0 Engine<br/>(STDIO / SSE / UDS)"]
 
-        subgraph CognitiveTiers ["Cognitive Memory Hierarchy"]
+        subgraph MemoryTiers ["Multi-Tier Memory Hierarchy"]
             Working["Working Memory Tier<br/>(Fast In-Memory Scratchpad & Mutexes)"]
             Episodic["Episodic Memory Tier<br/>(Chronological Logs & Commit History)"]
-            Semantic["Semantic Memory Tier<br/>(128-dim Cosine Vector Search)"]
+            Semantic["Semantic Memory Tier<br/>(Hybrid Vector + BM25 Search & Knowledge Graph)"]
         end
 
         subgraph StorageCore ["Storage Engine"]
@@ -36,28 +36,28 @@ flowchart TD
     end
 
     Agents <-->|"MCP Tools (coppermind_*)"| MCP
-    MCP --> CognitiveTiers
-    CognitiveTiers --> StorageCore
+    MCP --> MemoryTiers
+    MemoryTiers --> StorageCore
 ```
 
 ---
 
 ## Core Capabilities
 
-1. **MCP-Native First**: Exposes standard Model Context Protocol tools (`coppermind_remember`, `coppermind_recall`, `coppermind_scratchpad`, `coppermind_dispatch_task`, `coppermind_status`) directly over STDIO, allowing instant mounting in any IDE agent configuration.
+1. **MCP-Native First**: Exposes standard Model Context Protocol tools (`coppermind_remember`, `coppermind_recall`, `coppermind_scratchpad`, `coppermind_dispatch_task`, `coppermind_status`, `coppermind_lens_prepare`/`submit`, `coppermind_consolidate_prepare`/`submit`) directly over STDIO, allowing instant mounting in any IDE agent configuration.
 2. **Zero Hop Tax & Sub-10ms Latency**: Connects over persistent STDIO or Unix Domain Sockets; eliminates intermediate CLI wrapper latency.
 3. **Multi-Agent Concurrency ($N=8$ Stress-Tested)**: Features a single-writer channel worker with SQLite Write-Ahead Logging (WAL mode), enabling 8+ parallel subagents to store, search, and lock memory without database collisions or lock timeouts.
-4. **Cognitive Security & Taint Defense**: Normalizes all inbound memories via NFKC Unicode decomposition and strips invisible zero-width characters (OWASP LLM01 indirect prompt injection defense).
+4. **Memory Firewall & Taint Defense**: Normalizes all inbound memories via NFKC Unicode decomposition and strips invisible zero-width characters (OWASP LLM01 indirect prompt injection defense).
 5. **Absolute Secret & Credential Quarantine**: Strict fail-closed defense scanning for private keys, AWS/OpenAI/Anthropic/GitHub API keys, and high-entropy tokens. Raw keys are rejected with typed security errors, and embedded tokens are redacted (`[REDACTED_*]`) before reaching SQLite or vector embeddings.
-6. **Asynchronous AMQP / RabbitMQ Task Engine**: Dispatches background cognitive workflows (`deep_reflect`, `summarize_session`, `defrag_memory`) onto an embedded topic bus or external RabbitMQ cluster (`COPPERMIND_RABBITMQ_URL`).
-7. **LiteLLM Model Router**: Autonomous reflection and synthesis engine with outbound API key scrubbing on upstream HTTP error frames.
-8. **Cognitive Lenses**: Asynchronous, event-driven analytical personas (`red-team`, `security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`, `devils-advocate`) that subscribe to bus events, evaluate memories across cognitive tiers, and synthesize structured observations back into project vaults without recursive loops.
+6. **Asynchronous AMQP / RabbitMQ Task Engine**: Dispatches background memory workflows (`deep_reflect`, `summarize_session`, `defrag_memory`) onto an embedded topic bus or external RabbitMQ cluster (`COPPERMIND_RABBITMQ_URL`).
+7. **LiteLLM Model Router**: Optional upstream reflection and synthesis router with outbound API key scrubbing on upstream HTTP error frames.
+8. **Memory Lenses**: Event-driven and zero-API-key host-evaluated analytical personas (`red-team`, `security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`, `devils-advocate`) that evaluate stored memories and code diffs and persist structured observations back into project vaults without recursive loops.
 
 ---
 
-## 🔍 Cognitive Lenses Subsystem
+## 🔍 Memory Lenses Subsystem
 
-Cognitive Lenses provide continuous analytical evaluation of project memories via configurable personas:
+Memory Lenses provide continuous analytical evaluation of project memories via configurable personas:
 
 * **`red-team`**: Aggressively attacks code, configurations, and sandbox policies from an adversary's mindset; identifies concrete exploit vectors, sandbox escapes (Seatbelt/Landlock/seccomp), TOCTOU symlink races, parameter injections, and token replay.
 * **`security-architect`**: Audits code diffs, command executions, and configuration changes for OWASP vulnerabilities, credential exposure, unsafe syscalls, and privilege escalation vectors.
@@ -69,7 +69,7 @@ Cognitive Lenses provide continuous analytical evaluation of project memories vi
 ### Key Architectural Invariants
 * **Zero-Cost Pre-Filter Gates**: Fast regex/AST matching (e.g. scanning for `exec`, `syscall`, `unsafe`, credentials) skips 85%+ of candidate memories before invoking LLMs, preserving local VRAM and CPU.
 * **OWASP LLM01 Prompt Injection Defense**: Candidate memories and code diffs are fenced inside `<untrusted_artifact id="...">...</untrusted_artifact>` tags with strict system directives instructing the model to treat contents strictly as data, never directives.
-* **Loop Prevention (`derived=true`)**: Lenses write observations with `derived=true`. The brain manager and topic bus guarantee that derived records never emit `ingest.*` or `episodic.*` events, making recursive trigger cascades structurally impossible.
+* **Loop Prevention (`derived=true`)**: Lenses write observations with `derived=true`. The memory manager and topic bus guarantee that derived records never emit `ingest.*` or `episodic.*` events, making recursive trigger cascades structurally impossible.
 * **Deterministic Deduplication**: Computes `SHA256(project + ":" + lens_name + ":" + target_hash + ":" + summary)` to skip duplicate observations and eliminate alert fatigue.
 * **Append-Only Authority**: Lenses create observations and resolve existing observations from the same lens; they can never alter or delete canonical memories.
 
@@ -105,10 +105,10 @@ coppermind dispatch reflect --lens devils-advocate --since 24h
 # Recall memories and filter strictly to observations from a specific lens
 coppermind recall --lens security-architect "command execution"
 
-# Recall canonical memories with linked cognitive lens observations automatically attached (default)
+# Recall canonical memories with linked memory lens observations automatically attached (default)
 coppermind recall --include-observations "sandbox configuration"
 
-# Inspect and resolve open cognitive lens observations
+# Inspect and resolve open memory lens observations
 coppermind observations --status open --min-severity high
 coppermind observations --resolve <observation-id>
 
@@ -121,7 +121,7 @@ In MCP:
 * `coppermind_recall` accepts optional `lens` (string filter), `include_observations` (bool, default `true`), `session_id` (string), and `emit_receipt` (bool).
 * **Zero-API-Key Host-Evaluated Lenses & MCP Prompts**: Coppermind advertises `capabilities.prompts` (`prompts/list` & `prompts/get` exposing `/coppermind:security-audit`, `/coppermind:systems-audit`, and `/coppermind:drift-audit`) plus `coppermind_lens_prepare` and `coppermind_lens_submit`. Your active IDE AI subscription evaluates fenced `<untrusted_artifact>` bundles with zero extra API keys or Ollama RAM, while Coppermind deterministically enforces HMAC-SHA256 single-use `eval_token` validation, NFKC/secret quarantine, `EnforcePoCGate`, SHA-256 deduplication, `TIER_3_DERIVED` storage, and optional `BLPR-v1` receipts.
 * **BLPR-v1 Ideation Receipts**: When `FABRIAL_RECEIPT_DIR` is set and `emit_receipt: true` is passed to `coppermind_recall` (especially with `lens="mentor"` or `lens="requirements"`), Coppermind atomically writes a `BLPR-v1` DSSE / in-toto Statement v1 receipt (`producer.tool: "coppermind"`, `producer.stage: "ideation"`, `claims: {lens, results_count, open_high_observations}`) via `os.OpenRoot` (`O_NOFOLLOW`, `0600`), signs it via `LOCKSMITH_SOCKET` (`action: "sign_dsse"`) when reachable, and links `CONJOINER_SIR_ID` into `parent_receipts` / `claims`. Symlinked receipt directories fail closed (`exit_code: 10`).
-* **UB-MCP-v1 Structured Errors**: Quarantine, cognitive firewall, validation, and receipt policy denials return MCP `CallToolResult` (`isError: true`) with ANSI-sanitized calm `<=3`-line text in `content[0].text` and machine-readable `structuredContent` conforming to `ub-mcp-v1-error.schema.json` (`schema_version: "ub-cli-v2"`, `tool: "coppermind"`, `exit_code: 10`).
+* **UB-MCP-v1 Structured Errors**: Quarantine, memory firewall, validation, and receipt policy denials return MCP `CallToolResult` (`isError: true`) with ANSI-sanitized calm `<=3`-line text in `content[0].text` and machine-readable `structuredContent` conforming to `ub-mcp-v1-error.schema.json` (`schema_version: "ub-cli-v2"`, `tool: "coppermind"`, `exit_code: 10`).
 * `coppermind_dispatch_task` accepts `task="reflect"` with optional `lens` argument.
 * On `coppermind mcp` startup, the active project's scratchpad is automatically seeded with the top 3 unresolved `high`/`critical` observations.
 
@@ -176,7 +176,7 @@ coppermind vacuum
 # Run 10-pillar diagnostic inspection
 coppermind doctor
 
-# Brain health and metrics
+# Memory system health and metrics
 coppermind status
 ```
 
@@ -188,7 +188,7 @@ Every primary developer use case is backed by dedicated, copy-pasteable recipes 
 
 | Use Case | Scenario & Quick Recipe | Full Guide |
 | :--- | :--- | :--- |
-| **Cross-Session Cognitive Memory & Retrieval** | Store and query architectural facts via hybrid vector search:<br/>`coppermind remember` && `coppermind recall "<query>"` | [Guide](docs/use-cases/01-cross-session-memory.md) |
+| **Cross-Session Persistent Memory & Retrieval** | Store and query architectural facts via hybrid vector search:<br/>`coppermind remember` && `coppermind recall "<query>"` | [Guide](docs/use-cases/01-cross-session-memory.md) |
 | **Security Mentor Capsules for AI & Web Apps** | Zero-config 18 embedded v1.0 mentor cards (`<= 120`-token passive nudges out of the box), plus Ed25519 capsule signing and lesson distillation:<br/>`coppermind recall --lens mentor "RAG prompt"`<br/>`coppermind capsule keygen --out ./keys && coppermind capsule sign --in capsules/ai-app-and-rag-safety.mentor.json --key ./keys/ed25519.key`<br/>`coppermind distill --from-file lesson-to-capsule.md --out-dir ./distilled` | [Guide](docs/use-cases/02-security-mentor-capsules-for-ai-apps.md) |
 | **Product Owner Abuse-Case Acceptance Criteria** | Generate `<= 3` jargon-free `Given / When / Then` safety acceptance criteria (`<= 180` tokens, ephemeral) from a user story or 5-Q triggers:<br/>`coppermind requirements --story "AI refund assistant" --triggers ai_rag_context,ai_state_mutation` | [Guide](docs/use-cases/03-product-owner-abuse-case-criteria.md) |
 | **Automated Git Post-Commit Reflection** | Ingest commit diffs and flag architectural drifts automatically:<br/>`coppermind hook install` && `coppermind observations` | [Guide](docs/use-cases/02-git-hook-reflection.md) |
@@ -199,8 +199,8 @@ Every primary developer use case is backed by dedicated, copy-pasteable recipes 
 | **Pure-Go Static Neural Recall & Temporal Filtering** | Install offline `CMVEC1` embeddings, reindex in micro-batches, and run temporal recall with `--explain`:<br/>`coppermind models pull sovereign-dev-256 && coppermind reindex-vectors && coppermind recall --since 7d --explain "<query>"` | [Guide](docs/use-cases/06-static-neural-recall-and-reranking.md) |
 | **Knowledge Graph Impact & Incremental AST Indexing** | AST-chunk Go/Markdown incrementally without Merkle breaks and trace file impact:<br/>`coppermind index . && coppermind graph impact pkg/mcp/server.go` | [Guide](docs/use-cases/07-knowledge-graph-and-ast-indexing.md) |
 | **`<8ms` Context Briefs, MCP Resources & Zero-Key Sleep Cycle** | Compile `<=800`-token workspace briefs, manage pending commit inbox, and consolidate episodic trails:<br/>`coppermind brief && coppermind inbox list` + `/coppermind:consolidate` | [Guide](docs/use-cases/08-context-brief-inbox-and-sleep-cycle.md) |
-| **Mergeable Cartridges & Local Brain Explorer (`tui`/`ui`)** | Export/merge selective Ed25519 `.capsule` v2 packs and inspect your brain locally on `127.0.0.1`:<br/>`coppermind capsule export --repo fabrial --tier TIER_1_ARCHITECTURE --out pack.capsule && coppermind capsule inspect pack.capsule && coppermind ui` | [Guide](docs/use-cases/09-mergeable-cartridges-and-brain-explorer.md) |
-| **Obsidian/ADR Vault Watcher, Git-Tag Recall & Flightdeck Post-Mortems** | Read-only hash-incremental Markdown/Obsidian `[[wikilink]]` sync, `--since v0.5.0` git-tag recall, Brain Explorer v2 timeline/lineage, and Flightdeck trace ingestion:<br/>`coppermind --project personal watch --once ~/Obsidian && coppermind recall --since v0.7.0 "<q>" && coppermind ingest-flightdeck trace.jsonl` | [Guide](docs/use-cases/10-obsidian-vault-sync-timeline-and-flightdeck.md) |
+| **Mergeable Cartridges & Local Memory Explorer (`tui`/`ui`)** | Export/merge selective Ed25519 `.capsule` v2 packs and inspect your memory vault locally on `127.0.0.1`:<br/>`coppermind capsule export --repo fabrial --tier TIER_1_ARCHITECTURE --out pack.capsule && coppermind capsule inspect pack.capsule && coppermind ui` | [Guide](docs/use-cases/09-mergeable-cartridges-and-brain-explorer.md) |
+| **Obsidian/ADR Vault Watcher, Git-Tag Recall & Flightdeck Post-Mortems** | Read-only hash-incremental Markdown/Obsidian `[[wikilink]]` sync, `--since v0.5.0` git-tag recall, Memory Explorer v2 timeline/lineage, and Flightdeck trace ingestion:<br/>`coppermind --project personal watch --once ~/Obsidian && coppermind recall --since v0.7.0 "<q>" && coppermind ingest-flightdeck trace.jsonl` | [Guide](docs/use-cases/10-obsidian-vault-sync-timeline-and-flightdeck.md) |
 
 ---
 
@@ -352,7 +352,7 @@ Configure your AI agent to mount Coppermind using either Profile A (local zero-d
 
 ## Ecosystem Integration
 
-Coppermind operates as the persistent memory and cognitive runtime tier within the `bonjoski` sovereign AI agent security ecosystem, integrating natively alongside:
+Coppermind operates as the persistent AI memory system within the `bonjoski` sovereign AI agent security ecosystem, integrating natively alongside:
 * [**`bonjoski/fabrial`**](https://github.com/bonjoski/fabrial): Unified security fabric and dynamic multi-tier agent router.
 * [**`bonjoski/airlock`**](https://github.com/bonjoski/airlock): Sub-15ms kernel-enforced sandbox for AI agents and build tools.
 * [**`bonjoski/locksmith`**](https://github.com/bonjoski/locksmith): Hardware biometric secrets vault and MCP credential manager.

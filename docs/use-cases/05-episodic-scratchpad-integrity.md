@@ -8,7 +8,7 @@
 
 ## 1. Problem Statement
 
-In concurrent multi-agent architectures ($N=8$ parallel subagents), untrusted external workers (e.g. web searchers, documentation scrapers, or third-party pull request reviewers) generate observations that are saved to shared memory or working scratchpads. Malicious actors leverage this path to poison cognitive memory:
+In concurrent multi-agent architectures ($N=8$ parallel subagents), untrusted external workers (e.g. web searchers, documentation scrapers, or third-party pull request reviewers) generate observations that are saved to shared memory or working scratchpads. Malicious actors leverage this path to poison persistent agent memory:
 1. **Tool Reflection Smuggling:** Adversaries inject synthetic XML tags (`</untrusted_artifact><tool_call>...`) into scraped issues or documentation to trick the coordinator LLM into executing unauthorized commands upon recall.
 2. **Memory Poisoning (OWASP LLM01):** Untrusted subagents write unverified claims that overwrite canonical architecture decisions.
 3. **Attribution Forgery:** Rogue subagents forge author attribution to elevate their epistemic authority tier.
@@ -33,7 +33,7 @@ flowchart TD
     Val --> SigCheck["1. Ed25519 Author Signature Verification<br/>(Validates caller identity against public key)"]
     SigCheck --> SecretScan["2. Secret &amp; Credential Redaction<br/>(Fail-closed on private keys; redacts API tokens)"]
     SecretScan --> XMLDefang["3. XML Tool Reflection Defanging<br/>(Strips &lt;tool_call&gt;, &lt;tool_response&gt;, &lt;/untrusted_artifact&gt;)"]
-    XMLDefang --> ThreatScan["4. Cognitive Firewall Threat Inspection<br/>(OWASP LLM01 Prompt Injection &amp; Jailbreak Detection)"]
+    XMLDefang --> ThreatScan["4. Memory Firewall Threat Inspection<br/>(OWASP LLM01 Prompt Injection &amp; Jailbreak Detection)"]
     
     ThreatScan --> Decision{"Provenance &amp; Taint Check"}
     Decision -->|Local Trusted Workspace &amp; Taint &lt; 0.5| Canonical["✅ Active Canonical Memory Index<br/>(Tier 1-3, ACTIVE Consensus, Vector Space)"]
@@ -123,6 +123,6 @@ git diff origin/main...pr-branch | coppermind hook verify-diff --stdin --provena
 
 ## 5. Security Invariants & Guarantees
 
-1. **Fail-Closed Cognitive Rejection:** Critical prompt injections (e.g. `IGNORE ALL PREVIOUS INSTRUCTIONS`) originating from untrusted web or external users fail-closed immediately with `ErrPromptInjectionRejected`.
+1. **Fail-Closed Injection Rejection:** Critical prompt injections (e.g. `IGNORE ALL PREVIOUS INSTRUCTIONS`) originating from untrusted web or external users fail-closed immediately with `ErrPromptInjectionRejected`.
 2. **Defanged Tool Reflection:** Synthetic XML execution tags (`<tool_call>`, `<tool_response>`, `<call_tool>`, `<function_call>`, etc.) are stripped and replaced with whitespace before vector embedding, neutralizing prompt framing escapes.
 3. **Observation Partition Isolation:** Untrusted external observations are automatically relegated to the `quarantined_observations` partition with `PROPOSED` lifecycle status and `TIER_4_SCRATCHPAD` authority, preventing poisoning of the canonical vector space.

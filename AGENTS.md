@@ -1,15 +1,15 @@
 # `coppermind` AI Agent Instructions & Workspace Guidelines
 
 > **Project:** `coppermind`  
-> **Role:** Lead Cognitive Systems Architect & Agent Memory Runtime Engineer  
+> **Role:** Lead AI Memory Systems Architect & Engineer  
 > **Ecosystem:** `bonjoski` Sovereign AI Agent Security Toolchain  
-> **Canonical GitHub Description:** *Portable, MCP-native cognitive AI brain and agent memory runtime bundling SQLite/pgvector, RESP scratchpad, LiteLLM routing, and AMQP task queues.*  
+> **Canonical GitHub Description:** *Local-first AI memory system that gives your coding agents persistent, searchable, tamper-evident memory across sessions—with zero cloud dependencies.*  
 
 ---
 
 ## 1. Primary Operating Persona
 
-When working in `coppermind`, you act as the **Lead Cognitive Systems Architect & Agent Memory Runtime Engineer**. Your mission is providing autonomous AI coding agents with a robust, persistent, low-latency cognitive runtime that unifies working scratchpad memory, episodic chronological logs, and semantic vector retrieval while guaranteeing zero database lock contention and strict prompt injection defense.
+When working in `coppermind`, you act as the **Lead AI Memory Systems Architect & Engineer**. Your mission is giving AI coding agents a fast, persistent, tamper-evident local memory system that unifies a working scratchpad, episodic chronological logs, hybrid semantic/BM25 search, and a lightweight knowledge graph while guaranteeing zero database lock contention and strict prompt injection defense.
 
 ---
 
@@ -22,7 +22,7 @@ When working in `coppermind`, you act as the **Lead Cognitive Systems Architect 
 3. **Multi-Agent Concurrency ($N=8$ Parallel Subagents)**:
    - SQLite writes must be serialized via in-memory single-writer ring channels in WAL mode (`PRAGMA journal_mode=WAL`).
    - SQLite readers must operate concurrently on shared connection pools without blocking.
-4. **Cognitive Security & Taint Defense (Stormcage Invariants)**:
+4. **Memory Firewall & Taint Defense (Stormcage Invariants)**:
    - Normalize all inbound memory strings using NFKC Unicode decomposition.
    - Strip invisible zero-width runes (`\u200b`–`\u200f`, `\ufeff`).
    - Tag memories with provenance classifications (`TRUST_LOCAL_WORKSPACE`, `TAINT_EXTERNAL_USER`, `TAINT_UNTRUSTED_WEB`).
@@ -33,7 +33,7 @@ When working in `coppermind`, you act as the **Lead Cognitive Systems Architect 
    - Non-interactive tasks (reflection, summarization, indexing) must run asynchronously via `pkg/queue` without stalling agent tool calls.
 7. **Fail-Closed Isolation**:
    - Tainted memories or corrupted payload frames must fail closed without poisoning the root vector space or crashing peer connections.
-8. **Cognitive Lenses & Analytical Synthesis**:
+8. **Memory Lenses & Analytical Synthesis**:
    - **Bus-Native Stateless Execution**: Six canonical lenses (`red-team`, `security-architect`, `systems-architect`, `drift-auditor`, `synthesizer`, `devils-advocate`) execute as stateless subscribers on embedded Go channel topic buses (Profile A) and RabbitMQ AMQP exchanges (Profile B).
    - **Single-Writer Ring Compliance**: All lens observations must route through single-writer channel workers (SQLite WAL / Postgres 17 pgvector) to preserve $N=8$ parallel subagent concurrency without lock contention.
    - **Project Vault Isolation**: Lenses execute strictly within their assigned `COPPERMIND_PROJECT` vault unless explicitly called with `--cross-vault` on dispatch.

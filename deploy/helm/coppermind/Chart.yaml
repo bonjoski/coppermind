@@ -1,12 +1,13 @@
 apiVersion: v2
 name: coppermind
-description: Portable Cognitive AI Brain & Sovereign Agent Memory Runtime (Profile B Cluster Appliance)
+description: Local-first AI memory system for coding agents (Profile B Self-Hosted Stack)
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
 keywords:
   - ai-memory
-  - cognitive-brain
+  - agent-memory
+  - memory-system
   - mcp
   - pgvector
   - postgresql

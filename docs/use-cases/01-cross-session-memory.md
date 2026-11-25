@@ -1,4 +1,4 @@
-# Recipe: Cross-Session Cognitive Memory & Retrieval
+# Recipe: Cross-Session Persistent Memory & Retrieval
 
 > **Use Case ID:** `COP-UC-01`  
 > **Target Audience:** Developers, Agent Builders, Knowledge Engineers  
@@ -14,7 +14,7 @@ Autonomous coding agents (Cursor, Claude Code, Antigravity) are stateless: every
 
 ## 2. When to Use This
 
-Use **Coppermind Cognitive Memory** to give agents persistent, project-scoped memory. Coppermind runs locally, embedding facts into an in-process SQLite database. Agents recall past context using semantic queries (`coppermind recall`) or persist new discoveries (`coppermind remember`).
+Use **Coppermind** to give agents persistent, project-scoped memory. Coppermind runs locally, embedding facts into an in-process SQLite database. Agents recall past context using semantic queries (`coppermind recall`) or persist new discoveries (`coppermind remember`).
 
 ---
 

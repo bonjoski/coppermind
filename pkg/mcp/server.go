@@ -198,7 +198,7 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 	tools := []ToolDef{
 		{
 			Name:        "coppermind_remember",
-			Description: "Persist an architectural invariant, decision, pattern, or finding into the cognitive brain.",
+			Description: "Persist an architectural invariant, decision, pattern, or finding into long-term agent memory.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
@@ -217,7 +217,7 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_recall",
-			Description: "Perform semantic and hybrid search over stored memories in a project vault, optionally filtering by cognitive lens (including lens='mentor' for passive security nudges and lens='requirements' for ephemeral PO abuse-case acceptance criteria) or auto-attaching observations.",
+			Description: "Perform semantic and hybrid search over stored memories in a project vault, optionally filtering by memory lens (including lens='mentor' for passive security nudges and lens='requirements' for ephemeral PO abuse-case acceptance criteria) or auto-attaching observations.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
@@ -227,11 +227,11 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"session_id": { "type": "string", "description": "Optional session filter." },
 					"limit": { "type": "integer", "description": "Max results to return (default 5; hard ceiling 2 for lens='mentor', 3 for lens='requirements')." },
 					"min_score": { "type": "number", "description": "Minimum similarity score threshold (default 0.0)." },
-					"lens": { "type": "string", "description": "Optional cognitive lens filter (e.g. mentor, requirements, security-architect, systems-architect, drift-auditor, synthesizer)." },
+					"lens": { "type": "string", "description": "Optional memory lens filter (e.g. mentor, requirements, security-architect, systems-architect, drift-auditor, synthesizer)." },
 					"detected_sdks": { "type": "array", "items": { "type": "string" }, "description": "Optional detected SDK/framework hints when lens='mentor' (e.g. ['openai', 'mcp', 'pgvector'])." },
 					"triggers": { "type": "array", "items": { "type": "string" }, "description": "Optional 5-Q blast-radius trigger flags when lens='requirements' (auth_data_money, ai_rag_context, ai_state_mutation, supply_chain_mcp, secrets_pii)." },
 					"include_why": { "type": "boolean", "description": "When lens='requirements', include plain-English 1-sentence business impact and optional kata link (default false)." },
-					"include_observations": { "type": "boolean", "description": "Whether to auto-attach linked cognitive lens observations to recalled memories (default true)." },
+					"include_observations": { "type": "boolean", "description": "Whether to auto-attach linked memory lens observations to recalled memories (default true)." },
 					"include_superseded": { "type": "boolean", "description": "Whether to include superseded historical memories in results (default false)." },
 					"tier": { "type": "string", "description": "Optional authority tier filter (e.g. TIER_1_ARCHITECTURE)." },
 					"since": { "type": "string", "description": "Optional lower temporal bound (e.g. 24h, 7d, 30d, YYYY-MM-DD, RFC3339)." },
@@ -271,7 +271,7 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_status",
-			Description: "Inspect cognitive brain metrics, memory counts, and scratchpad state.",
+			Description: "Inspect AI memory system health, record counts, and scratchpad state.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {}
@@ -279,11 +279,11 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_dispatch_task",
-			Description: "Dispatch an asynchronous cognitive workflow onto the RabbitMQ/AMQP message bus (e.g. session reflection, memory defragmentation, or analytical lens reflection).",
+			Description: "Dispatch an asynchronous memory workflow onto the RabbitMQ/AMQP message bus (e.g. session reflection, memory defragmentation, or analytical lens reflection).",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
-					"task_type": { "type": "string", "enum": ["summarize_session", "deep_reflect", "defrag_memory", "reflect"], "description": "Type of cognitive task to execute in the background." },
+					"task_type": { "type": "string", "enum": ["summarize_session", "deep_reflect", "defrag_memory", "reflect"], "description": "Type of memory task to execute in the background." },
 					"session_id": { "type": "string", "description": "Target session/worktree identifier." },
 					"payload": { "type": "object", "description": "Optional arbitrary JSON parameters for the task (e.g. {'lens': 'security-architect'})." }
 				},
@@ -292,11 +292,11 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 		},
 		{
 			Name:        "coppermind_lens_prepare",
-			Description: "Prepare a zero-API-key host-evaluated cognitive lens prompt bundle with AST/regex pre-filtering, secret redaction, sibling-endpoint & ADR recall, XML <untrusted_artifact> fencing, and a single-use HMAC-SHA256 eval_token.",
+			Description: "Prepare a zero-API-key host-evaluated memory lens prompt bundle with AST/regex pre-filtering, secret redaction, sibling-endpoint & ADR recall, XML <untrusted_artifact> fencing, and a single-use HMAC-SHA256 eval_token.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
-					"lens": { "type": "string", "enum": ["security-architect", "systems-architect", "drift-auditor", "synthesizer", "red-team", "devils-advocate"], "description": "Cognitive lens persona to prepare." },
+					"lens": { "type": "string", "enum": ["security-architect", "systems-architect", "drift-auditor", "synthesizer", "red-team", "devils-advocate"], "description": "Memory lens persona to prepare." },
 					"target_id": { "type": "string", "description": "Existing Coppermind memory node ID to inspect." },
 					"content": { "type": "string", "description": "Inline candidate code or artifact content to inspect (bounded to 6,000 chars and secret-redacted)." },
 					"file_path": { "type": "string", "description": "Optional workspace file path for differential sibling-endpoint retrieval." },
@@ -419,7 +419,7 @@ func classifyCoppermindError(toolName string, err error) *ToolCallResult {
 			Code:           "COPPERMIND_FIREWALL_DENY",
 			ExitCode:       ExitCodePolicyDeny,
 			Retryable:      false,
-			Summary:        "Paused memory write: untrusted input triggered the cognitive firewall.",
+			Summary:        "Paused memory write: untrusted input triggered the memory firewall.",
 			RemediationCmd: "coppermind recall --category quarantined_observations",
 			Why:            "Untrusted content containing prompt-injection or delimiter-smuggling directives is blocked to preserve memory integrity.",
 			References:     []string{"https://github.com/bonjoski/coppermind/blob/main/docs/use-cases/05-episodic-scratchpad-integrity.md"},
@@ -1067,10 +1067,10 @@ func (s *Server) callStatus(ctx context.Context) (*ToolCallResult, error) {
 	}
 
 	status := fmt.Sprintf(
-		"Coppermind Cognitive Brain Status:\n"+
+		"Coppermind Memory Status:\n"+
 			"• Total Stored Memories: %d\n"+
 			"• Active Scratchpad Keys: %d\n"+
-			"• Cognitive Task Worker: %s\n"+
+			"• Background Task Worker: %s\n"+
 			"• Uptime: %s\n"+
 			"• Protocol: MCP JSON-RPC 2.0 (STDIO / SSE)\n"+
 			"• Storage Engine: Pure-Go SQLite WAL Mode + L2 Cosine Vector Index",

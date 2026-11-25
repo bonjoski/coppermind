@@ -163,7 +163,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`Coppermind — Portable Cognitive AI Brain & Agent Memory Runtime
+	fmt.Println(`Coppermind — Local-First AI Memory System for Coding Agents
 
 Usage:
   coppermind <command> [arguments]
@@ -174,11 +174,11 @@ Commands:
   remember     Store an architectural fact, decision, or runbook into memory
   recall       Perform semantic or hybrid similarity search over stored memories
   scratchpad   Interact with fast in-memory working state (get, set, keys)
-  dispatch     Enqueue an asynchronous cognitive task onto the message bus
+  dispatch     Enqueue an asynchronous memory task onto the message bus
   seed         Ingest markdown files or directories into memory
   index        Scan, chunk, and index a codebase repository into semantic memory
-  export       Export the brain into a portable, verified capsule archive
-  import       Restore a brain from a capsule archive with path traversal checks
+  export       Export the memory vault into a portable, verified capsule archive
+  import       Restore a memory vault from a capsule archive with path traversal checks
   capsule      Manage Mentor Capsules & mergeable .capsule v2 cartridges (keygen, sign, pack, export, inspect, merge, import, list, verify)
   requirements Generate <=3 sprint-ready Given/When/Then abuse-case acceptance criteria (ephemeral)
   distill      Distill a sanitized post-mortem lesson into MentorCard, AbuseCaseCriterion, and Aegisbox probe JSON
@@ -188,8 +188,8 @@ Commands:
   brief        Compile a <8ms, <=800-token deterministic workspace context brief
   inbox        Inspect or dismiss zero-API-key pending commit lens review tickets
   consolidate  Prepare or submit sleep-cycle episodic memory consolidation bundles
-  tui          Launch zero-dependency terminal Brain Explorer (search, graph, timeline, lineage, inbox, verify)
-  ui           Launch strictly 127.0.0.1 token-gated local Web Brain Explorer (--allow-curate optional)
+  tui          Launch zero-dependency terminal Memory Explorer (search, graph, timeline, lineage, inbox, verify)
+  ui           Launch strictly 127.0.0.1 token-gated local Web Memory Explorer (--allow-curate optional)
   watch        Read-only hash-incremental Markdown / Obsidian / ADR vault watcher (--once, --interval)
   ingest-flightdeck Ingest Flightdeck JSONL traces into linked dead_end -> troubleshooting memories
   verify       Audit cryptographic Merkle chain integrity for a session
@@ -198,10 +198,10 @@ Commands:
   config       Display or update persistent configuration (provider, model, endpoint)
   doctor       Execute the 11-pillar diagnostic inspection suite
   hook         Manage Git episodic capture and Stormcage diff integrity hooks (install, uninstall, status, check, verify-diff)
-  observations List, filter, and resolve cognitive lens observations (alias: obs)
+  observations List, filter, and resolve memory lens observations (alias: obs)
   proposals    Review, approve, or reject quarantined memory proposals
   radar        Synchronize or inspect industry standards and threat intelligence feeds
-  status       Display brain health metrics and stored memory counts
+  status       Display memory system health metrics and stored memory counts
   version      Print version information
 
 Flags for mcp/daemon:
@@ -587,7 +587,7 @@ func runRecall(args []string) {
 	hybrid := fs.Bool("hybrid", true, "Use hybrid FTS5 BM25 + vector RRF search (default true)")
 	lensName := fs.String("lens", "", "Filter recall to observations from a specific lens (e.g. mentor, security-architect, systems-architect)")
 	sdkHints := fs.String("sdk", "", "Optional comma-separated SDK hints for --lens mentor (e.g. openai,mcp,pgvector)")
-	includeObs := fs.Bool("include-observations", true, "Auto-attach linked cognitive lens observations to primary recalled memories")
+	includeObs := fs.Bool("include-observations", true, "Auto-attach linked memory lens observations to primary recalled memories")
 	includeSuperseded := fs.Bool("include-superseded", false, "Include superseded historical memories in query results")
 	tier := fs.String("tier", "", "Filter by specific authority tier (e.g. TIER_1_ARCHITECTURE)")
 	since := fs.String("since", "", "Optional lower temporal bound (e.g. 24h, 7d, 30d, YYYY-MM-DD, RFC3339)")
@@ -960,7 +960,7 @@ func runDispatch(args []string) {
 		}
 		defer cw.Stop()
 
-		fmt.Printf("Executing Cognitive Lens reflection (--lens %s, --since %s, limit=%d) in vault %q...\n", *lensName, *sinceStr, *limit, activeProj)
+		fmt.Printf("Executing Memory Lens reflection (--lens %s, --since %s, limit=%d) in vault %q...\n", *lensName, *sinceStr, *limit, activeProj)
 		res, err := engine.Reflect(ctx, lenses.ReflectRequest{
 			Lens:       *lensName,
 			Since:      sinceDur,
@@ -1119,7 +1119,7 @@ func runExport(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ Successfully exported brain capsule to %s\n", *outPath)
+	fmt.Printf("✓ Successfully exported memory capsule to %s\n", *outPath)
 	fmt.Printf("• Total Records: %d\n", manifest.TotalRecords)
 	fmt.Printf("• SHA-256 Checksum: %s\n", manifest.DBChecksum)
 }
@@ -1144,7 +1144,7 @@ func runImport(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ Successfully restored brain capsule from %s\n", capsulePath)
+	fmt.Printf("✓ Successfully restored memory capsule from %s\n", capsulePath)
 	fmt.Printf("• Restored Records: %d\n", manifest.TotalRecords)
 	fmt.Printf("• Verified Checksum: %s\n", manifest.DBChecksum)
 }
@@ -1304,7 +1304,7 @@ func runDoctor(args []string) {
 
 	fmt.Println()
 	if allPassed && !hasWarnings {
-		fmt.Println("🎉 All Coppermind health pillars PASSED! Cognitive brain is healthy and operating within SLAs.")
+		fmt.Println("🎉 All Coppermind health pillars PASSED! Memory system is healthy and operating within SLAs.")
 	} else if allPassed && hasWarnings {
 		fmt.Println("⚠️ Diagnostic warnings detected. Operational, but some cluster services are offline or unconfigured.")
 	} else {
@@ -1642,7 +1642,7 @@ func runStatus(args []string) {
 	}
 
 	profile := getProfile()
-	fmt.Println("Coppermind Brain Status:")
+	fmt.Println("Coppermind Memory Status:")
 	fmt.Printf("• Runtime Profile: Profile %s\n", strings.ToUpper(profile[:1])+profile[1:])
 	fmt.Printf("• Active Project Vault: %s\n", activeProj)
 	if profile == "cluster" {

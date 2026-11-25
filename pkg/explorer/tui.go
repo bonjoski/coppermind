@@ -181,7 +181,7 @@ func (t *TUI) curateProposal(ctx context.Context, id, newStatus, newTier string)
 func (t *TUI) renderHeader(ctx context.Context) {
 	cnt, _ := t.mgr.Count(ctx, "")
 	fmt.Fprintf(t.out, "╔══════════════════════════════════════════════════════════════════╗\n")
-	fmt.Fprintf(t.out, "║  🧠 Coppermind Brain Explorer TUI (%4d memories | %s)\n", cnt, t.mgr.EmbedderModelName())
+	fmt.Fprintf(t.out, "║  🧠 Coppermind Memory Explorer TUI (%4d memories | %s)\n", cnt, t.mgr.EmbedderModelName())
 	fmt.Fprintf(t.out, "║  [1] search  [2] graph  [3] inbox  [4] health  [5] timeline  [q] quit\n")
 	fmt.Fprintf(t.out, "╚══════════════════════════════════════════════════════════════════╝\n")
 }
@@ -194,7 +194,7 @@ func (t *TUI) renderHelp() {
 	fmt.Fprintln(t.out, "  lineage <memory_id>    Walk supersession ancestors and audit rationale")
 	fmt.Fprintln(t.out, "  proposals              List PROPOSED learnings awaiting approval")
 	fmt.Fprintln(t.out, "  inbox                  Show open observations, PROPOSED learnings & pending tickets")
-	fmt.Fprintln(t.out, "  resolve <obs_id>       Mark a cognitive lens observation resolved")
+	fmt.Fprintln(t.out, "  resolve <obs_id>       Mark a memory lens observation resolved")
 	fmt.Fprintln(t.out, "  approve <proposal_id>  Promote a PROPOSED learning to TIER_1_ARCHITECTURE")
 	fmt.Fprintln(t.out, "  reject <proposal_id>   Reject a PROPOSED learning")
 	fmt.Fprintln(t.out, "  delete <memory_id>     Delete a noisy chunk (refuses TIER_0_SOVEREIGN fail-closed)")

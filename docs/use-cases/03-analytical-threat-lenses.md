@@ -2,7 +2,7 @@
 
 > **Use Case ID:** `COP-UC-03`  
 > **Target Audience:** Systems Architects, Red Team Operators, Product Owners  
-> **Platform Engine:** Cognitive Analytical Lenses Engine  
+> **Platform Engine:** Memory Analytical Lenses Engine  
 
 ---
 
@@ -14,7 +14,7 @@ Engineering teams evaluating complex architecture proposals or RFCs often suffer
 
 ## 2. When to Use This
 
-Use **Coppermind Threat Lenses** to stress-test raw ideas, RFC documents, or PR descriptions before writing code. Coppermind runs automated multi-persona cognitive evaluations:
+Use **Coppermind Threat Lenses** to stress-test raw ideas, RFC documents, or PR descriptions before writing code. Coppermind runs automated multi-persona analytical evaluations:
 - **`devils-advocate`**: Interrogates unstated assumptions and fragility.
 - **`security-architect`**: Authors STRIDE threat models and privilege boundary checks.
 - **`red-team-operator` (*Shardbreaker*)**: Mounts offensive exploit synthesis, generating attack trees and sandbox escape PoCs.
@@ -58,7 +58,7 @@ coppermind radar --lenses security-architect,red-team-operator --file ./docs/pro
 ### Step 2: Review Findings and Attack Trees
 Expected output:
 ```text
-🔍 Coppermind Cognitive Lens Report:
+🔍 Coppermind Memory Lens Report:
 [Lens: Security Architect]
   • STRIDE (Elevation of Privilege): Flagged potential TOCTOU race in /tmp file creation.
   • Compliance: Safe Harbor verified (100% local, no enterprise cloud control plane).
