@@ -153,7 +153,6 @@ func initSchema(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_memory_session ON memory_nodes(session_id);
 	CREATE INDEX IF NOT EXISTS idx_memory_category ON memory_nodes(category);
 	CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory_nodes(created_at);
-	CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_nodes(scope);
 
 	CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 		id UNINDEXED,

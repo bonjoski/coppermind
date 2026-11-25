@@ -10,6 +10,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/lenses"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
@@ -21,6 +22,7 @@ type IngestCommitResult struct {
 	CommitSHA      string   `json:"commit_sha"`
 	RepoName       string   `json:"repo_name"`
 	BranchName     string   `json:"branch_name"`
+	Scope          string   `json:"scope,omitempty"`
 	MemoryID       string   `json:"memory_id"`
 	Provenance     string   `json:"provenance"`
 	TicketsQueued  int      `json:"tickets_queued"`
@@ -109,8 +111,15 @@ func IngestCommit(ctx context.Context, mgr *brain.Manager, repoRoot string, lens
 		content += "\nDiff excerpt:\n" + sanitizedDiff
 	}
 
+	// Resolve hierarchical scope from COPPERMIND_SCOPE or repo-confined .coppermind.yaml (fail-closed on malformed manifest)
+	resolvedScope, scErr := scope.Resolve("", repoRoot, repoRoot)
+	if scErr != nil {
+		return nil, fmt.Errorf("failed resolving commit scope for %s: %w", repoRoot, scErr)
+	}
+
 	node, err := mgr.Remember(ctx, brain.RememberRequest{
 		SessionID:      repoName,
+		Scope:          resolvedScope,
 		Category:       "git_commit",
 		Content:        content,
 		Provenance:     prov,
@@ -130,6 +139,7 @@ func IngestCommit(ctx context.Context, mgr *brain.Manager, repoRoot string, lens
 		CommitSHA:  commitSHA,
 		RepoName:   repoName,
 		BranchName: branchName,
+		Scope:      node.Scope,
 		MemoryID:   node.ID,
 		Provenance: string(prov),
 	}

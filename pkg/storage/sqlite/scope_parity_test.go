@@ -2,11 +2,14 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
@@ -249,5 +252,69 @@ func TestScopedMultiAgentConcurrencyN8(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Fatalf("N=8 concurrent scoped operation failed: %v", err)
+	}
+}
+
+func TestLegacyPreV09DatabaseMigratesScopeColumnCleanly(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "legacy_v08.db")
+
+	// Simulate a pre-v0.9.0 SQLite database whose memory_nodes table lacks the `scope` column.
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed opening raw legacy sqlite db: %v", err)
+	}
+	legacyDDL := `
+	CREATE TABLE memory_nodes (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL,
+		category TEXT NOT NULL,
+		content TEXT NOT NULL,
+		vector_blob BLOB,
+		provenance TEXT NOT NULL,
+		taint_score REAL NOT NULL DEFAULT 0.0,
+		metadata_json TEXT,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		prev_hash TEXT NOT NULL DEFAULT '',
+		hash TEXT NOT NULL DEFAULT ''
+	);
+	INSERT INTO memory_nodes (id, session_id, category, content, provenance, created_at, updated_at)
+	VALUES ('legacy-1', 'legacy-sess', 'architecture', 'Legacy global rule before v0.9', 'TRUST_LOCAL_WORKSPACE', 1000, 1000);
+	`
+	if _, err := rawDB.Exec(legacyDDL); err != nil {
+		rawDB.Close()
+		t.Fatalf("failed seeding legacy v0.8 schema: %v", err)
+	}
+	rawDB.Close()
+
+	// Opening with v0.9+ NewSQLiteStore MUST migrate cleanly without "no such column: scope".
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed to migrate pre-v0.9 database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	mgr := brain.NewManager(store, embedding.NewLocalHashEmbedder(128), scratchpad.NewMemoryScratchpad())
+	defer mgr.Close()
+
+	// Verify scoped writes and ancestor recall work alongside migrated legacy global rows.
+	if _, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:  "v09-sess",
+		Scope:      "bonjoski/airlock",
+		Category:   "architecture",
+		Content:    "Airlock child rule: Seatbelt deny rules come after allow rules.",
+		Provenance: brain.ProvenanceLocalWorkspace,
+	}); err != nil {
+		t.Fatalf("scoped Remember after legacy migration failed: %v", err)
+	}
+
+	scopes, err := store.ListScopes(ctx)
+	if err != nil {
+		t.Fatalf("ListScopes after legacy migration failed: %v", err)
+	}
+	if len(scopes) != 2 {
+		t.Fatalf("expected 2 scopes ('' and 'bonjoski/airlock'), got %d: %+v", len(scopes), scopes)
 	}
 }

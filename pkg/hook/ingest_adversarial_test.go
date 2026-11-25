@@ -76,3 +76,63 @@ func TestAdversarial_CommitMessageShellInjectionAndPendingInbox(t *testing.T) {
 		t.Fatalf("ResolvePendingTicket failed: %v", err)
 	}
 }
+
+func TestIngestCommitResolvesCoppermindYamlScopeAndFailsClosed(t *testing.T) {
+	t.Setenv("COPPERMIND_SCOPE", "")
+	repoDir := t.TempDir()
+
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester",
+			"GIT_AUTHOR_EMAIL=tester@example.com",
+			"GIT_COMMITTER_NAME=Tester",
+			"GIT_COMMITTER_EMAIL=tester@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+	}
+
+	run("init")
+	if err := os.WriteFile(filepath.Join(repoDir, ".coppermind.yaml"), []byte("scope: bonjoski/airlock\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".coppermind.yaml", "main.go")
+	run("commit", "--no-gpg-sign", "-m", "feat: add initial airlock entry")
+
+	store, err := sqlite.NewSQLiteStore(filepath.Join(t.TempDir(), "hook_scope.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mgr := brain.NewManager(store, embedding.NewLocalHashEmbedder(128), scratchpad.NewMemoryScratchpad())
+	defer mgr.Close()
+
+	ctx := context.Background()
+	res, err := IngestCommit(ctx, mgr, repoDir, lenses.DefaultConfig())
+	if err != nil {
+		t.Fatalf("IngestCommit with valid .coppermind.yaml failed: %v", err)
+	}
+	if res.Scope != "bonjoski/airlock" {
+		t.Fatalf("expected commit memory scope 'bonjoski/airlock', got %q", res.Scope)
+	}
+	stored, err := store.GetByID(ctx, res.MemoryID)
+	if err != nil || stored.Scope != "bonjoski/airlock" {
+		t.Fatalf("stored commit node scope mismatch: node=%+v err=%v", stored, err)
+	}
+
+	// Malformed .coppermind.yaml must fail closed rather than falling open to global scope.
+	if err := os.WriteFile(filepath.Join(repoDir, ".coppermind.yaml"), []byte("scope: ../../escape\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := IngestCommit(ctx, mgr, repoDir, lenses.DefaultConfig()); err == nil {
+		t.Fatalf("SECURITY VIOLATION: IngestCommit fell open on invalid .coppermind.yaml scope")
+	}
+}

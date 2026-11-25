@@ -1,0 +1,7 @@
+scope: bonjoski/coppermind
+paths:
+  pkg/storage: bonjoski/coppermind/storage
+  pkg/scope: bonjoski/coppermind/scope
+  pkg/mcp: bonjoski/coppermind/mcp
+  pkg/lenses: bonjoski/coppermind/lenses
+  pkg/capsule: bonjoski/coppermind/capsule
