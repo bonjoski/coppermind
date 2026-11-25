@@ -180,6 +180,55 @@ coppermind doctor
 coppermind status
 ```
 
+### 🗂️ Projects vs. Hierarchical Scopes
+
+Coppermind separates **hard isolation** from **layered inheritance**:
+
+- **Projects (`--project`) are flat, isolated vaults** (e.g., `github` vs `personal` — separate databases, 0% sharing). You do **not** create child projects.
+- **Scopes (`--scope`) form a slash-delimited hierarchy *inside* a single project vault** (`<parent>/<child>/<grandchild>`, e.g., `platform` → `platform/payments` → `platform/payments/webhooks`).
+- **No `create` command is needed:** a child scope is created implicitly the first time you store a memory with `--scope` or declare it in `.coppermind.yaml`.
+
+#### Scope Path Syntax
+- Lowercase ASCII segments separated by `/`: `^[a-z0-9][a-z0-9._-]{0,31}$` (max 32 chars/segment, max depth `8`, max length `128` bytes).
+- Leading/trailing `/`, `//`, `.`, `..`, spaces, wildcards (`*`, `%`), and non-ASCII characters are rejected fail-closed.
+
+#### Binding a Child Repo with `.coppermind.yaml` (Recommended)
+Commit a `.coppermind.yaml` at the root of each child repository so CLI commands, git hooks, and MCP calls auto-resolve the scope:
+
+```yaml
+scope: platform/payments
+
+# Optional: map subdirectories to deeper child or sibling scopes
+paths:
+  services/webhooks: platform/payments/webhooks
+  docs/runbooks: platform/runbooks
+```
+
+> **Strict Allowlist:** Only `scope` and `paths` are permitted keys in `.coppermind.yaml` (unknown keys like `project:` fail closed). Symlinks and files over `16 KiB` are rejected.
+
+#### CLI & Inheritance Quickstart
+```bash
+# 1. Write org/platform-wide guidance into the parent scope
+coppermind --project acme remember --scope platform --category architecture \
+  "All HTTP services must propagate X-Request-ID."
+
+# 2. Write component-specific guidance into a child scope
+coppermind --project acme remember --scope platform/payments/webhooks --category convention \
+  "Verify Stripe-Signature over raw unparsed bytes before JSON decoding."
+
+# 3. Recall from the child scope (default --scope-mode: ancestors)
+#    Inherits vault-global + platform + platform/payments + exact; excludes sibling scopes
+coppermind --project acme recall --scope platform/payments/webhooks "request logging and signatures"
+
+# 4. Inspect existing scopes and inheritance chains
+coppermind --project acme scope list
+coppermind --project acme scope show platform/payments/webhooks
+```
+
+- **Resolution Precedence:** `--scope` flag (or MCP `scope`) → `COPPERMIND_SCOPE` env var → nearest `.coppermind.yaml` inside the git repo root → `""` (vault-global).
+- **Recall Modes (`--scope-mode`):** `ancestors` *(default)*, `exact`, `subtree` *(target + descendants)*, `lineage` *(ancestors + descendants)*, `all`.
+- See the full guide: [**Use Case 11: Hierarchical Platform Scopes**](docs/use-cases/11-hierarchical-platform-scopes.md).
+
 ---
 
 ## 💡 Core Use Cases & Recipes

@@ -15,6 +15,8 @@ Coppermind project vaults (`--project github`, `--project personal`) enforce str
 
 Hierarchical Scopes solve this inside a single project vault with zero extra database handles, zero wrapper hop tax, and native knowledge-graph links across levels.
 
+> **Important (`--project` vs. `--scope`):** Projects (`--project`) are flat, isolated vaults—there is no "child project" or `scope create` command. Child scopes are slash-delimited paths (`<parent>/<child>/<grandchild>`, lowercase `^[a-z0-9][a-z0-9._-]{0,31}$`, max depth `8`, max `128` bytes) created implicitly on first write or declared in a repo-root `.coppermind.yaml`.
+
 ---
 
 ## Quickstart Workflow
