@@ -3,8 +3,10 @@ package hook
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -14,6 +16,80 @@ import (
 	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
+
+var nonScopeSegCharRe = regexp.MustCompile(`[^a-z0-9._-]+`)
+
+// IsEphemeralTempRepo reports whether repoRoot resides inside an OS temporary directory
+// (e.g., os.TempDir(), /tmp, /private/tmp, /var/folders, /private/var/folders) so live
+// git post-commit hooks never pollute persistent user vaults with go test t.TempDir() fixtures.
+func IsEphemeralTempRepo(repoRoot string) bool {
+	trimmed := strings.TrimSpace(repoRoot)
+	if trimmed == "" {
+		return false
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		return false
+	}
+	candidates := []string{filepath.Clean(abs)}
+	if resolved, rErr := filepath.EvalSymlinks(abs); rErr == nil {
+		candidates = append(candidates, filepath.Clean(resolved))
+	}
+
+	tempRoots := []string{
+		filepath.Clean(os.TempDir()),
+		"/tmp",
+		"/private/tmp",
+		"/var/folders",
+		"/private/var/folders",
+	}
+	if resolvedTmp, err := filepath.EvalSymlinks(os.TempDir()); err == nil {
+		tempRoots = append(tempRoots, filepath.Clean(resolvedTmp))
+	}
+
+	for _, c := range candidates {
+		cSlash := filepath.ToSlash(c)
+		for _, root := range tempRoots {
+			if root == "" || root == "." || root == "/" {
+				continue
+			}
+			rSlash := strings.TrimSuffix(filepath.ToSlash(root), "/")
+			if cSlash == rSlash || strings.HasPrefix(cSlash, rSlash+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// resolveHookScope strictly binds git hook ingestion to the repository's own .coppermind.yaml
+// (never allowing ambient COPPERMIND_SCOPE env vars to escalate commit diffs into org/ancestor scopes).
+// Repositories without a .coppermind.yaml isolate under "unscoped/<repo>" instead of vault-global "".
+func resolveHookScope(repoRoot, repoName string) (string, error) {
+	resolvedScope, err := scope.ResolveFromDir(repoRoot, repoRoot)
+	if err != nil {
+		return "", err
+	}
+	if resolvedScope != "" {
+		return resolvedScope, nil
+	}
+
+	seg := strings.ToLower(strings.TrimSpace(repoName))
+	seg = nonScopeSegCharRe.ReplaceAllString(seg, "-")
+	seg = strings.TrimLeft(seg, "._-")
+	if len(seg) > scope.MaxSegmentLength {
+		seg = seg[:scope.MaxSegmentLength]
+	}
+	if seg == "" {
+		seg = "unknown"
+	}
+	candidate := "unscoped/" + seg
+	norm, nErr := scope.Normalize(candidate)
+	if nErr != nil {
+		return "unscoped/unknown", nil
+	}
+	return norm, nil
+}
 
 const maxCommitDiffBytes = 4096
 
@@ -111,8 +187,9 @@ func IngestCommit(ctx context.Context, mgr *brain.Manager, repoRoot string, lens
 		content += "\nDiff excerpt:\n" + sanitizedDiff
 	}
 
-	// Resolve hierarchical scope from COPPERMIND_SCOPE or repo-confined .coppermind.yaml (fail-closed on malformed manifest)
-	resolvedScope, scErr := scope.Resolve("", repoRoot, repoRoot)
+	// Strictly resolve hierarchical scope from repo-confined .coppermind.yaml (ignores ambient
+	// COPPERMIND_SCOPE env vars to prevent scope escalation; unscoped repos isolate to unscoped/<repo>).
+	resolvedScope, scErr := resolveHookScope(repoRoot, repoName)
 	if scErr != nil {
 		return nil, fmt.Errorf("failed resolving commit scope for %s: %w", repoRoot, scErr)
 	}

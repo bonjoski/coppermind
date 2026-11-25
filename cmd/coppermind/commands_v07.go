@@ -356,6 +356,20 @@ func runConsolidate(args []string) {
 }
 
 func runHookIngestCommit(repoRoot string, dataDir, project string, jsonOut bool) {
+	// Skip ephemeral OS temp repositories (e.g., go test t.TempDir() fixtures) so live vaults stay clean.
+	checkRoot := strings.TrimSpace(repoRoot)
+	if checkRoot == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			checkRoot = cwd
+		}
+	}
+	if hook.IsEphemeralTempRepo(checkRoot) {
+		if jsonOut {
+			fmt.Println(`{"skipped":true,"reason":"ephemeral_temp_repo"}`)
+		}
+		return
+	}
+
 	mgr, _, err := initManager(dataDir, project)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
