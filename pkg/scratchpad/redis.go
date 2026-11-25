@@ -158,6 +158,60 @@ func (r *RedisScratchpad) Set(_ context.Context, key string, val string, ttl tim
 	return err
 }
 
+// redisCASLua atomically checks current value against expected (treating missing key as "")
+// and updates with optional EX TTL in a single Redis/Dragonfly server-side execution.
+const redisCASLua = `
+local cur = redis.call('GET', KEYS[1])
+if cur == false then cur = '' end
+if cur ~= ARGV[1] then return 0 end
+local ttl = tonumber(ARGV[3])
+if ttl and ttl > 0 then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ttl)
+else
+  redis.call('SET', KEYS[1], ARGV[2])
+end
+return 1
+`
+
+// Compile-time check that RedisScratchpad supports atomic CompareAndSwap handoffs.
+var _ CASScratchpad = (*RedisScratchpad)(nil)
+
+// CompareAndSwap atomically updates key in Redis/Dragonfly via Lua EVAL only if its current
+// value matches expectedVal (empty expectedVal matches missing or empty key).
+// Enforces full secret sanitization, XML delimiter defanging, and prompt-injection checks fail-closed.
+func (r *RedisScratchpad) CompareAndSwap(_ context.Context, key, expectedVal, newVal string, ttl time.Duration) (bool, error) {
+	secRes, err := security.SanitizeMemory(newVal)
+	if err != nil {
+		return false, fmt.Errorf("scratchpad CAS rejected: %w", err)
+	}
+	newVal = secRes.SanitizedText
+	newVal, _ = security.SanitizeXMLDelimiters(newVal)
+
+	if threatRes, err := security.InspectCognitiveThreats(newVal); err == nil && threatRes != nil && threatRes.IsCritical {
+		return false, fmt.Errorf("scratchpad CAS rejected: %w: %s", security.ErrPromptInjectionRejected, strings.Join(threatRes.Flags, ", "))
+	}
+
+	seconds := 0
+	if ttl > 0 {
+		seconds = int(ttl.Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	resp, err := r.execute("EVAL", redisCASLua, "1", key, expectedVal, newVal, strconv.Itoa(seconds))
+	if err != nil {
+		return false, err
+	}
+	if n, ok := resp.(int64); ok {
+		return n == 1, nil
+	}
+	return false, fmt.Errorf("unexpected Redis EVAL response: %T (%v)", resp, resp)
+}
+
 // Delete removes a key from Redis.
 func (r *RedisScratchpad) Delete(_ context.Context, key string) error {
 	r.mu.Lock()
@@ -167,7 +221,16 @@ func (r *RedisScratchpad) Delete(_ context.Context, key string) error {
 	return err
 }
 
-// AcquireLock implements distributed mutex locking via Redis SET NX EX.
+// redisUnlockLua atomically releases a distributed lock ONLY if the caller still owns the token,
+// preventing an expired lock holder from deleting another agent's newly acquired lock.
+const redisUnlockLua = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`
+
+// AcquireLock implements distributed mutex locking via Redis SET NX EX with token-verified Lua unlock.
 func (r *RedisScratchpad) AcquireLock(_ context.Context, lockName string, ttl time.Duration) (func(), error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -195,7 +258,7 @@ func (r *RedisScratchpad) AcquireLock(_ context.Context, lockName string, ttl ti
 	unlock := func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		_, _ = r.execute("DEL", "lock:"+lockName)
+		_, _ = r.execute("EVAL", redisUnlockLua, "1", "lock:"+lockName, token)
 	}
 
 	return unlock, nil

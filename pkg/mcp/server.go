@@ -22,6 +22,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/security"
+	"github.com/bonjoski/coppermind/pkg/storage"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 	"github.com/bonjoski/coppermind/pkg/version"
 	"github.com/bonjoski/coppermind/pkg/worker"
@@ -757,14 +758,14 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *Too
 
 	var createdAfter, createdBefore *time.Time
 	if strings.TrimSpace(input.Since) != "" {
-		t, pErr := brain.ParseTemporalBound(input.Since, time.Now().UTC())
+		t, pErr := brain.ResolveTemporalBound(input.Since, "", time.Now().UTC())
 		if pErr != nil {
 			return nil, fmt.Errorf("validation failed: %w", pErr)
 		}
 		createdAfter = &t
 	}
 	if strings.TrimSpace(input.Before) != "" {
-		t, pErr := brain.ParseTemporalBound(input.Before, time.Now().UTC())
+		t, pErr := brain.ResolveTemporalBound(input.Before, "", time.Now().UTC())
 		if pErr != nil {
 			return nil, fmt.Errorf("validation failed: %w", pErr)
 		}
@@ -1273,8 +1274,8 @@ func (s *Server) prepareLensBundle(ctx context.Context, input lensPrepareInput, 
 
 	targetID := strings.TrimSpace(input.TargetID)
 	if input.FromInbox && targetID == "" && strings.TrimSpace(input.Content) == "" {
-		if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok {
-			tkt, pErr := sqlStore.PeekOldestPendingTicket(ctx, lensName)
+		if inboxStore, ok := mgr.Store().(storage.InboxStore); ok {
+			tkt, pErr := inboxStore.PeekOldestPendingTicket(ctx, lensName)
 			if pErr != nil {
 				return nil, pErr
 			}
@@ -1441,8 +1442,8 @@ func (s *Server) callLensSubmit(ctx context.Context, args json.RawMessage, meta 
 
 	// Atomically close any matching pending inbox ticket for (lens, target_id)
 	if claims.TargetID != "" {
-		if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok {
-			_ = sqlStore.ResolvePendingTicketsByMemory(ctx, claims.LensName, claims.TargetID)
+		if inboxStore, ok := mgr.Store().(storage.InboxStore); ok {
+			_ = inboxStore.ResolvePendingTicketsByMemory(ctx, claims.LensName, claims.TargetID)
 		}
 	}
 

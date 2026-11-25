@@ -17,9 +17,11 @@ import (
 	"github.com/bonjoski/coppermind/pkg/capsule"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/explorer"
+	"github.com/bonjoski/coppermind/pkg/flightdeck"
 	"github.com/bonjoski/coppermind/pkg/hook"
 	"github.com/bonjoski/coppermind/pkg/lenses"
-	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/storage"
+	"github.com/bonjoski/coppermind/pkg/watcher"
 )
 
 func runModels(args []string) {
@@ -47,8 +49,8 @@ func runModels(args []string) {
 		for _, m := range embedding.KnownModels {
 			fmt.Printf("  • %-18s (dim=%d) — %s\n", m.Alias, m.Dimension, m.Description)
 		}
-		if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok {
-			if cov, err := sqlStore.GetVectorCoverage(context.Background(), mgr.EmbedderModelName()); err == nil {
+		if vecStore, ok := mgr.Store().(storage.VectorAdminStore); ok {
+			if cov, err := vecStore.GetVectorCoverage(context.Background(), mgr.EmbedderModelName()); err == nil {
 				fmt.Printf("\nVault %q Vector Coverage: %d/%d matching active model\n", activeProj, cov.MatchingNodes, cov.TotalNodes)
 				for model, cnt := range cov.ByModel {
 					fmt.Printf("  • %-24s %d nodes\n", model, cnt)
@@ -98,13 +100,13 @@ func runReindexVectors(args []string) {
 	}
 	defer mgr.Close()
 
-	sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore)
+	vecStore, ok := mgr.Store().(storage.VectorAdminStore)
 	if !ok {
-		fmt.Fprintln(os.Stderr, "Error: reindex-vectors is currently supported on SQLite Profile A vaults")
+		fmt.Fprintln(os.Stderr, "Error: active storage backend does not support vector reindexing")
 		os.Exit(1)
 	}
 
-	stats, err := sqlStore.ReindexVectors(context.Background(), mgr.Embedder(), mgr.EmbedderModelName(), *batchSize, *dryRun)
+	stats, err := vecStore.ReindexVectors(context.Background(), mgr.Embedder(), mgr.EmbedderModelName(), *batchSize, *dryRun)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reindexing vectors: %v\n", err)
 		os.Exit(1)
@@ -145,15 +147,15 @@ func runGraph(args []string) {
 	}
 	defer mgr.Close()
 
-	sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore)
+	graphStore, ok := mgr.Store().(storage.GraphStore)
 	if !ok {
-		fmt.Fprintln(os.Stderr, "Error: graph inspection requires SQLite backend")
+		fmt.Fprintln(os.Stderr, "Error: active storage backend does not support graph inspection")
 		os.Exit(1)
 	}
 
 	switch action {
 	case "impact":
-		nodes, err := sqlStore.ImpactForFile(context.Background(), target, *limit)
+		nodes, err := graphStore.ImpactForFile(context.Background(), target, *limit)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -167,7 +169,7 @@ func runGraph(args []string) {
 			fmt.Printf("%d. %s [%s | %s] %s\n", i+1, n.ID, n.AuthorityTier, n.Category, snippet)
 		}
 	case "neighbors":
-		edges, err := sqlStore.GetEdgesForNode(context.Background(), target)
+		edges, err := graphStore.GetEdgesForNode(context.Background(), target)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -183,7 +185,7 @@ func runGraph(args []string) {
 			}
 			fmt.Printf("  • %s --[%s]--> %s (w=%.2f)\n", e.SourceID, e.Relation, dest, e.Weight)
 		}
-		neighbors, _ := sqlStore.ExpandGraphNeighbors(context.Background(), []string{target}, *hops, brain.MemoryFilter{Limit: *limit})
+		neighbors, _ := graphStore.ExpandGraphNeighbors(context.Background(), []string{target}, *hops, brain.MemoryFilter{Limit: *limit})
 		if len(neighbors) > 0 {
 			fmt.Printf("\nExpanded Neighbors (hops=%d, %d nodes):\n", *hops, len(neighbors))
 			for i, r := range neighbors {
@@ -258,15 +260,15 @@ func runInbox(args []string) {
 	}
 	defer mgr.Close()
 
-	sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore)
+	inboxStore, ok := mgr.Store().(storage.InboxStore)
 	if !ok {
-		fmt.Fprintln(os.Stderr, "Error: inbox requires SQLite backend")
+		fmt.Fprintln(os.Stderr, "Error: active storage backend does not support pending lens inbox")
 		os.Exit(1)
 	}
 
 	switch action {
 	case "list", "ls":
-		tickets, err := sqlStore.ListPendingTickets(context.Background(), *lensName, *status, *limit)
+		tickets, err := inboxStore.ListPendingTickets(context.Background(), *lensName, *status, *limit)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error listing inbox: %v\n", err)
 			os.Exit(1)
@@ -284,7 +286,7 @@ func runInbox(args []string) {
 			fmt.Fprintln(os.Stderr, "Usage: coppermind inbox dismiss <ticket_id>")
 			os.Exit(1)
 		}
-		if err := sqlStore.ResolvePendingTicket(context.Background(), fs.Arg(0), "dismissed"); err != nil {
+		if err := inboxStore.ResolvePendingTicket(context.Background(), fs.Arg(0), "dismissed"); err != nil {
 			fmt.Fprintf(os.Stderr, "Error dismissing ticket: %v\n", err)
 			os.Exit(1)
 		}
@@ -392,9 +394,9 @@ func runCapsuleCartridgePack(args []string) {
 	}
 	defer mgr.Close()
 
-	sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore)
+	capStore, ok := mgr.Store().(storage.CartridgeStore)
 	if !ok {
-		fmt.Fprintln(os.Stderr, "Error: pack-memories requires SQLite backend")
+		fmt.Fprintln(os.Stderr, "Error: active storage backend does not support cartridge export")
 		os.Exit(1)
 	}
 
@@ -405,7 +407,7 @@ func runCapsuleCartridgePack(args []string) {
 		Tier:     *tier,
 	}
 	if strings.TrimSpace(*since) != "" {
-		t, pErr := brain.ParseTemporalBound(*since, time.Now().UTC())
+		t, pErr := brain.ResolveTemporalBound(*since, "", time.Now().UTC())
 		if pErr != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", pErr)
 			os.Exit(1)
@@ -421,7 +423,7 @@ func runCapsuleCartridgePack(args []string) {
 		opts.PrivateKey = priv
 	}
 
-	manifest, err := capsule.ExportCartridge(context.Background(), sqlStore, *outPath, opts)
+	manifest, err := capsule.ExportCartridge(context.Background(), capStore, *outPath, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error exporting cartridge: %v\n", err)
 		os.Exit(1)
@@ -471,6 +473,57 @@ func runCapsuleCartridgeMerge(args []string) {
 	}
 	fmt.Printf("✓ Merged cartridge %q into vault %q (signed=%t)\n  • Imported: %d | Deduplicated: %d | Quarantined: %d | Edges: %d\n",
 		res.Manifest.Name, activeProj, res.SignedVerified, res.ImportedCount, res.DeduplicatedSkip, res.QuarantinedSkip, res.EdgesRestored)
+}
+
+func runCapsuleCartridgeInspect(args []string) {
+	fs := flag.NewFlagSet("capsule inspect", flag.ExitOnError)
+	pubKeySpec := fs.String("pubkey", "", "Optional Ed25519 public key file or hex to verify signature against")
+	asJSON := fs.Bool("json", false, "Emit inspection report as JSON")
+	_ = fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: coppermind capsule inspect [--pubkey <ed25519.pub|hex>] [--json] <file.capsule>")
+		os.Exit(1)
+	}
+	inPath := fs.Arg(0)
+
+	var pub ed25519.PublicKey
+	if strings.TrimSpace(*pubKeySpec) != "" {
+		p, pErr := capsule.LoadEd25519PublicKey(*pubKeySpec)
+		if pErr != nil {
+			fmt.Fprintf(os.Stderr, "Error loading public key: %v\n", pErr)
+			os.Exit(1)
+		}
+		pub = p
+	}
+
+	res, err := capsule.InspectCartridge(inPath, pub)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cartridge inspection FAILED (fail-closed): %v\n", err)
+		os.Exit(1)
+	}
+	if *asJSON {
+		out, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(out))
+		return
+	}
+	fmt.Printf("✓ Cartridge %q (%s)\n", res.Manifest.Name, res.Manifest.SchemaVersion)
+	fmt.Printf("  • Records:   %d | Edges: %d\n", res.Manifest.RecordCount, res.EdgeCount)
+	fmt.Printf("  • Merkle:    %s (valid=%t)\n", res.Manifest.MerkleRoot, res.MerkleValid)
+	fmt.Printf("  • Signature: signed=%t verified=%t\n", res.Signed, res.SignatureValid)
+	if res.Manifest.FilterRepo != "" || res.Manifest.FilterTier != "" || res.Manifest.FilterCat != "" {
+		fmt.Printf("  • Filters:   repo=%q tier=%q category=%q\n", res.Manifest.FilterRepo, res.Manifest.FilterTier, res.Manifest.FilterCat)
+	}
+	if len(res.SampleRecords) > 0 {
+		fmt.Printf("  • Sample Previews (%d):\n", len(res.SampleRecords))
+		for i, rec := range res.SampleRecords {
+			snippet := strings.Join(strings.Fields(rec.Content), " ")
+			if len(snippet) > 100 {
+				snippet = snippet[:97] + "..."
+			}
+			fmt.Printf("    %d. [%s | %s] %s\n", i+1, rec.AuthorityTier, rec.Category, snippet)
+		}
+	}
 }
 
 func runTUI(args []string) {
@@ -530,4 +583,109 @@ func runUI(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = ws.Close(ctx)
+}
+
+func runWatch(args []string) {
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Project vault (e.g. personal)")
+	category := fs.String("category", "note", "Category assigned to synced Markdown notes")
+	interval := fs.Duration("interval", watcher.DefaultPollInterval, "Hash-incremental scan interval (e.g. 5s)")
+	once := fs.Bool("once", false, "Run a single read-only sync pass and exit")
+	asJSON := fs.Bool("json", false, "Emit sync stats as JSON")
+	_ = fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: coppermind watch [--once] [--interval 5s] [--project personal] [--category note] <vault_dir>")
+		os.Exit(1)
+	}
+	rootDir := fs.Arg(0)
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	opts := watcher.Options{
+		Category: *category,
+		Interval: *interval,
+	}
+
+	printStats := func(s *watcher.SyncStats, sErr error) {
+		if sErr != nil {
+			fmt.Fprintf(os.Stderr, "Vault sync error: %v\n", sErr)
+			return
+		}
+		if *asJSON {
+			b, _ := json.MarshalIndent(s, "", "  ")
+			fmt.Println(string(b))
+			return
+		}
+		fmt.Printf("✓ Synced read-only vault %q -> project %q (session=%s) in %s\n  • Scanned: %d | Indexed: %d | Unchanged: %d | Pruned: %d | Wikilinks: %d | Quarantined: %d | SymlinksSkipped: %d\n",
+			s.VaultName, activeProj, s.SessionID, s.Duration.Round(time.Millisecond),
+			s.ScannedFiles, s.IndexedFiles, s.SkippedUnchanged, s.PrunedFiles, s.WikilinksExtracted, s.QuarantinedFiles, s.SymlinksSkipped)
+	}
+
+	if *once {
+		stats, err := watcher.SyncVaultOnce(context.Background(), mgr, rootDir, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Vault sync failed: %v\n", err)
+			os.Exit(1)
+		}
+		printStats(stats, nil)
+		return
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Fprintf(os.Stderr, "👁  Watching read-only Markdown/Obsidian vault %q into project %q every %s (Ctrl+C to stop)\n", rootDir, activeProj, opts.Interval)
+	if err := watcher.WatchVault(ctx, mgr, rootDir, opts, func(s *watcher.SyncStats, sErr error) {
+		if sErr != nil || (s != nil && (s.IndexedFiles > 0 || s.PrunedFiles > 0 || s.QuarantinedFiles > 0)) {
+			printStats(s, sErr)
+		}
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Watcher exited with error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runIngestFlightdeck(args []string) {
+	fs := flag.NewFlagSet("ingest-flightdeck", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Project vault")
+	session := fs.String("session", "flightdeck", "Target session ID")
+	repo := fs.String("repo", "", "Optional git_repo metadata override")
+	asJSON := fs.Bool("json", false, "Emit ingestion report as JSON")
+	_ = fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: coppermind ingest-flightdeck [--project <vault>] [--repo <name>] [--json] <trace.jsonl>")
+		os.Exit(1)
+	}
+	tracePath := fs.Arg(0)
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	res, err := flightdeck.IngestTrace(context.Background(), mgr, tracePath, flightdeck.IngestOptions{
+		SessionID: *session,
+		RepoName:  *repo,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Flightdeck ingestion failed (fail-closed): %v\n", err)
+		os.Exit(1)
+	}
+	if *asJSON {
+		b, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+	fmt.Printf("✓ Ingested Flightdeck trace into vault %q\n  • Events: %d | Failures: %d | Failure→Fix Pairs Linked: %d | Dead Ends: %d | Quarantined: %d\n",
+		activeProj, res.EventsRead, res.FailuresFound, res.PairsLinked, len(res.DeadEndIDs), res.QuarantinedCount)
 }

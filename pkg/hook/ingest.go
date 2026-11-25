@@ -11,7 +11,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/lenses"
 	"github.com/bonjoski/coppermind/pkg/security"
-	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
 const maxCommitDiffBytes = 4096
@@ -138,7 +138,7 @@ func IngestCommit(ctx context.Context, mgr *brain.Manager, repoRoot string, lens
 	if lensCfg == nil {
 		lensCfg = lenses.DefaultConfig()
 	}
-	if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok && lensCfg != nil {
+	if inboxStore, ok := mgr.Store().(storage.InboxStore); ok && lensCfg != nil {
 		for i := range lensCfg.Lenses {
 			lc := &lensCfg.Lenses[i]
 			if lc.Name == "" {
@@ -156,7 +156,7 @@ func IngestCommit(ctx context.Context, mgr *brain.Manager, repoRoot string, lens
 			if len(summary) > 180 {
 				summary = summary[:177] + "..."
 			}
-			if qErr := sqlStore.EnqueuePendingTicket(ctx, sqlite.PendingLensTicket{
+			if qErr := inboxStore.EnqueuePendingTicket(ctx, storage.PendingLensTicket{
 				LensName:     lc.Name,
 				CommitSHA:    commitSHA,
 				MemoryID:     node.ID,

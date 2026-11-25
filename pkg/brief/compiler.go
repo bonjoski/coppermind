@@ -13,7 +13,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/gitscope"
 	"github.com/bonjoski/coppermind/pkg/lenses"
-	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
 const (
@@ -86,17 +86,19 @@ func Compile(ctx context.Context, mgr *brain.Manager, req BriefRequest) (*BriefR
 	slot3Budget := (maxChars * 200) / 800
 	slot4Budget := maxChars - slot1Budget - slot2Budget - slot3Budget
 
-	var sqlStore *sqlite.SQLiteStore
+	var graphStore storage.GraphStore
+	var inboxStore storage.InboxStore
 	if mgr != nil && mgr.Store() != nil {
-		sqlStore, _ = mgr.Store().(*sqlite.SQLiteStore)
+		graphStore, _ = mgr.Store().(storage.GraphStore)
+		inboxStore, _ = mgr.Store().(storage.InboxStore)
 	}
 
 	// Slot 1: Touched-File TIER_0/TIER_1 Invariants (via 1-hop graph entity index)
 	var slot1Lines []string
-	if sqlStore != nil && len(touched) > 0 {
+	if graphStore != nil && len(touched) > 0 {
 		seen := make(map[string]bool)
 		for _, f := range touched {
-			nodes, err := sqlStore.ImpactForFile(ctx, f, 5)
+			nodes, err := graphStore.ImpactForFile(ctx, f, 5)
 			if err != nil {
 				continue
 			}
@@ -144,8 +146,8 @@ func Compile(ctx context.Context, mgr *brain.Manager, req BriefRequest) (*BriefR
 			slot2Lines = append(slot2Lines, fmt.Sprintf("- [%s/%s] %s", strings.ToUpper(o.Severity), o.SourceLens, compactLine(o.Content, 140)))
 		}
 	}
-	if sqlStore != nil {
-		tickets, _ := sqlStore.ListPendingTickets(ctx, "", "pending", 10)
+	if inboxStore != nil {
+		tickets, _ := inboxStore.ListPendingTickets(ctx, "", "pending", 10)
 		res.PendingInboxCount = len(tickets)
 		if len(tickets) > 0 {
 			slot2Lines = append(slot2Lines, fmt.Sprintf("- [INBOX] %d pending commit lens ticket(s); oldest (%s): %s",

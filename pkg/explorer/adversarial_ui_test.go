@@ -3,6 +3,7 @@ package explorer
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
@@ -103,5 +105,171 @@ func TestAdversarial_ExplorerLoopbackDNSRebindingAuthAndCSRF(t *testing.T) {
 		!strings.Contains(out.String(), "Merkle chain INTACT") ||
 		!strings.Contains(out.String(), "Reindexed") {
 		t.Fatalf("unexpected TUI output:\n%s", out.String())
+	}
+}
+
+func TestAdversarial_ExplorerV2_TimelineLineageProposalsAndSovereignDeleteGuard(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := sqlite.NewSQLiteStore(filepath.Join(dir, "ui_v2.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mgr := brain.NewManager(store, embedding.NewLocalHashEmbedder(128), scratchpad.NewMemoryScratchpad())
+	defer mgr.Close()
+
+	// Seed TIER_0_SOVEREIGN invariant, superseded pair, PROPOSED learning, and noisy TIER_3 chunk
+	sov, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:     "default",
+		Category:      "security",
+		Content:       "Never disable GPG commit signing on release tags.",
+		AuthorityTier: authz.TierName0Sovereign,
+		Metadata:      map[string]string{"git_repo": "coppermind"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:     "default",
+		Category:      "architecture",
+		Content:       "Use SHA-256 hash embedder for local vector retrieval.",
+		AuthorityTier: authz.TierName1Architecture,
+		Metadata:      map[string]string{"git_repo": "coppermind"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:     "default",
+		Category:      "architecture",
+		Content:       "Upgrade local vector retrieval to CMVEC1 static neural embeddings.",
+		AuthorityTier: authz.TierName1Architecture,
+		SupersedesID:  v1.ID,
+		Rationale:     "RFC-2026-11-24-55 pure-Go semantic upgrade",
+		Metadata:      map[string]string{"git_repo": "coppermind"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prop, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:       "default",
+		Category:        "decision",
+		Content:         "Candidate cartridge insight pending review.",
+		AuthorityTier:   authz.TierName2MentorCapsule,
+		LifecycleStatus: string(authz.StatusProposed),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noisy, err := mgr.Remember(ctx, brain.RememberRequest{
+		SessionID:     "default",
+		Category:      "note",
+		Content:       "Temporary scratch note to be deleted.",
+		AuthorityTier: authz.TierName3Episodic,
+		Metadata:      map[string]string{"git_repo": "other-repo"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wsRO, _ := NewWebServer(mgr, WebOptions{ListenAddr: "127.0.0.1:0", AllowCurate: false})
+	wsCur, _ := NewWebServer(mgr, WebOptions{ListenAddr: "127.0.0.1:0", AllowCurate: true})
+
+	// 1. Timeline endpoint with repo filter
+	reqTL := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9999/api/v1/timeline?repo=coppermind&limit=10", nil)
+	reqTL.Host = "127.0.0.1:9999"
+	reqTL.Header.Set("Authorization", "Bearer "+wsCur.Token())
+	rec := httptest.NewRecorder()
+	wsCur.Handler().ServeHTTP(rec, reqTL)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("timeline failed: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var tlResp struct {
+		Count int `json:"count"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &tlResp)
+	if tlResp.Count != 3 {
+		t.Fatalf("expected 3 coppermind timeline items (sov, v1, v2), got %d", tlResp.Count)
+	}
+
+	// 2. Lineage endpoint walks v2 -> v1
+	reqLin := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9999/api/v1/lineage/"+v2.ID, nil)
+	reqLin.Host = "127.0.0.1:9999"
+	reqLin.Header.Set("Authorization", "Bearer "+wsCur.Token())
+	rec = httptest.NewRecorder()
+	wsCur.Handler().ServeHTTP(rec, reqLin)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), v1.ID) {
+		t.Fatalf("lineage failed to return ancestor %s: status=%d body=%s", v1.ID, rec.Code, rec.Body.String())
+	}
+
+	// 3. Proposals list & reject action
+	reqProps := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9999/api/v1/proposals", nil)
+	reqProps.Host = "127.0.0.1:9999"
+	reqProps.Header.Set("Authorization", "Bearer "+wsCur.Token())
+	rec = httptest.NewRecorder()
+	wsCur.Handler().ServeHTTP(rec, reqProps)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), prop.ID) {
+		t.Fatalf("expected proposal %s in /api/v1/proposals: %s", prop.ID, rec.Body.String())
+	}
+
+	reqRej := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:9999/api/v1/proposals/"+prop.ID+"/reject", nil)
+	reqRej.Host = "127.0.0.1:9999"
+	reqRej.Header.Set("Authorization", "Bearer "+wsCur.Token())
+	reqRej.Header.Set("X-Coppermind-CSRF", wsCur.CSRFToken())
+	rec = httptest.NewRecorder()
+	wsCur.Handler().ServeHTTP(rec, reqRej)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "REJECTED") {
+		t.Fatalf("proposal reject failed: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 4. DELETE blocked in read-only mode (403)
+	reqDelRO := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:9999/api/v1/memories/"+noisy.ID, nil)
+	reqDelRO.Host = "127.0.0.1:9999"
+	reqDelRO.Header.Set("Authorization", "Bearer "+wsRO.Token())
+	reqDelRO.Header.Set("X-Coppermind-CSRF", wsRO.CSRFToken())
+	rec = httptest.NewRecorder()
+	wsRO.Handler().ServeHTTP(rec, reqDelRO)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("SECURITY VIOLATION: DELETE allowed in read-only mode (status=%d)", rec.Code)
+	}
+
+	// 5. DELETE on TIER_0_SOVEREIGN MUST fail closed with 403 EVEN WITH --allow-curate + CSRF!
+	reqDelSov := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:9999/api/v1/memories/"+sov.ID, nil)
+	reqDelSov.Host = "127.0.0.1:9999"
+	reqDelSov.Header.Set("Authorization", "Bearer "+wsCur.Token())
+	reqDelSov.Header.Set("X-Coppermind-CSRF", wsCur.CSRFToken())
+	rec = httptest.NewRecorder()
+	wsCur.Handler().ServeHTTP(rec, reqDelSov)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("SECURITY VIOLATION: TIER_0_SOVEREIGN delete was not refused (status=%d)", rec.Code)
+	}
+	if stillThere, _ := store.GetByID(ctx, sov.ID); stillThere == nil {
+		t.Fatalf("SECURITY VIOLATION: TIER_0_SOVEREIGN memory disappeared after refused delete")
+	}
+
+	// 6. DELETE on TIER_3 noisy chunk succeeds under --allow-curate + CSRF
+	reqDelNoisy := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:9999/api/v1/memories/"+noisy.ID, nil)
+	reqDelNoisy.Host = "127.0.0.1:9999"
+	reqDelNoisy.Header.Set("Authorization", "Bearer "+wsCur.Token())
+	reqDelNoisy.Header.Set("X-Coppermind-CSRF", wsCur.CSRFToken())
+	rec = httptest.NewRecorder()
+	wsCur.Handler().ServeHTTP(rec, reqDelNoisy)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 deleting noisy TIER_3 chunk, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 7. TUI timeline, lineage, and fail-closed sovereign delete
+	var out bytes.Buffer
+	tui := NewTUI(mgr, strings.NewReader("timeline 5\nlineage "+v2.ID+"\ndelete "+sov.ID+"\nq\n"), &out)
+	if err := tui.Run(ctx); err != nil {
+		t.Fatalf("TUI v2 failed: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Episodic Timeline") ||
+		!strings.Contains(text, "Supersession Lineage") ||
+		!strings.Contains(text, "Refused fail-closed: TIER_0_SOVEREIGN") {
+		t.Fatalf("unexpected TUI v2 output:\n%s", text)
 	}
 }

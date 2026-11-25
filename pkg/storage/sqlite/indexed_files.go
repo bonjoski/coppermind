@@ -5,16 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
-// IndexedFileRecord tracks content hashes and stored chunk IDs for incremental codebase indexing.
-type IndexedFileRecord struct {
-	RepoRoot      string    `json:"repo_root"`
-	RelPath       string    `json:"rel_path"`
-	ContentSHA256 string    `json:"content_sha256"`
-	ChunkIDs      []string  `json:"chunk_ids"`
-	IndexedAt     time.Time `json:"indexed_at"`
-}
+// IndexedFileRecord aliases the backend-agnostic incremental file manifest record.
+type IndexedFileRecord = storage.IndexedFileRecord
 
 // ListIndexedFiles loads the hash-incremental manifest for repoRoot.
 func (s *SQLiteStore) ListIndexedFiles(ctx context.Context, repoRoot string) (map[string]IndexedFileRecord, error) {

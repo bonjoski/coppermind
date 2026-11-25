@@ -23,7 +23,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/graph"
 	"github.com/bonjoski/coppermind/pkg/security"
-	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
 const (
@@ -96,78 +96,42 @@ type CartridgeMergeResult struct {
 }
 
 // ExportCartridge packs a filtered subset of active, secret-redacted memories and internal edges
-// into a deterministic, Ed25519-signed mergeable .capsule v2 archive.
-func ExportCartridge(ctx context.Context, store *sqlite.SQLiteStore, outPath string, opts CartridgeExportOptions) (*CartridgeManifest, error) {
+// into a deterministic, Ed25519-signed mergeable .capsule v2 archive (works on both SQLite & Postgres).
+func ExportCartridge(ctx context.Context, store storage.CartridgeStore, outPath string, opts CartridgeExportOptions) (*CartridgeManifest, error) {
 	if store == nil {
-		return nil, fmt.Errorf("sqlite store is required")
+		return nil, fmt.Errorf("cartridge store is required")
 	}
 	if err := checkNoSymlinkPath(outPath); err != nil {
 		return nil, err
 	}
 
-	query := `SELECT id, category, content, metadata_json, authority_tier, advisory_ref, created_at FROM memory_nodes
-	          WHERE derived = 0 AND (lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL)`
-	var args []any
-	if opts.Category != "" {
-		query += " AND category = ?"
-		args = append(args, opts.Category)
-	}
-	if opts.Tier != "" {
-		query += " AND authority_tier = ?"
-		args = append(args, opts.Tier)
-	}
-	if opts.Since != nil {
-		query += " AND created_at >= ?"
-		args = append(args, opts.Since.UnixNano())
-	}
-	query += " ORDER BY id ASC"
-
-	rows, err := store.DB().QueryContext(ctx, query, args...)
+	nodes, err := store.QueryActiveNodesForCartridge(ctx, opts.Repo, opts.Category, opts.Tier, opts.Since)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var records []CartridgeRecord
 	idSet := make(map[string]bool)
 
-	for rows.Next() {
-		var id, cat, content, metaJSON, tier, advRef string
-		var createdNano int64
-		if err := rows.Scan(&id, &cat, &content, &metaJSON, &tier, &advRef, &createdNano); err != nil {
-			return nil, err
-		}
-		var meta map[string]string
-		if metaJSON != "" {
-			_ = json.Unmarshal([]byte(metaJSON), &meta)
-		}
-		if opts.Repo != "" {
-			if meta == nil || !strings.EqualFold(meta["git_repo"], opts.Repo) {
-				continue
-			}
-		}
-
+	for _, n := range nodes {
 		// Defense-in-depth: re-sanitize before export so raw secrets can never leave the vault.
-		secRes, secErr := security.SanitizeMemory(content)
+		secRes, secErr := security.SanitizeMemory(n.Content)
 		if secErr != nil {
 			continue
 		}
 		clean := secRes.SanitizedText
 		sum := sha256.Sum256([]byte(clean))
 		records = append(records, CartridgeRecord{
-			OriginalID:    id,
-			Category:      cat,
+			OriginalID:    n.ID,
+			Category:      n.Category,
 			Content:       clean,
 			ContentSHA256: hex.EncodeToString(sum[:]),
-			AuthorityTier: tier,
-			AdvisoryRef:   advRef,
-			Metadata:      meta,
-			CreatedAt:     time.Unix(0, createdNano).UTC(),
+			AuthorityTier: n.AuthorityTier,
+			AdvisoryRef:   n.AdvisoryRef,
+			Metadata:      n.Metadata,
+			CreatedAt:     n.CreatedAt.UTC(),
 		})
-		idSet[id] = true
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+		idSet[n.ID] = true
 	}
 
 	sort.Slice(records, func(i, j int) bool {
@@ -188,14 +152,16 @@ func ExportCartridge(ctx context.Context, store *sqlite.SQLiteStore, outPath str
 
 	// Collect internal edges among exported nodes
 	var edges []graph.Edge
-	for id := range idSet {
-		nodeEdges, err := store.GetEdgesForNode(ctx, id)
-		if err != nil {
-			continue
-		}
-		for _, e := range nodeEdges {
-			if e.SourceID == id && (e.TargetID == "" || idSet[e.TargetID]) {
-				edges = append(edges, e)
+	if graphStore, ok := store.(storage.GraphStore); ok {
+		for id := range idSet {
+			nodeEdges, err := graphStore.GetEdgesForNode(ctx, id)
+			if err != nil {
+				continue
+			}
+			for _, e := range nodeEdges {
+				if e.SourceID == id && (e.TargetID == "" || idSet[e.TargetID]) {
+					edges = append(edges, e)
+				}
 			}
 		}
 	}
@@ -417,21 +383,14 @@ func MergeCartridge(ctx context.Context, mgr *brain.Manager, capsulePath string,
 		signedVerified = true
 	}
 
-	// 3. Load existing content_sha256 set for fast deduplication
+	// 3. Load existing content_sha256 set for fast deduplication (works on SQLite & Postgres)
 	existingHashes := make(map[string]bool)
-	sqlStore, hasSQL := mgr.Store().(*sqlite.SQLiteStore)
-	if hasSQL {
-		rows, err := sqlStore.DB().QueryContext(ctx, `SELECT content_sha256 FROM memory_nodes WHERE content_sha256 != ''`)
-		if err == nil {
-			for rows.Next() {
-				var h string
-				if rows.Scan(&h) == nil {
-					existingHashes[h] = true
-				}
-			}
-			rows.Close()
+	if capStore, ok := mgr.Store().(storage.CartridgeStore); ok {
+		if loaded, err := capStore.ListExistingContentHashes(ctx); err == nil {
+			existingHashes = loaded
 		}
 	}
+	graphStore, hasGraph := mgr.Store().(storage.GraphStore)
 
 	sessionID := strings.TrimSpace(opts.SessionID)
 	if sessionID == "" {
@@ -499,7 +458,7 @@ func MergeCartridge(ctx context.Context, mgr *brain.Manager, capsulePath string,
 	}
 
 	// 4. Restore internal edges for remapped nodes
-	if hasSQL && len(edgesRaw) > 0 && len(idRemap) > 0 {
+	if hasGraph && len(edgesRaw) > 0 && len(idRemap) > 0 {
 		var restored []graph.Edge
 		es := bufio.NewScanner(bytes.NewReader(edgesRaw))
 		for es.Scan() {
@@ -535,7 +494,7 @@ func MergeCartridge(ctx context.Context, mgr *brain.Manager, capsulePath string,
 				CreatedAt:    time.Now(),
 			})
 		}
-		if len(restored) > 0 && sqlStore.StoreEdges(ctx, restored) == nil {
+		if len(restored) > 0 && graphStore.StoreEdges(ctx, restored) == nil {
 			res.EdgesRestored = len(restored)
 		}
 	}
@@ -545,4 +504,155 @@ func MergeCartridge(ctx context.Context, mgr *brain.Manager, capsulePath string,
 
 func cartridgeSigPayload(m *CartridgeManifest) []byte {
 	return []byte(fmt.Sprintf("%s:%s:%s:%d:%d", m.SchemaVersion, m.Name, m.MerkleRoot, m.RecordCount, m.EdgeCount))
+}
+
+// CartridgeInspectResult summarizes an offline, read-only audit of a .capsule v2 cartridge.
+type CartridgeInspectResult struct {
+	Manifest       *CartridgeManifest `json:"manifest"`
+	MerkleValid    bool               `json:"merkle_valid"`
+	Signed         bool               `json:"signed"`
+	SignatureValid bool               `json:"signature_valid"`
+	SampleRecords  []CartridgeRecord  `json:"sample_records,omitempty"`
+	EdgeCount      int                `json:"edge_count"`
+}
+
+// InspectCartridge performs an offline, read-only integrity & provenance inspection of a
+// mergeable .capsule v2 cartridge without touching any SQLite database.
+func InspectCartridge(capsulePath string, requiredPubKey ed25519.PublicKey) (*CartridgeInspectResult, error) {
+	if err := checkNoSymlinkPath(capsulePath); err != nil {
+		return nil, err
+	}
+	inFile, err := os.Open(capsulePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed opening cartridge: %w", err)
+	}
+	defer inFile.Close()
+
+	gr, err := gzip.NewReader(inFile)
+	if err != nil {
+		return nil, fmt.Errorf("invalid gzip cartridge: %w", err)
+	}
+	defer gr.Close()
+
+	limited := io.LimitReader(gr, MaxCartridgeDecompressedBytes+1)
+	tr := tar.NewReader(limited)
+
+	var manifest *CartridgeManifest
+	var recordsRaw, edgesRaw []byte
+	var totalBytes int64
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("corrupted tar cartridge: %w", err)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			return nil, fmt.Errorf("%w: non-regular tar entry %q (type %d)", ErrCartridgeUnsafeArchive, hdr.Name, hdr.Typeflag)
+		}
+		clean := filepath.Clean(hdr.Name)
+		if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) || strings.Contains(clean, string(filepath.Separator)+"..") {
+			return nil, fmt.Errorf("%w: illegal path %q", ErrCartridgeUnsafeArchive, hdr.Name)
+		}
+		data, err := io.ReadAll(io.LimitReader(tr, MaxCartridgeDecompressedBytes-totalBytes+1))
+		if err != nil {
+			return nil, err
+		}
+		totalBytes += int64(len(data))
+		if totalBytes > MaxCartridgeDecompressedBytes {
+			return nil, fmt.Errorf("%w: decompressed cartridge exceeds %d bytes", ErrCartridgeUnsafeArchive, MaxCartridgeDecompressedBytes)
+		}
+		switch clean {
+		case "manifest.json":
+			manifest = &CartridgeManifest{}
+			if err := json.Unmarshal(data, manifest); err != nil {
+				return nil, fmt.Errorf("corrupted cartridge manifest: %w", err)
+			}
+		case "records.jsonl":
+			recordsRaw = data
+		case "edges.jsonl":
+			edgesRaw = data
+		}
+	}
+
+	if manifest == nil || manifest.SchemaVersion != CartridgeSchemaV2 {
+		return nil, fmt.Errorf("invalid cartridge: missing or unsupported schema_version")
+	}
+
+	var samples []CartridgeRecord
+	merkleHasher := sha256.New()
+	recCount := 0
+	scanner := bufio.NewScanner(bytes.NewReader(recordsRaw))
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var rec CartridgeRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return nil, fmt.Errorf("corrupted cartridge record: %w", err)
+		}
+		sum := sha256.Sum256([]byte(rec.Content))
+		actualSHA := hex.EncodeToString(sum[:])
+		if rec.ContentSHA256 != "" && rec.ContentSHA256 != actualSHA {
+			return nil, fmt.Errorf("%w: record content hash mismatch", ErrCartridgeMerkleMismatch)
+		}
+		rec.ContentSHA256 = actualSHA
+		merkleHasher.Write([]byte(actualSHA))
+		recCount++
+		if len(samples) < 5 {
+			samples = append(samples, rec)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	actualRoot := hex.EncodeToString(merkleHasher.Sum(nil))
+	merkleOK := actualRoot == manifest.MerkleRoot && recCount == manifest.RecordCount
+
+	edgeCount := 0
+	if len(edgesRaw) > 0 {
+		es := bufio.NewScanner(bytes.NewReader(edgesRaw))
+		for es.Scan() {
+			if strings.TrimSpace(es.Text()) != "" {
+				edgeCount++
+			}
+		}
+	}
+
+	res := &CartridgeInspectResult{
+		Manifest:      manifest,
+		MerkleValid:   merkleOK,
+		Signed:        manifest.Signature != "",
+		SampleRecords: samples,
+		EdgeCount:     edgeCount,
+	}
+
+	if manifest.Signature != "" {
+		pub := requiredPubKey
+		if len(pub) != ed25519.PublicKeySize {
+			decoded, err := hex.DecodeString(manifest.PublicKey)
+			if err == nil && len(decoded) == ed25519.PublicKeySize {
+				pub = ed25519.PublicKey(decoded)
+			}
+		}
+		if len(pub) == ed25519.PublicKeySize {
+			if sigBytes, err := hex.DecodeString(manifest.Signature); err == nil {
+				res.SignatureValid = ed25519.Verify(pub, cartridgeSigPayload(manifest), sigBytes)
+			}
+		}
+	}
+
+	if !res.MerkleValid {
+		return res, fmt.Errorf("%w: expected %s (%d records), got %s (%d records)",
+			ErrCartridgeMerkleMismatch, manifest.MerkleRoot, manifest.RecordCount, actualRoot, recCount)
+	}
+	if len(requiredPubKey) == ed25519.PublicKeySize && !res.SignatureValid {
+		return res, ErrCartridgeSignatureFailed
+	}
+	return res, nil
 }

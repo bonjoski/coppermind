@@ -33,6 +33,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/router"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/seeder"
+	"github.com/bonjoski/coppermind/pkg/storage"
 	"github.com/bonjoski/coppermind/pkg/storage/postgres"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 	"github.com/bonjoski/coppermind/pkg/version"
@@ -144,6 +145,10 @@ func main() {
 		runTUI(cmdArgs)
 	case "ui":
 		runUI(cmdArgs)
+	case "watch":
+		runWatch(cmdArgs)
+	case "ingest-flightdeck":
+		runIngestFlightdeck(cmdArgs)
 	case "status":
 		runStatus(cmdArgs)
 	case "version", "--version", "-v":
@@ -174,9 +179,19 @@ Commands:
   index        Scan, chunk, and index a codebase repository into semantic memory
   export       Export the brain into a portable, verified capsule archive
   import       Restore a brain from a capsule archive with path traversal checks
-  capsule      Manage Security Mentor & Requirements Capsules (keygen, sign, pack, import, list, verify, export)
+  capsule      Manage Mentor Capsules & mergeable .capsule v2 cartridges (keygen, sign, pack, export, inspect, merge, import, list, verify)
   requirements Generate <=3 sprint-ready Given/When/Then abuse-case acceptance criteria (ephemeral)
   distill      Distill a sanitized post-mortem lesson into MentorCard, AbuseCaseCriterion, and Aegisbox probe JSON
+  models       Manage offline CMVEC1 static neural embedding packs (list, pull)
+  reindex-vectors Re-embed stored memories in micro-batches using the active embedder
+  graph        Inspect 1-2 hop knowledge graph edges and file impact (neighbors, impact)
+  brief        Compile a <8ms, <=800-token deterministic workspace context brief
+  inbox        Inspect or dismiss zero-API-key pending commit lens review tickets
+  consolidate  Prepare or submit sleep-cycle episodic memory consolidation bundles
+  tui          Launch zero-dependency terminal Brain Explorer (search, graph, timeline, lineage, inbox, verify)
+  ui           Launch strictly 127.0.0.1 token-gated local Web Brain Explorer (--allow-curate optional)
+  watch        Read-only hash-incremental Markdown / Obsidian / ADR vault watcher (--once, --interval)
+  ingest-flightdeck Ingest Flightdeck JSONL traces into linked dead_end -> troubleshooting memories
   verify       Audit cryptographic Merkle chain integrity for a session
   vacuum       Purge expired TTL memories and compact SQLite storage
   project      Manage isolated vaults (list, use, create, delete)
@@ -428,8 +443,8 @@ func runMCP(args []string) {
 			}
 			_ = mgr.Scratchpad().Set(ctx, "active_observations", sb.String(), 24*time.Hour)
 		}
-		if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok {
-			if tkts, tErr := sqlStore.ListPendingTickets(ctx, "", "pending", 10); tErr == nil && len(tkts) > 0 {
+		if inboxStore, ok := mgr.Store().(storage.InboxStore); ok {
+			if tkts, tErr := inboxStore.ListPendingTickets(ctx, "", "pending", 10); tErr == nil && len(tkts) > 0 {
 				summary := fmt.Sprintf("%d pending zero-key commit lens ticket(s) — oldest [%s]: %s. Run /coppermind:security-audit or coppermind_lens_prepare(from_inbox=true).",
 					len(tkts), tkts[0].LensName, tkts[0].Summary)
 				_ = mgr.Scratchpad().Set(ctx, "pending_inbox", summary, 24*time.Hour)
@@ -652,7 +667,7 @@ func runRecall(args []string) {
 
 	var createdAfter, createdBefore *time.Time
 	if strings.TrimSpace(*since) != "" {
-		t, pErr := brain.ParseTemporalBound(*since, time.Now().UTC())
+		t, pErr := brain.ResolveTemporalBound(*since, "", time.Now().UTC())
 		if pErr != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", pErr)
 			os.Exit(1)
@@ -660,7 +675,7 @@ func runRecall(args []string) {
 		createdAfter = &t
 	}
 	if strings.TrimSpace(*before) != "" {
-		t, pErr := brain.ParseTemporalBound(*before, time.Now().UTC())
+		t, pErr := brain.ResolveTemporalBound(*before, "", time.Now().UTC())
 		if pErr != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", pErr)
 			os.Exit(1)
@@ -2004,6 +2019,8 @@ func runCapsule(args []string) {
 		runCapsuleCartridgePack(cmdArgs)
 	case "merge":
 		runCapsuleCartridgeMerge(cmdArgs)
+	case "inspect":
+		runCapsuleCartridgeInspect(cmdArgs)
 	case "keygen":
 		fs := flag.NewFlagSet("capsule keygen", flag.ExitOnError)
 		outDir := fs.String("out", "", "Output directory for ed25519.key (0600) and ed25519.pub")
@@ -2215,6 +2232,23 @@ func runCapsule(args []string) {
 		fmt.Printf("  • Merkle Root: %s\n", ver.MerkleRoot)
 
 	case "export":
+		// Detect selective mergeable cartridge flags (--repo/--tier/--category/--since/--key) and route
+		// seamlessly to ExportCartridge while preserving legacy Mentor/Requirements capsule export (--from/--name).
+		isCartridgeExport := false
+		for _, a := range cmdArgs {
+			if a == "--repo" || strings.HasPrefix(a, "--repo=") ||
+				a == "--tier" || strings.HasPrefix(a, "--tier=") ||
+				a == "--category" || strings.HasPrefix(a, "--category=") ||
+				a == "--since" || strings.HasPrefix(a, "--since=") ||
+				a == "--key" || strings.HasPrefix(a, "--key=") {
+				isCartridgeExport = true
+				break
+			}
+		}
+		if isCartridgeExport {
+			runCapsuleCartridgePack(cmdArgs)
+			return
+		}
 		fs := flag.NewFlagSet("capsule export", flag.ExitOnError)
 		dataDir := fs.String("data-dir", "", "Data directory")
 		projectName := fs.String("project", "", "Target project vault")

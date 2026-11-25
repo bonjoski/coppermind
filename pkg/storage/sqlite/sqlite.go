@@ -441,11 +441,17 @@ func (s *SQLiteStore) storeNodeTx(tx *sql.Tx, node *brain.MemoryNode) error {
 	vecBlob := encodeVector(node.Vector)
 	metaJSON, _ := json.Marshal(node.Metadata)
 
-	// Ensure Merkle hash chaining
+	// Ensure Merkle hash chaining with strictly monotonic created_at per session
+	// so N=8 concurrent goroutines stamping timestamps before entering writeCh never invert chain order.
 	if node.Hash == "" {
 		var prevHash string
-		row := tx.QueryRow("SELECT hash FROM memory_nodes WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", node.SessionID)
-		_ = row.Scan(&prevHash)
+		var lastCreatedNano int64
+		row := tx.QueryRow("SELECT hash, created_at FROM memory_nodes WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", node.SessionID)
+		if err := row.Scan(&prevHash, &lastCreatedNano); err == nil {
+			if node.CreatedAt.UnixNano() <= lastCreatedNano {
+				node.CreatedAt = time.Unix(0, lastCreatedNano+1)
+			}
+		}
 		if prevHash == "" {
 			prevHash = "0000000000000000000000000000000000000000000000000000000000000000"
 		}
@@ -619,13 +625,17 @@ func (s *SQLiteStore) execSupersede(req *supersedeReq) error {
 	}
 	defer tx.Rollback()
 
-	var targetTier string
-	row := tx.QueryRow("SELECT authority_tier FROM memory_nodes WHERE id = ?", req.targetID)
-	if err := row.Scan(&targetTier); err != nil {
+	var targetTier, targetStatus string
+	var targetSupBy sql.NullString
+	row := tx.QueryRow("SELECT authority_tier, lifecycle_status, superseded_by_id FROM memory_nodes WHERE id = ?", req.targetID)
+	if err := row.Scan(&targetTier, &targetStatus, &targetSupBy); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("target memory node %q not found: %w", req.targetID, err)
 		}
 		return fmt.Errorf("failed to query target memory node: %w", err)
+	}
+	if strings.EqualFold(targetStatus, string(authz.StatusSuperseded)) {
+		return fmt.Errorf("target memory node %q is already superseded by %q: %w", req.targetID, targetSupBy.String, authz.ErrInvalidSupersession)
 	}
 
 	targetTierParsed := authz.ParseAuthorityTier(targetTier)

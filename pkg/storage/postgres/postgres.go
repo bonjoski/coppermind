@@ -10,19 +10,41 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/graph"
 	_ "github.com/lib/pq"
 )
 
-const postgresMemoryColumns = `id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash, authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref`
+const postgresMemoryColumns = `id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash, authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref, embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256`
 
-// PostgresStore implements brain.MemoryStore backed by PostgreSQL 17 + pgvector.
+// PostgresStore implements brain.MemoryStore and all storage capability interfaces backed by PostgreSQL 17 + pgvector.
 type PostgresStore struct {
-	db        *sql.DB
-	dimension int
+	db           *sql.DB
+	dimension    int
+	hookMu       sync.RWMutex
+	preWriteHook func(ctx context.Context, node *brain.MemoryNode) error
+}
+
+// SetPreWriteHook registers a mandatory pre-write integrity validator (e.g. embedded Stormcage)
+// invoked before persisting any MemoryNode into PostgreSQL.
+func (s *PostgresStore) SetPreWriteHook(fn func(ctx context.Context, node *brain.MemoryNode) error) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.preWriteHook = fn
+}
+
+func (s *PostgresStore) runPreWriteHook(ctx context.Context, node *brain.MemoryNode) error {
+	s.hookMu.RLock()
+	fn := s.preWriteHook
+	s.hookMu.RUnlock()
+	if fn != nil {
+		return fn(ctx, node)
+	}
+	return nil
 }
 
 // Config provides connection settings for PostgreSQL.
@@ -95,7 +117,12 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		superseded_by_id VARCHAR(64) DEFAULT '',
 		supersedes_id VARCHAR(64) DEFAULT '',
 		rationale TEXT DEFAULT '',
-		advisory_ref VARCHAR(128) DEFAULT ''
+		advisory_ref VARCHAR(128) DEFAULT '',
+		embedding_model VARCHAR(64) DEFAULT '',
+		embedding_dim INTEGER DEFAULT 0,
+		access_count INTEGER DEFAULT 0,
+		last_accessed_at BIGINT DEFAULT 0,
+		content_sha256 VARCHAR(64) DEFAULT ''
 	);
 
 	-- Run ALTER TABLE statements FIRST so that missing columns on existing tables are added before indices
@@ -113,6 +140,11 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS supersedes_id VARCHAR(64) DEFAULT '';
 	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS rationale TEXT DEFAULT '';
 	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS advisory_ref VARCHAR(128) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(64) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding_dim INTEGER DEFAULT 0;
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS access_count INTEGER DEFAULT 0;
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS last_accessed_at BIGINT DEFAULT 0;
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS content_sha256 VARCHAR(64) DEFAULT '';
 
 	CREATE INDEX IF NOT EXISTS idx_pg_session_id ON memory_nodes(session_id);
 	CREATE INDEX IF NOT EXISTS idx_pg_category ON memory_nodes(category);
@@ -125,6 +157,8 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_pg_authority_tier ON memory_nodes(authority_tier);
 	CREATE INDEX IF NOT EXISTS idx_pg_lifecycle_status ON memory_nodes(lifecycle_status);
 	CREATE INDEX IF NOT EXISTS idx_pg_superseded_by ON memory_nodes(superseded_by_id);
+	CREATE INDEX IF NOT EXISTS idx_pg_embedding_model ON memory_nodes(embedding_model);
+	CREATE INDEX IF NOT EXISTS idx_pg_content_sha256 ON memory_nodes(content_sha256);
 	CREATE INDEX IF NOT EXISTS idx_pg_content_fts ON memory_nodes USING gin(to_tsvector('english', content));
 
 	CREATE TABLE IF NOT EXISTS memory_supersessions (
@@ -139,6 +173,46 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_pg_supersessions_superseded ON memory_supersessions(superseded_id);
 	CREATE INDEX IF NOT EXISTS idx_pg_supersessions_superseding ON memory_supersessions(superseding_id);
+
+	CREATE TABLE IF NOT EXISTS memory_edges (
+		id VARCHAR(64) PRIMARY KEY,
+		source_id VARCHAR(64) NOT NULL,
+		target_id VARCHAR(64) DEFAULT '',
+		target_entity VARCHAR(256) DEFAULT '',
+		relation VARCHAR(64) NOT NULL,
+		weight DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+		derived BOOLEAN NOT NULL DEFAULT FALSE,
+		created_at BIGINT NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_pg_edges_source ON memory_edges(source_id);
+	CREATE INDEX IF NOT EXISTS idx_pg_edges_target ON memory_edges(target_id);
+	CREATE INDEX IF NOT EXISTS idx_pg_edges_entity ON memory_edges(target_entity);
+	CREATE INDEX IF NOT EXISTS idx_pg_edges_relation ON memory_edges(relation);
+
+	CREATE TABLE IF NOT EXISTS indexed_files (
+		repo_root TEXT NOT NULL,
+		rel_path TEXT NOT NULL,
+		content_sha256 VARCHAR(64) NOT NULL,
+		chunk_ids_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+		indexed_at BIGINT NOT NULL,
+		PRIMARY KEY (repo_root, rel_path)
+	);
+
+	CREATE TABLE IF NOT EXISTS pending_lens_tickets (
+		id VARCHAR(64) PRIMARY KEY,
+		lens_name VARCHAR(64) NOT NULL,
+		commit_sha VARCHAR(64) DEFAULT '',
+		memory_id VARCHAR(64) NOT NULL,
+		repo_name VARCHAR(128) DEFAULT '',
+		branch_name VARCHAR(128) DEFAULT '',
+		summary TEXT NOT NULL,
+		matched_sinks_json JSONB DEFAULT '[]'::jsonb,
+		status VARCHAR(32) NOT NULL DEFAULT 'pending',
+		created_at BIGINT NOT NULL,
+		resolved_at BIGINT,
+		UNIQUE (lens_name, memory_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_pg_pending_tickets_status ON pending_lens_tickets(status, lens_name, created_at);
 	`, s.dimension)
 
 	_, err := s.db.ExecContext(ctx, schema)
@@ -210,11 +284,31 @@ func ComputeNodeHash(prevHash, id, sessionID, category, content string, createdA
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Store persists a memory node into PostgreSQL.
+// Store persists a memory node into PostgreSQL inside a per-session advisory-locked transaction,
+// preventing Merkle hash chain forks under N=8+ distributed concurrent writers.
 func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error {
+	if node == nil {
+		return fmt.Errorf("node cannot be nil")
+	}
 	if node.ID == "" {
 		return fmt.Errorf("node ID cannot be empty")
 	}
+	if err := s.runPreWriteHook(ctx, node); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin store transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.storeNodeTx(ctx, tx, node); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresStore) storeNodeTx(ctx context.Context, tx *sql.Tx, node *brain.MemoryNode) error {
 	if node.CreatedAt.IsZero() {
 		node.CreatedAt = time.Now()
 	}
@@ -222,12 +316,22 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		node.UpdatedAt = time.Now()
 	}
 
+	// Serialize writes per session_id across distributed agents so Merkle prev_hash never forks
+	// and created_at stays strictly monotonic within each session chain.
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", node.SessionID); err != nil {
+		return fmt.Errorf("failed acquiring session advisory lock: %w", err)
+	}
+
 	// Compute Merkle prev_hash if not populated
 	if node.Hash == "" {
 		var prevHash string
-		err := s.db.QueryRowContext(ctx, "SELECT hash FROM memory_nodes WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1", node.SessionID).Scan(&prevHash)
+		var lastCreatedNano int64
+		err := tx.QueryRowContext(ctx, "SELECT hash, created_at FROM memory_nodes WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1", node.SessionID).Scan(&prevHash, &lastCreatedNano)
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("failed to fetch prev_hash: %w", err)
+		}
+		if err == nil && node.CreatedAt.UnixNano() <= lastCreatedNano {
+			node.CreatedAt = time.Unix(0, lastCreatedNano+1)
 		}
 		node.PrevHash = prevHash
 		node.Hash = ComputeNodeHash(prevHash, node.ID, node.SessionID, node.Category, node.Content, node.CreatedAt.UnixNano())
@@ -244,7 +348,10 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		expiresAtNano = &exp
 	}
 
-	vecStr := FormatVector(node.Vector)
+	var vecArg interface{}
+	if len(node.Vector) > 0 {
+		vecArg = FormatVector(node.Vector)
+	}
 
 	parentsJSON, _ := json.Marshal(node.ParentIDs)
 	if node.ParentIDs == nil {
@@ -262,14 +369,35 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 	node.AuthorityTier = authorityTier
 	node.LifecycleStatus = lifecycleStatus
 
+	embDim := node.EmbeddingDim
+	if embDim == 0 {
+		embDim = len(node.Vector)
+	}
+	embModel := node.EmbeddingModel
+	if embModel == "" && embDim > 0 {
+		embModel = fmt.Sprintf("local-hash-%d", embDim)
+	}
+	node.EmbeddingDim = embDim
+	node.EmbeddingModel = embModel
+
+	if node.ContentSHA256 == "" {
+		sum := sha256.Sum256([]byte(node.Content))
+		node.ContentSHA256 = hex.EncodeToString(sum[:])
+	}
+	var lastAccessedNano int64
+	if !node.LastAccessedAt.IsZero() {
+		lastAccessedNano = node.LastAccessedAt.UnixNano()
+	}
+
 	query := `
 	INSERT INTO memory_nodes (
 		id, session_id, category, content, vector_data, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
 		derived, source_lens, parent_ids_json, severity, status, dedup_hash,
-		authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref
+		authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref,
+		embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256
 	) VALUES (
 		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-		$20, $21, $22, $23, $24, $25, $26, $27
+		$20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
 	)
 	ON CONFLICT (id) DO UPDATE SET
 		category = EXCLUDED.category,
@@ -293,15 +421,20 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		superseded_by_id = EXCLUDED.superseded_by_id,
 		supersedes_id = EXCLUDED.supersedes_id,
 		rationale = EXCLUDED.rationale,
-		advisory_ref = EXCLUDED.advisory_ref;
+		advisory_ref = EXCLUDED.advisory_ref,
+		embedding_model = EXCLUDED.embedding_model,
+		embedding_dim = EXCLUDED.embedding_dim,
+		access_count = EXCLUDED.access_count,
+		last_accessed_at = EXCLUDED.last_accessed_at,
+		content_sha256 = EXCLUDED.content_sha256;
 	`
 
-	_, err := s.db.ExecContext(ctx, query,
+	_, err := tx.ExecContext(ctx, query,
 		node.ID,
 		node.SessionID,
 		node.Category,
 		node.Content,
-		vecStr,
+		vecArg,
 		string(node.Provenance),
 		node.TaintScore,
 		metaJSON,
@@ -324,26 +457,62 @@ func (s *PostgresStore) Store(ctx context.Context, node *brain.MemoryNode) error
 		node.SupersedesID,
 		node.Rationale,
 		node.AdvisoryRef,
+		embModel,
+		embDim,
+		node.AccessCount,
+		lastAccessedNano,
+		node.ContentSHA256,
 	)
+	if err != nil {
+		return err
+	}
 
-	return err
+	// Deterministically extract and persist knowledge graph edges atomically inside the same tx
+	if edges := graph.ExtractEdges(node); len(edges) > 0 {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM memory_edges WHERE source_id = $1", node.ID); err != nil {
+			return err
+		}
+		stmt, err := tx.PrepareContext(ctx, `
+			INSERT INTO memory_edges (id, source_id, target_id, target_entity, relation, weight, derived, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (id) DO NOTHING
+		`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		for _, e := range edges {
+			ts := e.CreatedAt
+			if ts.IsZero() {
+				ts = time.Now()
+			}
+			if _, err := stmt.ExecContext(ctx, e.ID, e.SourceID, e.TargetID, e.TargetEntity, string(e.Relation), e.Weight, e.Derived, ts.UnixNano()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func scanPostgresNode(scanner interface {
 	Scan(dest ...interface{}) error
 }, scoreDest *float32) (*brain.MemoryNode, error) {
 	var (
-		id, sid, category, content, vecText, provStr, prevHash, hash string
-		metaJSON, parentIDsJSON                                      []byte
-		taintScore                                                   float64
-		createdAtNano, updatedAtNano                                 int64
-		expiresAtNano                                                sql.NullInt64
-		derived                                                      bool
-		sourceLens, severity, status, dedupHash                      string
-		authorityTier, lifecycleStatus                               sql.NullString
-		authorIdentity, authorRole                                   sql.NullString
-		supersededByID, supersedesID                                 sql.NullString
-		rationale, advisoryRef                                       sql.NullString
+		id, sid, category, content, provStr, prevHash, hash string
+		vecText                                             sql.NullString
+		metaJSON, parentIDsJSON                             []byte
+		taintScore                                          float64
+		createdAtNano, updatedAtNano                        int64
+		expiresAtNano                                       sql.NullInt64
+		derived                                             bool
+		sourceLens, severity, status, dedupHash             string
+		authorityTier, lifecycleStatus                      sql.NullString
+		authorIdentity, authorRole                          sql.NullString
+		supersededByID, supersedesID                        sql.NullString
+		rationale, advisoryRef                              sql.NullString
+		embeddingModel, contentSHA256                       sql.NullString
+		embeddingDim, accessCount                           sql.NullInt64
+		lastAccessedNano                                    sql.NullInt64
 	)
 
 	dests := []interface{}{
@@ -352,6 +521,7 @@ func scanPostgresNode(scanner interface {
 		&derived, &sourceLens, &parentIDsJSON, &severity, &status, &dedupHash,
 		&authorityTier, &lifecycleStatus, &authorIdentity, &authorRole,
 		&supersededByID, &supersedesID, &rationale, &advisoryRef,
+		&embeddingModel, &embeddingDim, &accessCount, &lastAccessedNano, &contentSHA256,
 	}
 	if scoreDest != nil {
 		dests = append(dests, scoreDest)
@@ -378,7 +548,10 @@ func scanPostgresNode(scanner interface {
 		expiresAt = &exp
 	}
 
-	parsedVec, _ := ParseVector(vecText)
+	var parsedVec []float32
+	if vecText.Valid {
+		parsedVec, _ = ParseVector(vecText.String)
+	}
 
 	tierVal := authorityTier.String
 	if tierVal == "" {
@@ -387,6 +560,10 @@ func scanPostgresNode(scanner interface {
 	statusVal := lifecycleStatus.String
 	if statusVal == "" {
 		statusVal = string(authz.StatusActive)
+	}
+	var lastAccessed time.Time
+	if lastAccessedNano.Valid && lastAccessedNano.Int64 > 0 {
+		lastAccessed = time.Unix(0, lastAccessedNano.Int64)
 	}
 
 	return &brain.MemoryNode{
@@ -417,6 +594,11 @@ func scanPostgresNode(scanner interface {
 		SupersedesID:    supersedesID.String,
 		Rationale:       rationale.String,
 		AdvisoryRef:     advisoryRef.String,
+		EmbeddingModel:  embeddingModel.String,
+		EmbeddingDim:    int(embeddingDim.Int64),
+		AccessCount:     int(accessCount.Int64),
+		LastAccessedAt:  lastAccessed,
+		ContentSHA256:   contentSHA256.String,
 	}, nil
 }
 
@@ -429,7 +611,7 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 	SELECT %s,
 	       1.0 - (vector_data <=> $1) AS score
 	FROM memory_nodes
-	WHERE (expires_at IS NULL OR expires_at > $2)
+	WHERE vector_data IS NOT NULL AND (expires_at IS NULL OR expires_at > $2)
 	`, postgresMemoryColumns)
 	args := []interface{}{vecStr, nowNano}
 	idx := 3
@@ -562,6 +744,12 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 		if filter.AuthorityTier != "" && !strings.EqualFold(node.AuthorityTier, filter.AuthorityTier) {
 			continue
 		}
+		if filter.CreatedAfter != nil && node.CreatedAt.UnixNano() < filter.CreatedAfter.UnixNano() {
+			continue
+		}
+		if filter.CreatedBefore != nil && node.CreatedAt.UnixNano() > filter.CreatedBefore.UnixNano() {
+			continue
+		}
 
 		results = append(results, &brain.SearchResult{
 			Node:  node,
@@ -675,6 +863,12 @@ func (s *PostgresStore) RecallHybrid(ctx context.Context, query string, queryVec
 		}
 
 		if filter.AuthorityTier != "" && !strings.EqualFold(node.AuthorityTier, filter.AuthorityTier) {
+			continue
+		}
+		if filter.CreatedAfter != nil && node.CreatedAt.UnixNano() < filter.CreatedAfter.UnixNano() {
+			continue
+		}
+		if filter.CreatedBefore != nil && node.CreatedAt.UnixNano() > filter.CreatedBefore.UnixNano() {
 			continue
 		}
 
@@ -876,8 +1070,9 @@ func severityGTE(a, b string) bool {
 	return ra >= rb
 }
 
-// Delete removes a node by ID.
+// Delete removes a node and its incident graph edges by ID.
 func (s *PostgresStore) Delete(ctx context.Context, id string) error {
+	_, _ = s.db.ExecContext(ctx, "DELETE FROM memory_edges WHERE source_id = $1 OR target_id = $1", id)
 	_, err := s.db.ExecContext(ctx, "DELETE FROM memory_nodes WHERE id = $1", id)
 	return err
 }

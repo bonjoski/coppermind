@@ -9,22 +9,12 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
-// PendingLensTicket represents a pre-filtered commit or artifact awaiting zero-key host lens evaluation.
-type PendingLensTicket struct {
-	ID           string     `json:"id"`
-	LensName     string     `json:"lens_name"`
-	CommitSHA    string     `json:"commit_sha,omitempty"`
-	MemoryID     string     `json:"memory_id"`
-	RepoName     string     `json:"repo_name,omitempty"`
-	BranchName   string     `json:"branch_name,omitempty"`
-	Summary      string     `json:"summary"`
-	MatchedSinks []string   `json:"matched_sinks,omitempty"`
-	Status       string     `json:"status"` // pending | completed | dismissed
-	CreatedAt    time.Time  `json:"created_at"`
-	ResolvedAt   *time.Time `json:"resolved_at,omitempty"`
-}
+// PendingLensTicket aliases the backend-agnostic pending lens review ticket.
+type PendingLensTicket = storage.PendingLensTicket
 
 // EnqueuePendingTicket inserts a deduplicated pending lens ticket through the single-writer ring.
 func (s *SQLiteStore) EnqueuePendingTicket(ctx context.Context, ticket PendingLensTicket) error {

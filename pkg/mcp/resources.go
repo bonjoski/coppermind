@@ -8,7 +8,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/brief"
-	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
 const (
@@ -104,9 +104,9 @@ func (s *Server) handleResourcesRead(ctx context.Context, msg *JSONRPCMessage) *
 		return out
 
 	case ResourceURIInboxPending:
-		var tickets []sqlite.PendingLensTicket
-		if sqlStore, ok := s.manager.Store().(*sqlite.SQLiteStore); ok {
-			tickets, _ = sqlStore.ListPendingTickets(ctx, "", "pending", 15)
+		var tickets []storage.PendingLensTicket
+		if inboxStore, ok := s.manager.Store().(storage.InboxStore); ok {
+			tickets, _ = inboxStore.ListPendingTickets(ctx, "", "pending", 15)
 		}
 		b, _ := json.MarshalIndent(map[string]any{"count": len(tickets), "tickets": tickets}, "", "  ")
 		out, _ := NewSuccessResponse(msg.ID, ResourceReadResult{

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/authz"
@@ -31,11 +32,17 @@ func (s *PostgresStore) Supersede(
 	rationale, advisoryRef string,
 	authorIdentity, authorRole string,
 ) error {
+	if supersedingNode == nil || supersedingNode.ID == "" {
+		return fmt.Errorf("superseding node and ID cannot be empty")
+	}
 	if targetID == "" {
 		return fmt.Errorf("target node ID cannot be empty")
 	}
 	if rationale == "" {
 		return authz.ErrMissingRationale
+	}
+	if err := s.runPreWriteHook(ctx, supersedingNode); err != nil {
+		return err
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -44,14 +51,18 @@ func (s *PostgresStore) Supersede(
 	}
 	defer tx.Rollback()
 
-	// 1. Verify target node exists and fetch its authority tier
+	// 1. Lock target node row FOR UPDATE and reject concurrent double-supersession fail-closed
 	var targetTier, targetStatus string
-	err = tx.QueryRowContext(ctx, "SELECT authority_tier, lifecycle_status FROM memory_nodes WHERE id = $1 FOR UPDATE", targetID).Scan(&targetTier, &targetStatus)
+	var targetSupBy sql.NullString
+	err = tx.QueryRowContext(ctx, "SELECT authority_tier, lifecycle_status, superseded_by_id FROM memory_nodes WHERE id = $1 FOR UPDATE", targetID).Scan(&targetTier, &targetStatus, &targetSupBy)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("target memory node %q not found: %w", targetID, err)
 		}
 		return fmt.Errorf("failed to query target memory node: %w", err)
+	}
+	if strings.EqualFold(targetStatus, string(authz.StatusSuperseded)) {
+		return fmt.Errorf("target memory node %q is already superseded by %q: %w", targetID, targetSupBy.String, authz.ErrInvalidSupersession)
 	}
 
 	targetTierParsed := authz.ParseAuthorityTier(targetTier)
@@ -86,8 +97,8 @@ func (s *PostgresStore) Supersede(
 		supersedingNode.AuthorityTier = targetTier
 	}
 
-	// 4. Store supersedingNode
-	if err := s.Store(ctx, supersedingNode); err != nil {
+	// 4. Store supersedingNode atomically INSIDE the same transaction (eliminates split-connection race)
+	if err := s.storeNodeTx(ctx, tx, supersedingNode); err != nil {
 		return fmt.Errorf("failed to store superseding memory node: %w", err)
 	}
 

@@ -17,7 +17,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/graph"
 	"github.com/bonjoski/coppermind/pkg/security"
-	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
 const (
@@ -311,7 +311,7 @@ func (e *DefaultHostEvaluator) SubmitConsolidation(ctx context.Context, mgr *bra
 	}
 
 	// Persist detected contradictions as typed graph edges
-	if sqlStore, ok := mgr.Store().(*sqlite.SQLiteStore); ok && len(payload.Contradictions) > 0 {
+	if graphStore, ok := mgr.Store().(storage.GraphStore); ok && len(payload.Contradictions) > 0 {
 		var edges []graph.Edge
 		now := time.Now()
 		for _, c := range payload.Contradictions {
@@ -332,7 +332,7 @@ func (e *DefaultHostEvaluator) SubmitConsolidation(ctx context.Context, mgr *bra
 				CreatedAt: now,
 			})
 		}
-		if len(edges) > 0 && sqlStore.StoreEdges(ctx, edges) == nil {
+		if len(edges) > 0 && graphStore.StoreEdges(ctx, edges) == nil {
 			res.ContradictionEdges = len(edges)
 		}
 	}

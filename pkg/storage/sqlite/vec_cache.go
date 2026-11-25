@@ -12,6 +12,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
 // VectorSlabEntry holds a lightweight immutable in-memory projection of a memory node
@@ -276,22 +277,11 @@ func (s *SQLiteStore) IncrementAccessBatch(ctx context.Context, ids []string, ac
 	})
 }
 
-// ReindexStats reports outcomes from a vector re-embedding upgrade pass.
-type ReindexStats struct {
-	TotalNodes   int           `json:"total_nodes"`
-	Reindexed    int           `json:"reindexed"`
-	Skipped      int           `json:"skipped"`
-	ModelName    string        `json:"model_name"`
-	Dimension    int           `json:"dimension"`
-	Duration     time.Duration `json:"duration"`
-}
+// ReindexStats aliases the backend-agnostic vector reindex statistics.
+type ReindexStats = storage.ReindexStats
 
-// VectorCoverage summarizes how many active vault nodes match a given model name.
-type VectorCoverage struct {
-	TotalNodes    int            `json:"total_nodes"`
-	MatchingNodes int            `json:"matching_nodes"`
-	ByModel       map[string]int `json:"by_model"`
-}
+// VectorCoverage aliases the backend-agnostic vector model coverage summary.
+type VectorCoverage = storage.VectorCoverage
 
 // GetVectorCoverage reports active memory counts broken down by embedding_model.
 func (s *SQLiteStore) GetVectorCoverage(ctx context.Context, activeModel string) (*VectorCoverage, error) {
