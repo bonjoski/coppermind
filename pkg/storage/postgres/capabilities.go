@@ -13,6 +13,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/graph"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
@@ -339,6 +340,9 @@ func pgNodeMatchesFilter(n *brain.MemoryNode, f brain.MemoryFilter, nowNano int6
 		return false
 	}
 	if f.GitBranch != "" && (n.Metadata == nil || n.Metadata["git_branch"] != f.GitBranch) {
+		return false
+	}
+	if (f.Scope != "" || f.ScopeMode == scope.ModeExact) && !scope.Matches(n.Scope, f.Scope, f.ScopeMode) {
 		return false
 	}
 	return true
@@ -777,6 +781,7 @@ func (s *PostgresStore) ListTimeline(ctx context.Context, filter storage.Timelin
 		args = append(args, filter.Since.UnixNano())
 		idx++
 	}
+	query, args, idx = appendPostgresScopePredicate(query, args, idx, filter.Scope, filter.ScopeMode)
 	query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d", idx)
 	args = append(args, fetchLimit)
 
@@ -868,30 +873,65 @@ func (s *PostgresStore) GetLineage(ctx context.Context, id string) ([]*brain.Mem
 	return ancestors, audit, nil
 }
 
+// ListScopes aggregates active non-derived memory and invariant counts per canonical scope.
+func (s *PostgresStore) ListScopes(ctx context.Context) ([]storage.ScopeSummary, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT COALESCE(scope, ''),
+		       COUNT(*) AS mem_count,
+		       SUM(CASE WHEN authority_tier IN ('TIER_0_SOVEREIGN', 'TIER_1_ARCHITECTURE') THEN 1 ELSE 0 END) AS inv_count
+		FROM memory_nodes
+		WHERE derived = FALSE
+		  AND (lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL)
+		GROUP BY COALESCE(scope, '')
+		ORDER BY COALESCE(scope, '') ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []storage.ScopeSummary
+	for rows.Next() {
+		var sc string
+		var memCnt, invCnt int
+		if err := rows.Scan(&sc, &memCnt, &invCnt); err != nil {
+			return nil, err
+		}
+		out = append(out, storage.ScopeSummary{
+			Scope:          sc,
+			Depth:          scope.Depth(sc),
+			MemoryCount:    memCnt,
+			InvariantCount: invCnt,
+		})
+	}
+	return out, rows.Err()
+}
+
 // --- CartridgeStore ---
 
 // QueryActiveNodesForCartridge selects active, non-derived nodes matching cartridge export filters.
-func (s *PostgresStore) QueryActiveNodesForCartridge(ctx context.Context, repo, category, tier string, since *time.Time) ([]*brain.MemoryNode, error) {
+func (s *PostgresStore) QueryActiveNodesForCartridge(ctx context.Context, filter storage.CartridgeFilter) ([]*brain.MemoryNode, error) {
 	query := `SELECT ` + postgresMemoryColumns + `
 	          FROM memory_nodes
 	          WHERE derived = FALSE AND (lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL)`
 	var args []any
 	idx := 1
-	if category != "" {
+	if filter.Category != "" {
 		query += fmt.Sprintf(" AND category = $%d", idx)
-		args = append(args, category)
+		args = append(args, filter.Category)
 		idx++
 	}
-	if tier != "" {
+	if filter.Tier != "" {
 		query += fmt.Sprintf(" AND authority_tier = $%d", idx)
-		args = append(args, tier)
+		args = append(args, filter.Tier)
 		idx++
 	}
-	if since != nil {
+	if filter.Since != nil {
 		query += fmt.Sprintf(" AND created_at >= $%d", idx)
-		args = append(args, since.UnixNano())
+		args = append(args, filter.Since.UnixNano())
 		idx++
 	}
+	query, args, idx = appendPostgresScopePredicate(query, args, idx, filter.Scope, filter.ScopeMode)
 	query += " ORDER BY id ASC"
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -905,7 +945,7 @@ func (s *PostgresStore) QueryActiveNodesForCartridge(ctx context.Context, repo, 
 		if err != nil {
 			return nil, err
 		}
-		if repo != "" && (n.Metadata == nil || !strings.EqualFold(n.Metadata["git_repo"], repo)) {
+		if filter.Repo != "" && (n.Metadata == nil || !strings.EqualFold(n.Metadata["git_repo"], filter.Repo)) {
 			continue
 		}
 		out = append(out, n)

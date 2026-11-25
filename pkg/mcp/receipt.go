@@ -158,6 +158,7 @@ type IdeationReceiptInput struct {
 	ConjoinerSIRID       string
 	Lens                 string
 	Query                string
+	Scope                string
 	ResultsCount         int
 	OpenHighObservations int
 }
@@ -222,6 +223,9 @@ func EmitIdeationReceipt(ctx context.Context, in IdeationReceiptInput) (*Emitted
 		"lens":                   lensName,
 		"results_count":          in.ResultsCount,
 		"open_high_observations": in.OpenHighObservations,
+	}
+	if sc := strings.TrimSpace(in.Scope); sc != "" {
+		claims["scope"] = SanitizeSingleLine(sc)
 	}
 
 	sirID := strings.TrimSpace(in.ConjoinerSIRID)

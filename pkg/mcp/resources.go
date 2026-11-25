@@ -17,6 +17,7 @@ const (
 	ResourceURIInboxPending     = "coppermind://inbox/pending"
 	ResourceURIDecisionsRecent  = "coppermind://decisions/recent"
 	ResourceURIScratchpadActive = "coppermind://scratchpad/active"
+	ResourceURIScopesTree       = "coppermind://scopes/tree"
 )
 
 func (s *Server) handleResourcesList(msg *JSONRPCMessage) *JSONRPCMessage {
@@ -49,6 +50,12 @@ func (s *Server) handleResourcesList(msg *JSONRPCMessage) *JSONRPCMessage {
 			URI:         ResourceURIScratchpadActive,
 			Name:        "Active Scratchpad & Worktree Handoffs",
 			Description: "Current working memory keys and structured cross-agent handoff packets.",
+			MimeType:    "application/json",
+		},
+		{
+			URI:         ResourceURIScopesTree,
+			Name:        "Hierarchical Scope Tree",
+			Description: "Canonical hierarchical scopes (e.g. platform -> platform/payments) and active memory/invariant counts in the active project vault.",
 			MimeType:    "application/json",
 		},
 	}
@@ -146,6 +153,24 @@ func (s *Server) handleResourcesRead(ctx context.Context, msg *JSONRPCMessage) *
 			}
 		}
 		b, _ := json.MarshalIndent(map[string]any{"count": len(data), "entries": data}, "", "  ")
+		out, _ := NewSuccessResponse(msg.ID, ResourceReadResult{
+			Contents: []ResourceContent{{URI: uri, MimeType: "application/json", Text: string(b)}},
+		})
+		return out
+
+	case ResourceURIScopesTree:
+		var scopes []storage.ScopeSummary
+		if expStore, ok := s.manager.Store().(storage.ExplorerStore); ok {
+			var err error
+			scopes, err = expStore.ListScopes(ctx)
+			if err != nil {
+				return NewErrorResponse(msg.ID, ErrCodeInternalError, SanitizeSingleLine(err.Error()))
+			}
+		}
+		if scopes == nil {
+			scopes = []storage.ScopeSummary{}
+		}
+		b, _ := json.MarshalIndent(map[string]any{"count": len(scopes), "scopes": scopes}, "", "  ")
 		out, _ := NewSuccessResponse(msg.ID, ResourceReadResult{
 			Contents: []ResourceContent{{URI: uri, MimeType: "application/json", Text: string(b)}},
 		})

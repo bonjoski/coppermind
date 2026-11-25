@@ -9,6 +9,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/scope"
 )
 
 // SupersessionRecord models an immutable audit entry when a memory node is superseded.
@@ -51,10 +52,10 @@ func (s *PostgresStore) Supersede(
 	}
 	defer tx.Rollback()
 
-	// 1. Lock target node row FOR UPDATE and reject concurrent double-supersession fail-closed
+	// 1. Lock target node row FOR UPDATE and reject concurrent double-supersession & cross-scope supersession fail-closed
 	var targetTier, targetStatus string
-	var targetSupBy sql.NullString
-	err = tx.QueryRowContext(ctx, "SELECT authority_tier, lifecycle_status, superseded_by_id FROM memory_nodes WHERE id = $1 FOR UPDATE", targetID).Scan(&targetTier, &targetStatus, &targetSupBy)
+	var targetSupBy, targetScope sql.NullString
+	err = tx.QueryRowContext(ctx, "SELECT authority_tier, lifecycle_status, superseded_by_id, scope FROM memory_nodes WHERE id = $1 FOR UPDATE", targetID).Scan(&targetTier, &targetStatus, &targetSupBy, &targetScope)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("target memory node %q not found: %w", targetID, err)
@@ -63,6 +64,9 @@ func (s *PostgresStore) Supersede(
 	}
 	if strings.EqualFold(targetStatus, string(authz.StatusSuperseded)) {
 		return fmt.Errorf("target memory node %q is already superseded by %q: %w", targetID, targetSupBy.String, authz.ErrInvalidSupersession)
+	}
+	if targetScope.String != supersedingNode.Scope {
+		return fmt.Errorf("%w: cannot supersede memory %q in scope %q from scope %q", scope.ErrCrossScopeSupersession, targetID, targetScope.String, supersedingNode.Scope)
 	}
 
 	targetTierParsed := authz.ParseAuthorityTier(targetTier)

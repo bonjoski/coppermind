@@ -16,20 +16,23 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/gitscope"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
 )
 
 // IndexOptions configures codebase traversal and AST/structural incremental chunking.
 type IndexOptions struct {
-	MaxFileSize int64        // Maximum file size in bytes to index (default: 512KB)
-	MaxChunks   int          // Maximum total chunks to create per run (default: 10000)
-	SkipDirs    []string     // Extra directory names to skip
-	ChunkLines  int          // Target lines per structural fallback chunk (default: 50)
-	Overlap     int          // Overlap lines between fallback chunks (default: 5)
-	Category    string       // Target category (default: "code")
-	FullRebuild bool         // If true, ignore SHA-256 cache and re-index all candidate files
-	OnProgress  ProgressFunc // Optional callback for real-time indexing progress events
+	MaxFileSize     int64        // Maximum file size in bytes to index (default: 512KB)
+	MaxChunks       int          // Maximum total chunks to create per run (default: 10000)
+	SkipDirs        []string     // Extra directory names to skip
+	ChunkLines      int          // Target lines per structural fallback chunk (default: 50)
+	Overlap         int          // Overlap lines between fallback chunks (default: 5)
+	Category        string       // Target category (default: "code")
+	Scope           string       // Optional canonical hierarchical scope (e.g. "platform/payments")
+	ScopeFromConfig bool         // If true, resolve per-file scopes from repo-confined .coppermind.yaml
+	FullRebuild     bool         // If true, ignore SHA-256 cache and re-index all candidate files
+	OnProgress      ProgressFunc // Optional callback for real-time indexing progress events
 }
 
 // IndexStats reports the outcome of a codebase indexing run.
@@ -187,8 +190,13 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 		opts.Category = "code"
 	}
 
-	scope := gitscope.Detect(absRoot)
-	repoName := scope.RepoName
+	baseScope, err := scope.Normalize(opts.Scope)
+	if err != nil {
+		return nil, err
+	}
+
+	gitCtx := gitscope.Detect(absRoot)
+	repoName := gitCtx.RepoName
 	if repoName == "" {
 		repoName = filepath.Base(absRoot)
 	}
@@ -368,6 +376,11 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 			continue
 		}
 
+		fileScope, scErr := scope.ResolveFileScope(absRoot, cand.relPath, baseScope, opts.ScopeFromConfig)
+		if scErr != nil {
+			return stats, scErr
+		}
+
 		var newChunkIDs []string
 		fileIndexed := false
 		for _, chunk := range chunks {
@@ -400,7 +413,7 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 				"start_line":    fmt.Sprintf("%d", chunk.StartLine),
 				"end_line":      fmt.Sprintf("%d", chunk.EndLine),
 				"git_repo":      repoName,
-				"git_branch":    scope.Branch,
+				"git_branch":    gitCtx.Branch,
 				"indexed_at":    time.Now().UTC().Format(time.RFC3339),
 				"index_managed": "true",
 			}
@@ -414,6 +427,7 @@ func IndexDirectory(ctx context.Context, mgr *brain.Manager, rootDir string, opt
 			node, remErr := mgr.Remember(ctx, brain.RememberRequest{
 				SessionID:  indexSession,
 				Category:   cat,
+				Scope:      fileScope,
 				Content:    contentFormatted,
 				Provenance: brain.ProvenanceLocalWorkspace,
 				Metadata:   meta,

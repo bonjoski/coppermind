@@ -16,10 +16,11 @@ import (
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/graph"
-	_ "github.com/lib/pq"
+	"github.com/bonjoski/coppermind/pkg/scope"
+	"github.com/lib/pq"
 )
 
-const postgresMemoryColumns = `id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash, authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref, embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256`
+const postgresMemoryColumns = `id, session_id, category, content, vector_data::text, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash, authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref, embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256, scope`
 
 // PostgresStore implements brain.MemoryStore and all storage capability interfaces backed by PostgreSQL 17 + pgvector.
 type PostgresStore struct {
@@ -122,7 +123,8 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		embedding_dim INTEGER DEFAULT 0,
 		access_count INTEGER DEFAULT 0,
 		last_accessed_at BIGINT DEFAULT 0,
-		content_sha256 VARCHAR(64) DEFAULT ''
+		content_sha256 VARCHAR(64) DEFAULT '',
+		scope TEXT COLLATE "C" NOT NULL DEFAULT ''
 	);
 
 	-- Run ALTER TABLE statements FIRST so that missing columns on existing tables are added before indices
@@ -145,8 +147,10 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS access_count INTEGER DEFAULT 0;
 	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS last_accessed_at BIGINT DEFAULT 0;
 	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS content_sha256 VARCHAR(64) DEFAULT '';
+	ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS scope TEXT COLLATE "C" NOT NULL DEFAULT '';
 
 	CREATE INDEX IF NOT EXISTS idx_pg_session_id ON memory_nodes(session_id);
+	CREATE INDEX IF NOT EXISTS idx_pg_scope ON memory_nodes(scope);
 	CREATE INDEX IF NOT EXISTS idx_pg_category ON memory_nodes(category);
 	CREATE INDEX IF NOT EXISTS idx_pg_created_at ON memory_nodes(created_at);
 	CREATE INDEX IF NOT EXISTS idx_pg_expires_at ON memory_nodes(expires_at);
@@ -272,7 +276,7 @@ func ParseVector(str string) ([]float32, error) {
 	return vec, nil
 }
 
-// ComputeNodeHash computes the SHA-256 Merkle chain hash.
+// ComputeNodeHash computes the SHA-256 Merkle chain hash (v1 legacy/global).
 func ComputeNodeHash(prevHash, id, sessionID, category, content string, createdAtNano int64) string {
 	h := sha256.New()
 	h.Write([]byte(prevHash))
@@ -282,6 +286,69 @@ func ComputeNodeHash(prevHash, id, sessionID, category, content string, createdA
 	h.Write([]byte(content))
 	h.Write([]byte(strconv.FormatInt(createdAtNano, 10)))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ComputeNodeHashScoped preserves v1 hashes for unscoped/global nodes (scope == "")
+// and binds canonical scope into domain-separated v2 hashes so direct SQL scope tampering
+// is caught by VerifySessionChain.
+func ComputeNodeHashScoped(prevHash, id, sessionID, nodeScope, category, content string, createdAtNano int64) string {
+	if nodeScope == "" {
+		return ComputeNodeHash(prevHash, id, sessionID, category, content, createdAtNano)
+	}
+	h := sha256.New()
+	h.Write([]byte("cm-v2|"))
+	h.Write([]byte(prevHash))
+	h.Write([]byte("|"))
+	h.Write([]byte(id))
+	h.Write([]byte("|"))
+	h.Write([]byte(sessionID))
+	h.Write([]byte("|"))
+	h.Write([]byte(nodeScope))
+	h.Write([]byte("|"))
+	h.Write([]byte(category))
+	h.Write([]byte("|"))
+	h.Write([]byte(content))
+	h.Write([]byte("|"))
+	h.Write([]byte(strconv.FormatInt(createdAtNano, 10)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func appendPostgresScopePredicate(query string, args []any, idx int, targetScope string, mode scope.Mode) (string, []any, int) {
+	if targetScope == "" && mode != scope.ModeExact {
+		return query, args, idx
+	}
+	if mode == "" {
+		mode = scope.ModeAncestors
+	}
+	if mode == scope.ModeAll {
+		return query, args, idx
+	}
+	switch mode {
+	case scope.ModeExact:
+		query += fmt.Sprintf(" AND scope = $%d", idx)
+		args = append(args, targetScope)
+		return query, args, idx + 1
+	case scope.ModeAncestors:
+		query += fmt.Sprintf(" AND scope = ANY($%d)", idx)
+		args = append(args, pq.Array(scope.Ancestors(targetScope)))
+		return query, args, idx + 1
+	case scope.ModeSubtree:
+		if targetScope == "" {
+			return query, args, idx
+		}
+		query += fmt.Sprintf(" AND (scope = $%d OR starts_with(scope, $%d))", idx, idx+1)
+		args = append(args, targetScope, targetScope+"/")
+		return query, args, idx + 2
+	case scope.ModeLineage:
+		if targetScope == "" {
+			return query, args, idx
+		}
+		query += fmt.Sprintf(" AND (scope = ANY($%d) OR starts_with(scope, $%d))", idx, idx+1)
+		args = append(args, pq.Array(scope.Ancestors(targetScope)), targetScope+"/")
+		return query, args, idx + 2
+	default:
+		return query, args, idx
+	}
 }
 
 // Store persists a memory node into PostgreSQL inside a per-session advisory-locked transaction,
@@ -334,7 +401,7 @@ func (s *PostgresStore) storeNodeTx(ctx context.Context, tx *sql.Tx, node *brain
 			node.CreatedAt = time.Unix(0, lastCreatedNano+1)
 		}
 		node.PrevHash = prevHash
-		node.Hash = ComputeNodeHash(prevHash, node.ID, node.SessionID, node.Category, node.Content, node.CreatedAt.UnixNano())
+		node.Hash = ComputeNodeHashScoped(prevHash, node.ID, node.SessionID, node.Scope, node.Category, node.Content, node.CreatedAt.UnixNano())
 	}
 
 	var metaJSON []byte
@@ -394,10 +461,10 @@ func (s *PostgresStore) storeNodeTx(ctx context.Context, tx *sql.Tx, node *brain
 		id, session_id, category, content, vector_data, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
 		derived, source_lens, parent_ids_json, severity, status, dedup_hash,
 		authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref,
-		embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256
+		embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256, scope
 	) VALUES (
 		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-		$20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
+		$20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33
 	)
 	ON CONFLICT (id) DO UPDATE SET
 		category = EXCLUDED.category,
@@ -426,7 +493,8 @@ func (s *PostgresStore) storeNodeTx(ctx context.Context, tx *sql.Tx, node *brain
 		embedding_dim = EXCLUDED.embedding_dim,
 		access_count = EXCLUDED.access_count,
 		last_accessed_at = EXCLUDED.last_accessed_at,
-		content_sha256 = EXCLUDED.content_sha256;
+		content_sha256 = EXCLUDED.content_sha256,
+		scope = EXCLUDED.scope;
 	`
 
 	_, err := tx.ExecContext(ctx, query,
@@ -462,6 +530,7 @@ func (s *PostgresStore) storeNodeTx(ctx context.Context, tx *sql.Tx, node *brain
 		node.AccessCount,
 		lastAccessedNano,
 		node.ContentSHA256,
+		node.Scope,
 	)
 	if err != nil {
 		return err
@@ -510,7 +579,7 @@ func scanPostgresNode(scanner interface {
 		authorIdentity, authorRole                          sql.NullString
 		supersededByID, supersedesID                        sql.NullString
 		rationale, advisoryRef                              sql.NullString
-		embeddingModel, contentSHA256                       sql.NullString
+		embeddingModel, contentSHA256, nodeScope            sql.NullString
 		embeddingDim, accessCount                           sql.NullInt64
 		lastAccessedNano                                    sql.NullInt64
 	)
@@ -521,7 +590,7 @@ func scanPostgresNode(scanner interface {
 		&derived, &sourceLens, &parentIDsJSON, &severity, &status, &dedupHash,
 		&authorityTier, &lifecycleStatus, &authorIdentity, &authorRole,
 		&supersededByID, &supersedesID, &rationale, &advisoryRef,
-		&embeddingModel, &embeddingDim, &accessCount, &lastAccessedNano, &contentSHA256,
+		&embeddingModel, &embeddingDim, &accessCount, &lastAccessedNano, &contentSHA256, &nodeScope,
 	}
 	if scoreDest != nil {
 		dests = append(dests, scoreDest)
@@ -599,6 +668,7 @@ func scanPostgresNode(scanner interface {
 		AccessCount:     int(accessCount.Int64),
 		LastAccessedAt:  lastAccessed,
 		ContentSHA256:   contentSHA256.String,
+		Scope:           nodeScope.String,
 	}, nil
 }
 
@@ -681,6 +751,7 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 		args = append(args, filter.CreatedBefore.UnixNano())
 		idx++
 	}
+	query, args, idx = appendPostgresScopePredicate(query, args, idx, filter.Scope, filter.ScopeMode)
 
 	query += fmt.Sprintf(" ORDER BY vector_data <=> $1 ASC LIMIT $%d", idx)
 	limit := filter.Limit
@@ -689,7 +760,29 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 	}
 	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	var rows *sql.Rows
+	var err error
+	var readTx *sql.Tx
+	// Selective-scope HNSW guard (pgvector 0.8+): prevent post-filter candidate starvation
+	// on narrow leaf scopes with graceful SAVEPOINT fallback on older pgvector servers.
+	if (filter.Scope != "" || filter.ScopeMode == scope.ModeExact) && filter.ScopeMode != scope.ModeAll {
+		readTx, err = s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err == nil {
+			defer readTx.Rollback()
+			if _, spErr := readTx.ExecContext(ctx, "SAVEPOINT cm_hnsw"); spErr == nil {
+				if _, setErr := readTx.ExecContext(ctx, "SET LOCAL hnsw.iterative_scan = relaxed_order"); setErr != nil {
+					_, _ = readTx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT cm_hnsw")
+				} else {
+					_, _ = readTx.ExecContext(ctx, "RELEASE SAVEPOINT cm_hnsw")
+				}
+			}
+			rows, err = readTx.QueryContext(ctx, query, args...)
+		} else {
+			rows, err = s.db.QueryContext(ctx, query, args...)
+		}
+	} else {
+		rows, err = s.db.QueryContext(ctx, query, args...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -750,6 +843,9 @@ func (s *PostgresStore) RecallSemantic(ctx context.Context, queryVector []float3
 		if filter.CreatedBefore != nil && node.CreatedAt.UnixNano() > filter.CreatedBefore.UnixNano() {
 			continue
 		}
+		if (filter.Scope != "" || filter.ScopeMode == scope.ModeExact) && !scope.Matches(node.Scope, filter.Scope, filter.ScopeMode) {
+			continue
+		}
 
 		results = append(results, &brain.SearchResult{
 			Node:  node,
@@ -777,15 +873,17 @@ func (s *PostgresStore) RecallHybrid(ctx context.Context, query string, queryVec
 		nodesByID[r.Node.ID] = r.Node
 	}
 
-	// 2. Full text search
-	ftsSQL := fmt.Sprintf(`
+	// 2. Full text search (scope-filtered so FTS limit is not consumed by sibling branches)
+	ftsQuery := fmt.Sprintf(`
 	SELECT %s
 	FROM memory_nodes
-	WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)
-	LIMIT 50;
-	`, postgresMemoryColumns)
+	WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)`, postgresMemoryColumns)
+	ftsArgs := []any{query}
+	ftsIdx := 2
+	ftsQuery, ftsArgs, _ = appendPostgresScopePredicate(ftsQuery, ftsArgs, ftsIdx, filter.Scope, filter.ScopeMode)
+	ftsQuery += " LIMIT 50;"
 	ftsRanks := make(map[string]int)
-	rows, err := s.db.QueryContext(ctx, ftsSQL, query)
+	rows, err := s.db.QueryContext(ctx, ftsQuery, ftsArgs...)
 	if err == nil {
 		defer rows.Close()
 		rankIdx := 0
@@ -869,6 +967,9 @@ func (s *PostgresStore) RecallHybrid(ctx context.Context, query string, queryVec
 			continue
 		}
 		if filter.CreatedBefore != nil && node.CreatedAt.UnixNano() > filter.CreatedBefore.UnixNano() {
+			continue
+		}
+		if (filter.Scope != "" || filter.ScopeMode == scope.ModeExact) && !scope.Matches(node.Scope, filter.Scope, filter.ScopeMode) {
 			continue
 		}
 
@@ -1118,7 +1219,7 @@ func (s *PostgresStore) VerifySessionChain(ctx context.Context, sessionID string
 		if n.PrevHash != prevHash {
 			return false, i, n.ID, fmt.Errorf("tamper detected at node %s: expected prev_hash %s, got %s", n.ID, prevHash, n.PrevHash)
 		}
-		expectedHash := ComputeNodeHash(n.PrevHash, n.ID, n.SessionID, n.Category, n.Content, n.CreatedAt.UnixNano())
+		expectedHash := ComputeNodeHashScoped(n.PrevHash, n.ID, n.SessionID, n.Scope, n.Category, n.Content, n.CreatedAt.UnixNano())
 		if n.Hash != expectedHash {
 			return false, i, n.ID, fmt.Errorf("tamper detected at node %s: expected hash %s, stored hash %s", n.ID, expectedHash, n.Hash)
 		}

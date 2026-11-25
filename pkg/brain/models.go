@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bonjoski/coppermind/pkg/scope"
 	stormtaint "github.com/bonjoski/stormcage/pkg/taint"
 )
 
@@ -92,6 +93,9 @@ type MemoryNode struct {
 	AccessCount    int       `json:"access_count,omitempty"`
 	LastAccessedAt time.Time `json:"last_accessed_at,omitempty"`
 	ContentSHA256  string    `json:"content_sha256,omitempty"`
+
+	// Hierarchical Scope extension (RFC-2026-11-24-58): "" = vault-global, e.g. "platform/payments/webhooks"
+	Scope string `json:"scope,omitempty"`
 }
 
 // ConflictWarning alerts callers when a newly stored architectural memory may conflict
@@ -134,6 +138,11 @@ type MemoryFilter struct {
 	ActiveBranch  string     `json:"active_branch,omitempty"`
 	DisableMMR    bool       `json:"disable_mmr,omitempty"`
 	Explain       bool       `json:"explain,omitempty"`
+
+	// Hierarchical Scope filters (RFC-2026-11-24-58)
+	Scope       string     `json:"scope,omitempty"`
+	ScopeMode   scope.Mode `json:"scope_mode,omitempty"`
+	ActiveScope string     `json:"active_scope,omitempty"`
 }
 
 // SearchResult contains a retrieved memory node and its relevance score.

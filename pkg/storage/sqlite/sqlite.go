@@ -20,10 +20,11 @@ import (
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	_ "modernc.org/sqlite"
 )
 
-const sqliteMemoryColumns = "id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash, authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref, embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256"
+const sqliteMemoryColumns = "id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at, derived, source_lens, parent_ids_json, severity, status, dedup_hash, authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref, embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256, scope"
 
 type writeOpType int
 
@@ -146,11 +147,13 @@ func initSchema(db *sql.DB) error {
 		embedding_dim INTEGER NOT NULL DEFAULT 128,
 		access_count INTEGER NOT NULL DEFAULT 0,
 		last_accessed_at INTEGER NOT NULL DEFAULT 0,
-		content_sha256 TEXT NOT NULL DEFAULT ''
+		content_sha256 TEXT NOT NULL DEFAULT '',
+		scope TEXT NOT NULL DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS idx_memory_session ON memory_nodes(session_id);
 	CREATE INDEX IF NOT EXISTS idx_memory_category ON memory_nodes(category);
 	CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory_nodes(created_at);
+	CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_nodes(scope);
 
 	CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 		id UNINDEXED,
@@ -300,6 +303,8 @@ func initSchema(db *sql.DB) error {
 	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0")
 	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT 0")
 	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN content_sha256 TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE memory_nodes ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_nodes(scope)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_expires_at ON memory_nodes(expires_at)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_derived ON memory_nodes(derived)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_memory_source_lens ON memory_nodes(source_lens)")
@@ -341,6 +346,31 @@ func computeNodeHash(prevHash, id, sessionID, category, content string, createdA
 	h.Write([]byte(id))
 	h.Write([]byte(":"))
 	h.Write([]byte(sessionID))
+	h.Write([]byte(":"))
+	h.Write([]byte(category))
+	h.Write([]byte(":"))
+	h.Write([]byte(content))
+	h.Write([]byte(":"))
+	h.Write([]byte(strconv.FormatInt(createdAtNano, 10)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// computeNodeHashScoped preserves exact v1 Merkle hashes for legacy/global nodes (scope == "")
+// and binds canonical scope into domain-separated v2 hashes so direct SQLite scope escalation
+// (e.g., wiping scope to '' or promoting child->parent) is caught by VerifySessionChain.
+func computeNodeHashScoped(prevHash, id, sessionID, nodeScope, category, content string, createdAtNano int64) string {
+	if nodeScope == "" {
+		return computeNodeHash(prevHash, id, sessionID, category, content, createdAtNano)
+	}
+	h := sha256.New()
+	h.Write([]byte("cm-v2:"))
+	h.Write([]byte(prevHash))
+	h.Write([]byte(":"))
+	h.Write([]byte(id))
+	h.Write([]byte(":"))
+	h.Write([]byte(sessionID))
+	h.Write([]byte(":"))
+	h.Write([]byte(nodeScope))
 	h.Write([]byte(":"))
 	h.Write([]byte(category))
 	h.Write([]byte(":"))
@@ -456,7 +486,7 @@ func (s *SQLiteStore) storeNodeTx(tx *sql.Tx, node *brain.MemoryNode) error {
 			prevHash = "0000000000000000000000000000000000000000000000000000000000000000"
 		}
 		node.PrevHash = prevHash
-		node.Hash = computeNodeHash(node.PrevHash, node.ID, node.SessionID, node.Category, node.Content, node.CreatedAt.UnixNano())
+		node.Hash = computeNodeHashScoped(node.PrevHash, node.ID, node.SessionID, node.Scope, node.Category, node.Content, node.CreatedAt.UnixNano())
 	}
 
 	var expiresAtVal *int64
@@ -514,8 +544,8 @@ func (s *SQLiteStore) storeNodeTx(tx *sql.Tx, node *brain.MemoryNode) error {
 		id, session_id, category, content, vector_blob, provenance, taint_score, metadata_json, created_at, updated_at, prev_hash, hash, expires_at,
 		derived, source_lens, parent_ids_json, severity, status, dedup_hash,
 		authority_tier, lifecycle_status, author_identity, author_role, superseded_by_id, supersedes_id, rationale, advisory_ref,
-		embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		embedding_model, embedding_dim, access_count, last_accessed_at, content_sha256, scope
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		category=excluded.category,
 		content=excluded.content,
@@ -543,7 +573,8 @@ func (s *SQLiteStore) storeNodeTx(tx *sql.Tx, node *brain.MemoryNode) error {
 		advisory_ref=excluded.advisory_ref,
 		embedding_model=excluded.embedding_model,
 		embedding_dim=excluded.embedding_dim,
-		content_sha256=excluded.content_sha256;
+		content_sha256=excluded.content_sha256,
+		scope=excluded.scope;
 	`
 	_, err := tx.Exec(query,
 		node.ID,
@@ -578,6 +609,7 @@ func (s *SQLiteStore) storeNodeTx(tx *sql.Tx, node *brain.MemoryNode) error {
 		node.AccessCount,
 		lastAccessedNano,
 		contentSHA,
+		node.Scope,
 	)
 	if err != nil {
 		return err
@@ -626,9 +658,9 @@ func (s *SQLiteStore) execSupersede(req *supersedeReq) error {
 	defer tx.Rollback()
 
 	var targetTier, targetStatus string
-	var targetSupBy sql.NullString
-	row := tx.QueryRow("SELECT authority_tier, lifecycle_status, superseded_by_id FROM memory_nodes WHERE id = ?", req.targetID)
-	if err := row.Scan(&targetTier, &targetStatus, &targetSupBy); err != nil {
+	var targetSupBy, targetScope sql.NullString
+	row := tx.QueryRow("SELECT authority_tier, lifecycle_status, superseded_by_id, scope FROM memory_nodes WHERE id = ?", req.targetID)
+	if err := row.Scan(&targetTier, &targetStatus, &targetSupBy, &targetScope); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("target memory node %q not found: %w", req.targetID, err)
 		}
@@ -636,6 +668,9 @@ func (s *SQLiteStore) execSupersede(req *supersedeReq) error {
 	}
 	if strings.EqualFold(targetStatus, string(authz.StatusSuperseded)) {
 		return fmt.Errorf("target memory node %q is already superseded by %q: %w", req.targetID, targetSupBy.String, authz.ErrInvalidSupersession)
+	}
+	if targetScope.String != req.node.Scope {
+		return fmt.Errorf("%w: cannot supersede memory %q in scope %q from scope %q", scope.ErrCrossScopeSupersession, req.targetID, targetScope.String, req.node.Scope)
 	}
 
 	targetTierParsed := authz.ParseAuthorityTier(targetTier)
@@ -708,7 +743,7 @@ func scanNode(scanner interface {
 		authorIdentity, authorRole                                          sql.NullString
 		supersededByID, supersedesID                                        sql.NullString
 		rationale, advisoryRef                                              sql.NullString
-		embeddingModel, contentSHA256                                       sql.NullString
+		embeddingModel, contentSHA256, nodeScope                            sql.NullString
 		embeddingDim, accessCount                                           sql.NullInt64
 		lastAccessedNano                                                    sql.NullInt64
 	)
@@ -719,7 +754,7 @@ func scanNode(scanner interface {
 		&derivedInt, &sourceLens, &parentIDsJSON, &severity, &status, &dedupHash,
 		&authorityTier, &lifecycleStatus, &authorIdentity, &authorRole,
 		&supersededByID, &supersedesID, &rationale, &advisoryRef,
-		&embeddingModel, &embeddingDim, &accessCount, &lastAccessedNano, &contentSHA256,
+		&embeddingModel, &embeddingDim, &accessCount, &lastAccessedNano, &contentSHA256, &nodeScope,
 	)
 	if err != nil {
 		return nil, err
@@ -798,6 +833,7 @@ func scanNode(scanner interface {
 		AccessCount:     int(accessCount.Int64),
 		LastAccessedAt:  lastAccessed,
 		ContentSHA256:   contentSHA256.String,
+		Scope:           nodeScope.String,
 	}, nil
 }
 
@@ -1198,6 +1234,9 @@ func (s *SQLiteStore) RecallHybrid(ctx context.Context, query string, queryVecto
 		if filter.AuthorityTier != "" && node.AuthorityTier != filter.AuthorityTier {
 			continue
 		}
+		if (filter.Scope != "" || filter.ScopeMode == scope.ModeExact) && !scope.Matches(node.Scope, filter.Scope, filter.ScopeMode) {
+			continue
+		}
 
 		var rrf float32
 		if rank, ok := vecRanks[id]; ok {
@@ -1416,7 +1455,7 @@ func sanitizeFTS5Query(q string) string {
 // VerifySessionChain audits the cryptographic Merkle chain for a given session.
 func (s *SQLiteStore) VerifySessionChain(ctx context.Context, sessionID string) (bool, int, string, error) {
 	query := `
-	SELECT id, session_id, category, content, created_at, prev_hash, hash
+	SELECT id, session_id, category, content, created_at, prev_hash, hash, scope
 	FROM memory_nodes
 	WHERE session_id = ?
 	ORDER BY created_at ASC, rowid ASC;
@@ -1434,8 +1473,9 @@ func (s *SQLiteStore) VerifySessionChain(ctx context.Context, sessionID string) 
 		var (
 			id, sid, category, content, prevHash, storedHash string
 			createdAtNano                                    int64
+			nodeScope                                        sql.NullString
 		)
-		if err := rows.Scan(&id, &sid, &category, &content, &createdAtNano, &prevHash, &storedHash); err != nil {
+		if err := rows.Scan(&id, &sid, &category, &content, &createdAtNano, &prevHash, &storedHash, &nodeScope); err != nil {
 			return false, verifiedCount, "", err
 		}
 
@@ -1448,7 +1488,7 @@ func (s *SQLiteStore) VerifySessionChain(ctx context.Context, sessionID string) 
 			return false, verifiedCount, id, fmt.Errorf("cryptographic chain break at node %s: expected prev_hash %s, got %s", id, expectedPrevHash, prevHash)
 		}
 
-		computedHash := computeNodeHash(prevHash, id, sid, category, content, createdAtNano)
+		computedHash := computeNodeHashScoped(prevHash, id, sid, nodeScope.String, category, content, createdAtNano)
 		if computedHash != storedHash {
 			return false, verifiedCount, id, fmt.Errorf("tamper detected at node %s: expected hash %s, stored hash %s", id, computedHash, storedHash)
 		}

@@ -6,6 +6,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/graph"
+	"github.com/bonjoski/coppermind/pkg/scope"
 )
 
 // IndexedFileRecord tracks content hashes and stored chunk IDs for incremental codebase & vault sync.
@@ -51,9 +52,29 @@ type VectorCoverage struct {
 
 // TimelineFilter scopes chronological memory timeline queries across backends.
 type TimelineFilter struct {
-	Since *time.Time
-	Repo  string
-	Limit int
+	Since     *time.Time
+	Repo      string
+	Scope     string
+	ScopeMode scope.Mode
+	Limit     int
+}
+
+// ScopeSummary reports memory and architectural invariant counts for a canonical scope.
+type ScopeSummary struct {
+	Scope          string `json:"scope"`
+	Depth          int    `json:"depth"`
+	MemoryCount    int    `json:"memory_count"`
+	InvariantCount int    `json:"invariant_count"`
+}
+
+// CartridgeFilter selects active, non-derived nodes for selective .capsule v2 exports.
+type CartridgeFilter struct {
+	Repo      string
+	Category  string
+	Tier      string
+	Scope     string
+	ScopeMode scope.Mode
+	Since     *time.Time
 }
 
 // SupersessionAudit is a backend-agnostic supersession audit trail entry.
@@ -101,15 +122,16 @@ type VectorAdminStore interface {
 	ReindexVectors(ctx context.Context, emb brain.Embedder, modelName string, batchSize int, dryRun bool) (*ReindexStats, error)
 }
 
-// ExplorerStore powers Brain Explorer v2 timeline, proposals, and supersession lineage across backends.
+// ExplorerStore powers Brain Explorer v2 timeline, proposals, scopes, and supersession lineage across backends.
 type ExplorerStore interface {
 	ListTimeline(ctx context.Context, filter TimelineFilter) ([]*brain.MemoryNode, error)
 	ListProposals(ctx context.Context, limit int) ([]*brain.MemoryNode, error)
 	GetLineage(ctx context.Context, id string) ([]*brain.MemoryNode, []*SupersessionAudit, error)
+	ListScopes(ctx context.Context) ([]ScopeSummary, error)
 }
 
 // CartridgeStore provides selective filtered exports and SHA-256 dedup sets for .capsule v2 cartridges.
 type CartridgeStore interface {
-	QueryActiveNodesForCartridge(ctx context.Context, repo, category, tier string, since *time.Time) ([]*brain.MemoryNode, error)
+	QueryActiveNodesForCartridge(ctx context.Context, filter CartridgeFilter) ([]*brain.MemoryNode, error)
 	ListExistingContentHashes(ctx context.Context) (map[string]bool, error)
 }

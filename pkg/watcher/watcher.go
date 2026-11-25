@@ -17,6 +17,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/graph"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
@@ -39,9 +40,11 @@ var (
 
 // Options controls local read-only Markdown/Obsidian/ADR vault synchronization.
 type Options struct {
-	Category     string        // Defaults to "note"
-	Interval     time.Duration // Poll interval for WatchVault (defaults to 5s)
-	MaxFileBytes int64         // Max Markdown file bytes (defaults to 512 KiB)
+	Category      string        // Defaults to "note"
+	Scope         string        // Optional base canonical hierarchical scope
+	ScopeFromDirs bool          // If true, map relative subdirectories into nested child scopes
+	Interval      time.Duration // Poll interval for WatchVault (defaults to 5s)
+	MaxFileBytes  int64         // Max Markdown file bytes (defaults to 512 KiB)
 }
 
 // SyncStats reports the deterministic outcome of a single read-only vault sync pass.
@@ -100,6 +103,11 @@ func SyncVaultOnce(ctx context.Context, mgr *brain.Manager, rootDir string, opts
 		return nil, fmt.Errorf("failed confining vault root: %w", err)
 	}
 	defer rootFS.Close()
+
+	baseScope, err := scope.Normalize(opts.Scope)
+	if err != nil {
+		return nil, err
+	}
 
 	category := strings.TrimSpace(opts.Category)
 	if category == "" {
@@ -255,9 +263,17 @@ func SyncVaultOnce(ctx context.Context, mgr *brain.Manager, rootDir string, opts
 			meta["note_aliases"] = strings.Join(fm.Aliases, ",")
 		}
 
+		noteScope := baseScope
+		if opts.ScopeFromDirs {
+			if derivedScope, dErr := scope.FromRelativeDir(baseScope, filepath.ToSlash(filepath.Dir(rel))); dErr == nil {
+				noteScope = derivedScope
+			}
+		}
+
 		stored, storeErr := mgr.Remember(ctx, brain.RememberRequest{
 			SessionID:     sessionID,
 			Category:      category,
+			Scope:         noteScope,
 			Content:       contentBuf.String(),
 			Provenance:    brain.ProvenanceLocalWorkspace,
 			AuthorityTier: tier,

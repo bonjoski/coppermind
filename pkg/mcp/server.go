@@ -16,10 +16,12 @@ import (
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/capsule"
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/gitscope"
 	"github.com/bonjoski/coppermind/pkg/graph"
 	"github.com/bonjoski/coppermind/pkg/lenses"
 	"github.com/bonjoski/coppermind/pkg/project"
 	"github.com/bonjoski/coppermind/pkg/queue"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage"
@@ -205,6 +207,7 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"content": { "type": "string", "description": "The exact fact, insight, or invariant to remember." },
 					"category": { "type": "string", "description": "Category (e.g. architecture, convention, bug_fix, runbook, personal)." },
 					"project": { "type": "string", "description": "Optional isolated project vault name (e.g. github, personal, work)." },
+					"scope": { "type": "string", "description": "Optional canonical hierarchical scope within the vault (e.g. platform, platform/payments, platform/payments/webhooks). Empty means vault-global." },
 					"session_id": { "type": "string", "description": "Optional session/worktree identifier." },
 					"provenance": { "type": "string", "enum": ["TRUST_LOCAL_WORKSPACE", "TAINT_EXTERNAL_USER", "TAINT_UNTRUSTED_WEB"] },
 					"supersedes": { "type": "string", "description": "Optional UUID of previous memory to supersede and tombstone." },
@@ -223,6 +226,8 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 				"properties": {
 					"query": { "type": "string", "description": "Natural language query or ephemeral user story text to search/match." },
 					"project": { "type": "string", "description": "Optional isolated project vault name (e.g. github, personal, work)." },
+					"scope": { "type": "string", "description": "Optional canonical hierarchical scope within the vault (e.g. platform/payments/webhooks). Defaults to ancestor-inheriting recall excluding sibling branches." },
+					"scope_mode": { "type": "string", "enum": ["ancestors", "exact", "subtree", "lineage", "all"], "description": "How scope matches candidate memories (default: ancestors)." },
 					"category": { "type": "string", "description": "Optional category filter." },
 					"session_id": { "type": "string", "description": "Optional session filter." },
 					"limit": { "type": "integer", "description": "Max results to return (default 5; hard ceiling 2 for lens='mentor', 3 for lens='requirements')." },
@@ -301,6 +306,7 @@ func (s *Server) handleToolsList(msg *JSONRPCMessage) *JSONRPCMessage {
 					"content": { "type": "string", "description": "Inline candidate code or artifact content to inspect (bounded to 6,000 chars and secret-redacted)." },
 					"file_path": { "type": "string", "description": "Optional workspace file path for differential sibling-endpoint retrieval." },
 					"project": { "type": "string", "description": "Optional isolated project vault name." },
+					"scope": { "type": "string", "description": "Optional hierarchical scope grounding the lens audit against ancestor platform invariants." },
 					"session_id": { "type": "string", "description": "Optional session/worktree identifier cryptographically bound into eval_token." },
 					"from_inbox": { "type": "boolean", "description": "When true, automatically pop the oldest pending commit review ticket from the zero-key Pending Lens Inbox." },
 					"force": { "type": "boolean", "description": "Bypass zero-cost pre-filter gate even when no sensitive sinks match (default false)." }
@@ -556,6 +562,7 @@ func (s *Server) getManagerForProject(projectName string) (*brain.Manager, func(
 func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolCallResult, error) {
 	var input struct {
 		Project     string `json:"project"`
+		Scope       string `json:"scope"`
 		Content     string `json:"content"`
 		Category    string `json:"category"`
 		SessionID   string `json:"session_id"`
@@ -568,6 +575,12 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	gitCtx := gitscope.Detect("")
+	resolvedScope, err := scope.Resolve(input.Scope, "", gitCtx.RepoPath)
+	if err != nil {
+		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
 	mgr, cleanup, err := s.getManagerForProject(input.Project)
@@ -584,6 +597,7 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 	node, err := mgr.Remember(ctx, brain.RememberRequest{
 		SessionID:      input.SessionID,
 		Category:       input.Category,
+		Scope:          resolvedScope,
 		Content:        input.Content,
 		Provenance:     prov,
 		SupersedesID:   input.Supersedes,
@@ -600,7 +614,11 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 	if targetProj == "" {
 		targetProj = "active"
 	}
-	msg := fmt.Sprintf("Stored memory %s in vault %q [%s] (%s): %s", node.ID, targetProj, node.Category, node.Provenance, node.Content)
+	scopeLabel := ""
+	if node.Scope != "" {
+		scopeLabel = fmt.Sprintf(" scope=%q", node.Scope)
+	}
+	msg := fmt.Sprintf("Stored memory %s in vault %q%s [%s] (%s): %s", node.ID, targetProj, scopeLabel, node.Category, node.Provenance, node.Content)
 	if node.SupersedesID != "" {
 		msg = fmt.Sprintf("Stored memory %s in vault %q (superseded %s, status: %s): %s", node.ID, targetProj, node.SupersedesID, node.LifecycleStatus, node.Content)
 	} else if warnings := graph.DetectConflicts(ctx, mgr, node); len(warnings) > 0 {
@@ -615,6 +633,8 @@ func (s *Server) callRemember(ctx context.Context, args json.RawMessage) (*ToolC
 func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *ToolCallMeta) (*ToolCallResult, error) {
 	var input struct {
 		Project             string   `json:"project"`
+		Scope               string   `json:"scope"`
+		ScopeMode           string   `json:"scope_mode"`
 		Query               string   `json:"query"`
 		Category            string   `json:"category"`
 		SessionID           string   `json:"session_id"`
@@ -665,6 +685,7 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *Too
 			ConjoinerSIRID:       conjoinerSIRID,
 			Lens:                 lensName,
 			Query:                input.Query,
+			Scope:                strings.TrimSpace(input.Scope),
 			ResultsCount:         resultsCount,
 			OpenHighObservations: openHigh,
 		})
@@ -781,9 +802,26 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *Too
 		}
 	}
 
+	gitCtx := gitscope.Detect("")
+	resolvedScope, scErr := scope.Resolve(input.Scope, "", gitCtx.RepoPath)
+	if scErr != nil {
+		return nil, fmt.Errorf("validation failed: %w", scErr)
+	}
+	var parsedScopeMode scope.Mode
+	if strings.TrimSpace(input.ScopeMode) != "" {
+		m, mErr := scope.ParseMode(input.ScopeMode)
+		if mErr != nil {
+			return nil, fmt.Errorf("validation failed: %w", mErr)
+		}
+		parsedScopeMode = m
+	}
+
 	results, err := mgr.Recall(ctx, brain.RecallRequest{
 		SessionID:           input.SessionID,
 		Category:            input.Category,
+		Scope:               resolvedScope,
+		ScopeMode:           parsedScopeMode,
+		ActiveScope:         resolvedScope,
 		Query:               input.Query,
 		Limit:               input.Limit,
 		MinScore:            input.MinScore,
@@ -840,8 +878,12 @@ func (s *Server) callRecall(ctx context.Context, args json.RawMessage, meta *Too
 			catBadge = catBadge + " (learning)"
 		}
 
-		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] [%s | %s | %s]\n",
-			i+1, r.Score, tierBadge, catBadge, r.Node.Provenance))
+		scopeBadge := ""
+		if r.Node.Scope != "" {
+			scopeBadge = " | scope:" + r.Node.Scope
+		}
+		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] [%s | %s%s | %s]\n",
+			i+1, r.Score, tierBadge, catBadge, scopeBadge, r.Node.Provenance))
 		if len(r.GraphLinks) > 0 {
 			sb.WriteString(fmt.Sprintf("   [linked via: %s]\n", strings.Join(r.GraphLinks, ", ")))
 		}
@@ -1247,6 +1289,7 @@ type lensPrepareInput struct {
 	Content   string `json:"content"`
 	FilePath  string `json:"file_path"`
 	Project   string `json:"project"`
+	Scope     string `json:"scope"`
 	SessionID string `json:"session_id"`
 	FromInbox bool   `json:"from_inbox"`
 	Force     bool   `json:"force"`
@@ -1344,6 +1387,13 @@ func (s *Server) prepareLensBundle(ctx context.Context, input lensPrepareInput, 
 			Metadata:   nodeMeta,
 			CreatedAt:  time.Now().UTC(),
 		}
+	}
+	if strings.TrimSpace(input.Scope) != "" {
+		normSc, scErr := scope.Normalize(input.Scope)
+		if scErr != nil {
+			return nil, fmt.Errorf("validation failed: %w", scErr)
+		}
+		candidate.Scope = normSc
 	}
 
 	projName := strings.TrimSpace(input.Project)

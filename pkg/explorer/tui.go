@@ -98,6 +98,8 @@ func (t *TUI) Run(ctx context.Context) error {
 			t.renderLineage(ctx, arg)
 		case "proposals":
 			t.renderProposals(ctx)
+		case "scopes":
+			t.renderScopes(ctx)
 		case "delete", "rm":
 			if arg == "" {
 				fmt.Fprintln(t.out, "Usage: delete <memory_id>")
@@ -153,6 +155,31 @@ func (t *TUI) Run(ctx context.Context) error {
 		default:
 			t.renderSearch(ctx, line)
 		}
+	}
+}
+
+func (t *TUI) renderScopes(ctx context.Context) {
+	if t.expStore == nil {
+		fmt.Fprintln(t.out, "Scopes not supported by active storage backend.")
+		return
+	}
+	scopes, err := t.expStore.ListScopes(ctx)
+	if err != nil {
+		fmt.Fprintf(t.out, "Error listing scopes: %v\n", err)
+		return
+	}
+	if len(scopes) == 0 {
+		fmt.Fprintln(t.out, "No active memories in vault.")
+		return
+	}
+	fmt.Fprintln(t.out, "Hierarchical Scopes:")
+	for _, s := range scopes {
+		label := s.Scope
+		if label == "" {
+			label = "(vault-global)"
+		}
+		indent := strings.Repeat("  ", s.Depth)
+		fmt.Fprintf(t.out, "%s- %s  (%d memories, %d TIER_0/1 invariants)\n", indent, label, s.MemoryCount, s.InvariantCount)
 	}
 }
 

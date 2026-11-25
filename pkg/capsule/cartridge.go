@@ -22,6 +22,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/graph"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
@@ -51,15 +52,18 @@ type CartridgeManifest struct {
 	MerkleRoot    string    `json:"merkle_root"`
 	Signature     string    `json:"signature,omitempty"`
 	PublicKey     string    `json:"public_key,omitempty"`
-	FilterRepo    string    `json:"filter_repo,omitempty"`
-	FilterCat     string    `json:"filter_category,omitempty"`
-	FilterTier    string    `json:"filter_tier,omitempty"`
+	FilterRepo      string    `json:"filter_repo,omitempty"`
+	FilterCat       string    `json:"filter_category,omitempty"`
+	FilterTier      string    `json:"filter_tier,omitempty"`
+	FilterScope     string    `json:"filter_scope,omitempty"`
+	FilterScopeMode string    `json:"filter_scope_mode,omitempty"`
 }
 
 // CartridgeRecord is a portable, sanitized memory record stored in records.jsonl.
 type CartridgeRecord struct {
 	OriginalID    string            `json:"original_id"`
 	Category      string            `json:"category"`
+	Scope         string            `json:"scope,omitempty"`
 	Content       string            `json:"content"`
 	ContentSHA256 string            `json:"content_sha256"`
 	AuthorityTier string            `json:"authority_tier"`
@@ -74,6 +78,8 @@ type CartridgeExportOptions struct {
 	Repo       string
 	Category   string
 	Tier       string
+	Scope      string
+	ScopeMode  scope.Mode
 	Since      *time.Time
 	PrivateKey ed25519.PrivateKey
 }
@@ -83,6 +89,7 @@ type CartridgeMergeOptions struct {
 	RequiredPubKey ed25519.PublicKey
 	AllowUnsigned  bool
 	SessionID      string
+	ScopePrefix    string
 }
 
 // CartridgeMergeResult summarizes a non-destructive cartridge merge into an existing vault.
@@ -105,7 +112,28 @@ func ExportCartridge(ctx context.Context, store storage.CartridgeStore, outPath 
 		return nil, err
 	}
 
-	nodes, err := store.QueryActiveNodesForCartridge(ctx, opts.Repo, opts.Category, opts.Tier, opts.Since)
+	normScope, err := scope.Normalize(opts.Scope)
+	if err != nil {
+		return nil, err
+	}
+	scopeMode := opts.ScopeMode
+	if scopeMode != "" {
+		scopeMode, err = scope.ParseMode(string(scopeMode))
+		if err != nil {
+			return nil, err
+		}
+	} else if normScope != "" {
+		scopeMode = scope.ModeSubtree
+	}
+
+	nodes, err := store.QueryActiveNodesForCartridge(ctx, storage.CartridgeFilter{
+		Repo:      opts.Repo,
+		Category:  opts.Category,
+		Tier:      opts.Tier,
+		Scope:     normScope,
+		ScopeMode: scopeMode,
+		Since:     opts.Since,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +152,7 @@ func ExportCartridge(ctx context.Context, store storage.CartridgeStore, outPath 
 		records = append(records, CartridgeRecord{
 			OriginalID:    n.ID,
 			Category:      n.Category,
+			Scope:         n.Scope,
 			Content:       clean,
 			ContentSHA256: hex.EncodeToString(sum[:]),
 			AuthorityTier: n.AuthorityTier,
@@ -186,9 +215,11 @@ func ExportCartridge(ctx context.Context, store storage.CartridgeStore, outPath 
 		RecordCount:   len(records),
 		EdgeCount:     len(edges),
 		MerkleRoot:    merkleRoot,
-		FilterRepo:    opts.Repo,
-		FilterCat:     opts.Category,
-		FilterTier:    opts.Tier,
+		FilterRepo:      opts.Repo,
+		FilterCat:       opts.Category,
+		FilterTier:      opts.Tier,
+		FilterScope:     normScope,
+		FilterScopeMode: string(scopeMode),
 	}
 
 	if len(opts.PrivateKey) == ed25519.PrivateKeySize {
@@ -264,6 +295,10 @@ func MergeCartridge(ctx context.Context, mgr *brain.Manager, capsulePath string,
 		return nil, fmt.Errorf("brain manager is required")
 	}
 	if err := checkNoSymlinkPath(capsulePath); err != nil {
+		return nil, err
+	}
+	normScopePrefix, err := scope.Normalize(opts.ScopePrefix)
+	if err != nil {
 		return nil, err
 	}
 
@@ -438,9 +473,17 @@ func MergeCartridge(ctx context.Context, mgr *brain.Manager, capsulePath string,
 		meta["cartridge_name"] = manifest.Name
 		meta["cartridge_merkle"] = manifest.MerkleRoot
 
+		// Validate and optionally prefix record scope fail-closed
+		recScope, scErr := scope.Join(normScopePrefix, rec.Scope)
+		if scErr != nil {
+			res.QuarantinedSkip++
+			continue
+		}
+
 		stored, err := mgr.Remember(ctx, brain.RememberRequest{
 			SessionID:       sessionID,
 			Category:        rec.Category,
+			Scope:           recScope,
 			Content:         secRes.SanitizedText,
 			Provenance:      brain.ProvenanceLocalWorkspace,
 			AuthorityTier:   tier,

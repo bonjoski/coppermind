@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/scope"
 )
 
 // RelationType enumerates allowlisted knowledge graph edge relations.
@@ -200,12 +201,18 @@ func DetectConflicts(ctx context.Context, mgr *brain.Manager, candidate *brain.M
 		return nil
 	}
 
-	results, err := mgr.Recall(ctx, brain.RecallRequest{
+	recallReq := brain.RecallRequest{
 		Query:      candidate.Content,
 		Limit:      5,
 		Hybrid:     true,
 		DisableMMR: true,
-	})
+	}
+	if candidate.Scope != "" {
+		recallReq.Scope = candidate.Scope
+		recallReq.ScopeMode = scope.ModeAncestors
+		recallReq.ActiveScope = candidate.Scope
+	}
+	results, err := mgr.Recall(ctx, recallReq)
 	if err != nil || len(results) == 0 {
 		return nil
 	}
@@ -233,12 +240,20 @@ func DetectConflicts(ctx context.Context, mgr *brain.Manager, candidate *brain.M
 			if len(snippet) > 140 {
 				snippet = snippet[:140] + "..."
 			}
+			action := fmt.Sprintf("If this replaces %s, re-store with supersedes=%q and a rationale.", r.Node.ID, r.Node.ID)
+			if r.Node.Scope != candidate.Scope {
+				parentLabel := r.Node.Scope
+				if parentLabel == "" {
+					parentLabel = "(vault-global)"
+				}
+				action = fmt.Sprintf("Ancestor refinement of %s in scope %q: keep both for scoped exception, or target scope %q directly to supersede.", r.Node.ID, parentLabel, r.Node.Scope)
+			}
 			warnings = append(warnings, brain.ConflictWarning{
 				ConflictingNodeID: r.Node.ID,
 				AuthorityTier:     r.Node.AuthorityTier,
 				Similarity:        r.Score,
 				Summary:           snippet,
-				SuggestedAction:   fmt.Sprintf("If this replaces %s, re-store with supersedes=%q and a rationale.", r.Node.ID, r.Node.ID),
+				SuggestedAction:   action,
 			})
 			if len(warnings) >= 3 {
 				break

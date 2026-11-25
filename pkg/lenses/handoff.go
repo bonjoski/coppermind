@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/security"
 )
 
@@ -562,25 +563,35 @@ func recallContextForLens(ctx context.Context, mgr *brain.Manager, lens *LensCon
 	}
 
 	falseDerived := false
+	var scMode scope.Mode
+	if candidate.Scope != "" {
+		scMode = scope.ModeAncestors
+	}
 	for _, cat := range lens.RecallCategories {
 		recalled, err := mgr.Recall(ctx, brain.RecallRequest{
-			SessionID: candidate.SessionID,
-			Category:  cat,
-			Query:     candidate.Content,
-			Limit:     3,
-			MinScore:  0.0,
-			Hybrid:    true,
-			Derived:   &falseDerived,
+			SessionID:   candidate.SessionID,
+			Category:    cat,
+			Scope:       candidate.Scope,
+			ScopeMode:   scMode,
+			ActiveScope: candidate.Scope,
+			Query:       candidate.Content,
+			Limit:       3,
+			MinScore:    0.0,
+			Hybrid:      true,
+			Derived:     &falseDerived,
 		})
 		if (err != nil || len(recalled) == 0) && candidate.SessionID != "" {
-			// Fallback to project-wide recall so shared ADRs and industry_radar baselines are included.
+			// Fallback to project-wide recall (preserving scope ancestor inheritance) so shared ADRs and industry_radar baselines are included.
 			recalled, err = mgr.Recall(ctx, brain.RecallRequest{
-				Category: cat,
-				Query:    candidate.Content,
-				Limit:    3,
-				MinScore: 0.0,
-				Hybrid:   true,
-				Derived:  &falseDerived,
+				Category:    cat,
+				Scope:       candidate.Scope,
+				ScopeMode:   scMode,
+				ActiveScope: candidate.Scope,
+				Query:       candidate.Content,
+				Limit:       3,
+				MinScore:    0.0,
+				Hybrid:      true,
+				Derived:     &falseDerived,
 			})
 		}
 		if err != nil {

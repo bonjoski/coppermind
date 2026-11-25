@@ -13,6 +13,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/embedding"
 	"github.com/bonjoski/coppermind/pkg/gitscope"
 	"github.com/bonjoski/coppermind/pkg/lenses"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
@@ -25,6 +26,7 @@ const (
 // BriefRequest configures deterministic live context compilation.
 type BriefRequest struct {
 	RepoDir      string   `json:"repo_dir,omitempty"`
+	Scope        string   `json:"scope,omitempty"`
 	MaxTokens    int      `json:"max_tokens,omitempty"`
 	TouchedFiles []string `json:"touched_files,omitempty"`
 	Format       string   `json:"format,omitempty"` // "markdown" | "json"
@@ -34,6 +36,7 @@ type BriefRequest struct {
 type BriefResult struct {
 	Repo              string        `json:"repo"`
 	Branch            string        `json:"branch"`
+	Scope             string        `json:"scope,omitempty"`
 	TouchedFiles      []string      `json:"touched_files,omitempty"`
 	InvariantsCount   int           `json:"invariants_count"`
 	OpenAlertsCount   int           `json:"open_alerts_count"`
@@ -56,27 +59,33 @@ func Compile(ctx context.Context, mgr *brain.Manager, req BriefRequest) (*BriefR
 	maxChars := maxTokens * charsPerToken
 
 	repoDir := strings.TrimSpace(req.RepoDir)
-	scope := gitscope.Detect(repoDir)
-	repoName := scope.RepoName
+	gitCtx := gitscope.Detect(repoDir)
+	repoName := gitCtx.RepoName
 	if repoName == "" && repoDir != "" {
 		repoName = filepath.Base(repoDir)
 	}
 	if repoName == "" {
 		repoName = "workspace"
 	}
-	branch := scope.Branch
+	branch := gitCtx.Branch
 	if branch == "" {
 		branch = "main"
 	}
 
+	activeScope, err := scope.Resolve(req.Scope, repoDir, gitCtx.RepoPath)
+	if err != nil {
+		return nil, err
+	}
+
 	touched := req.TouchedFiles
-	if len(touched) == 0 && scope.IsGit {
+	if len(touched) == 0 && gitCtx.IsGit {
 		touched = detectDirtyFiles(ctx, repoDir)
 	}
 
 	res := &BriefResult{
 		Repo:         repoName,
 		Branch:       branch,
+		Scope:        activeScope,
 		TouchedFiles: touched,
 	}
 
@@ -109,6 +118,9 @@ func Compile(ctx context.Context, mgr *brain.Manager, req BriefRequest) (*BriefR
 				if n.AuthorityTier != "TIER_0_SOVEREIGN" && n.AuthorityTier != "TIER_1_ARCHITECTURE" {
 					continue
 				}
+				if activeScope != "" && !scope.Matches(n.Scope, activeScope, scope.ModeAncestors) {
+					continue
+				}
 				seen[n.ID] = true
 				slot1Lines = append(slot1Lines, fmt.Sprintf("- [%s] (%s) %s", n.AuthorityTier, f, compactLine(n.Content, 160)))
 				res.InvariantsCount++
@@ -122,17 +134,28 @@ func Compile(ctx context.Context, mgr *brain.Manager, req BriefRequest) (*BriefR
 		}
 	}
 	if len(slot1Lines) == 0 && mgr != nil {
-		// Fallback to active TIER_0/TIER_1 invariants for current repo
+		// Fallback to active TIER_0/TIER_1 invariants for current repo & ancestor scopes
+		q := repoName + " architecture invariant security policy"
+		if activeScope != "" {
+			q = activeScope + " " + q
+		}
 		recalled, _ := mgr.Recall(ctx, brain.RecallRequest{
-			Query:         repoName + " architecture invariant security policy",
+			Query:         q,
 			AuthorityTier: "TIER_1_ARCHITECTURE",
 			ActiveRepo:    repoName,
 			ActiveBranch:  branch,
+			Scope:         activeScope,
+			ScopeMode:     scope.ModeAncestors,
+			ActiveScope:   activeScope,
 			Hybrid:        true,
 			Limit:         3,
 		})
 		for _, r := range recalled {
-			slot1Lines = append(slot1Lines, fmt.Sprintf("- [%s] %s", r.Node.AuthorityTier, compactLine(r.Node.Content, 160)))
+			scopeTag := ""
+			if r.Node.Scope != "" {
+				scopeTag = " (" + r.Node.Scope + ")"
+			}
+			slot1Lines = append(slot1Lines, fmt.Sprintf("- [%s]%s %s", r.Node.AuthorityTier, scopeTag, compactLine(r.Node.Content, 160)))
 			res.InvariantsCount++
 		}
 	}
@@ -164,6 +187,9 @@ func Compile(ctx context.Context, mgr *brain.Manager, req BriefRequest) (*BriefR
 				Category:     cat,
 				ActiveRepo:   repoName,
 				ActiveBranch: branch,
+				Scope:        activeScope,
+				ScopeMode:    scope.ModeAncestors,
+				ActiveScope:  activeScope,
 				Hybrid:       true,
 				Limit:        2,
 			})
@@ -211,6 +237,9 @@ func Compile(ctx context.Context, mgr *brain.Manager, req BriefRequest) (*BriefR
 
 	// Assemble with downward rollover and strict hard ceiling
 	header := fmt.Sprintf("<coppermind_brief repo=%q branch=%q>\n", repoName, branch)
+	if activeScope != "" {
+		header = fmt.Sprintf("<coppermind_brief repo=%q branch=%q scope=%q>\n", repoName, branch, activeScope)
+	}
 	footer := "</coppermind_brief>"
 	avail := maxChars - len(header) - len(footer)
 	if avail < 200 {

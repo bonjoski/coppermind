@@ -17,6 +17,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
@@ -93,6 +94,7 @@ func NewWebServer(mgr *brain.Manager, opts WebOptions) (*WebServer, error) {
 	mux.HandleFunc("/api/v1/search", ws.handleSearch)
 	mux.HandleFunc("/api/v1/graph", ws.handleGraph)
 	mux.HandleFunc("/api/v1/timeline", ws.handleTimeline)
+	mux.HandleFunc("/api/v1/scopes", ws.handleScopes)
 	mux.HandleFunc("/api/v1/lineage/", ws.handleLineage)
 	mux.HandleFunc("/api/v1/memories/", ws.handleMemoryByID)
 	mux.HandleFunc("/api/v1/observations", ws.handleObservations)
@@ -282,6 +284,23 @@ func (w *WebServer) handleSearch(rw http.ResponseWriter, r *http.Request) {
 		}
 		req.CreatedAfter = &t
 	}
+	if rawScope := strings.TrimSpace(r.URL.Query().Get("scope")); rawScope != "" {
+		normScope, err := scope.Normalize(rawScope)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.Scope = normScope
+		req.ActiveScope = normScope
+	}
+	if rawMode := strings.TrimSpace(r.URL.Query().Get("scope_mode")); rawMode != "" {
+		mode, err := scope.ParseMode(rawMode)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.ScopeMode = mode
+	}
 	res, err := w.mgr.Recall(r.Context(), req)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -328,11 +347,31 @@ func (w *WebServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 		sincePtr = &t
 	}
 	repoFilter := strings.TrimSpace(r.URL.Query().Get("repo"))
+	var scopeFilter string
+	var scopeMode scope.Mode
+	if rawScope := strings.TrimSpace(r.URL.Query().Get("scope")); rawScope != "" {
+		normScope, err := scope.Normalize(rawScope)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+		scopeFilter = normScope
+	}
+	if rawMode := strings.TrimSpace(r.URL.Query().Get("scope_mode")); rawMode != "" {
+		m, err := scope.ParseMode(rawMode)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+		scopeMode = m
+	}
 
 	nodes, err := w.expStore.ListTimeline(r.Context(), storage.TimelineFilter{
-		Since: sincePtr,
-		Repo:  repoFilter,
-		Limit: limit,
+		Since:     sincePtr,
+		Repo:      repoFilter,
+		Scope:     scopeFilter,
+		ScopeMode: scopeMode,
+		Limit:     limit,
 	})
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -343,6 +382,7 @@ func (w *WebServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 		ID              string            `json:"id"`
 		SessionID       string            `json:"session_id"`
 		Category        string            `json:"category"`
+		Scope           string            `json:"scope,omitempty"`
 		Content         string            `json:"content"`
 		Metadata        map[string]string `json:"metadata,omitempty"`
 		AuthorityTier   string            `json:"authority_tier"`
@@ -358,6 +398,7 @@ func (w *WebServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 			ID:              n.ID,
 			SessionID:       n.SessionID,
 			Category:        n.Category,
+			Scope:           n.Scope,
 			Content:         n.Content,
 			Metadata:        n.Metadata,
 			AuthorityTier:   n.AuthorityTier,
@@ -368,6 +409,19 @@ func (w *WebServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{"count": len(items), "items": items})
+}
+
+func (w *WebServer) handleScopes(rw http.ResponseWriter, r *http.Request) {
+	if w.expStore == nil {
+		writeJSON(rw, http.StatusOK, map[string]any{"count": 0, "scopes": []any{}})
+		return
+	}
+	scopes, err := w.expStore.ListScopes(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{"count": len(scopes), "scopes": scopes})
 }
 
 func (w *WebServer) handleLineage(rw http.ResponseWriter, r *http.Request) {

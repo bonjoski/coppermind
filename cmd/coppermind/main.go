@@ -22,6 +22,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/daemon"
 	"github.com/bonjoski/coppermind/pkg/doctor"
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/gitscope"
 	"github.com/bonjoski/coppermind/pkg/hook"
 	"github.com/bonjoski/coppermind/pkg/indexer"
 	"github.com/bonjoski/coppermind/pkg/keystore"
@@ -31,6 +32,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/queue"
 	"github.com/bonjoski/coppermind/pkg/radar"
 	"github.com/bonjoski/coppermind/pkg/router"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/seeder"
 	"github.com/bonjoski/coppermind/pkg/storage"
@@ -117,6 +119,8 @@ func main() {
 		runVacuum(cmdArgs)
 	case "project", "projects":
 		runProject(cmdArgs)
+	case "scope", "scopes":
+		runScope(cmdArgs)
 	case "config":
 		runConfig(cmdArgs)
 	case "doctor":
@@ -195,6 +199,7 @@ Commands:
   verify       Audit cryptographic Merkle chain integrity for a session
   vacuum       Purge expired TTL memories and compact SQLite storage
   project      Manage isolated vaults (list, use, create, delete)
+  scope        Inspect hierarchical scopes and inherited invariants inside a vault (list, show)
   config       Display or update persistent configuration (provider, model, endpoint)
   doctor       Execute the 11-pillar diagnostic inspection suite
   hook         Manage Git episodic capture and Stormcage diff integrity hooks (install, uninstall, status, check, verify-diff)
@@ -468,6 +473,7 @@ func runRemember(args []string) {
 	project := fs.String("project", "", "Target project vault (e.g. github, personal, work)")
 	category := fs.String("category", "general", "Category (architecture, convention, decision, runbook)")
 	session := fs.String("session", "default", "Session or worktree identifier")
+	scopeFlag := fs.String("scope", "", "Optional hierarchical scope (e.g. platform/payments/webhooks; resolves via COPPERMIND_SCOPE or .coppermind.yaml)")
 	ttl := fs.Duration("ttl", 0, "Optional TTL (e.g. 24h, 30m) after which the memory expires")
 	supersedes := fs.String("supersedes", "", "UUID of previous memory node to supersede and tombstone")
 	rationale := fs.String("rationale", "", "Mandatory rationale when superseding an existing memory")
@@ -538,9 +544,17 @@ func runRemember(args []string) {
 		os.Exit(1)
 	}
 
+	gitCtx := gitscope.Detect("")
+	resolvedScope, scErr := scope.Resolve(*scopeFlag, "", gitCtx.RepoPath)
+	if scErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", scErr)
+		os.Exit(1)
+	}
+
 	node, err := mgr.Remember(context.Background(), brain.RememberRequest{
 		SessionID:       *session,
 		Category:        *category,
+		Scope:           resolvedScope,
 		Content:         content,
 		Provenance:      provenance,
 		TTL:             *ttl,
@@ -561,16 +575,20 @@ func runRemember(args []string) {
 	if node.ExpiresAt != nil {
 		expMsg = fmt.Sprintf(" (expires %s)", node.ExpiresAt.Format("2006-01-02 15:04"))
 	}
+	scopeMsg := ""
+	if node.Scope != "" {
+		scopeMsg = fmt.Sprintf(" scope=%q", node.Scope)
+	}
 
 	if status == authz.StatusProposed {
-		fmt.Printf("⚠ Write intercepted: role %q lacks authority for %s. Quarantined as PROPOSED observation [%s] in vault %q: %s\n",
-			authorRole, node.AuthorityTier, node.ID, activeProj, node.Content)
+		fmt.Printf("⚠ Write intercepted: role %q lacks authority for %s. Quarantined as PROPOSED observation [%s] in vault %q%s: %s\n",
+			authorRole, node.AuthorityTier, node.ID, activeProj, scopeMsg, node.Content)
 	} else if *supersedes != "" {
-		fmt.Printf("✓ Stored memory [%s] in vault %q (superseded [%s], %s)%s: %s\n",
-			node.ID, activeProj, *supersedes, node.AuthorityTier, expMsg, node.Content)
+		fmt.Printf("✓ Stored memory [%s] in vault %q%s (superseded [%s], %s)%s: %s\n",
+			node.ID, activeProj, scopeMsg, *supersedes, node.AuthorityTier, expMsg, node.Content)
 	} else {
-		fmt.Printf("✓ Stored memory [%s] in vault %q [%s | %s]%s: %s\n",
-			node.ID, activeProj, node.AuthorityTier, node.Category, expMsg, node.Content)
+		fmt.Printf("✓ Stored memory [%s] in vault %q%s [%s | %s]%s: %s\n",
+			node.ID, activeProj, scopeMsg, node.AuthorityTier, node.Category, expMsg, node.Content)
 	}
 }
 
@@ -582,6 +600,8 @@ func runRecall(args []string) {
 	session := fs.String("session", "", "Optional session filter")
 	repo := fs.String("repo", "", "Optional git repository scope filter")
 	branch := fs.String("branch", "", "Optional git branch scope filter")
+	scopeFlag := fs.String("scope", "", "Optional hierarchical scope filter (e.g. platform/payments/webhooks)")
+	scopeModeFlag := fs.String("scope-mode", "", "Scope matching mode (ancestors|exact|subtree|lineage|all; default ancestors when scoped)")
 	limit := fs.Int("limit", 5, "Maximum results to retrieve")
 	minScore := fs.Float64("min-score", 0.0, "Minimum cosine score threshold")
 	hybrid := fs.Bool("hybrid", true, "Use hybrid FTS5 BM25 + vector RRF search (default true)")
@@ -683,9 +703,28 @@ func runRecall(args []string) {
 		createdBefore = &t
 	}
 
+	gitCtx := gitscope.Detect("")
+	resolvedScope, scErr := scope.Resolve(*scopeFlag, "", gitCtx.RepoPath)
+	if scErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", scErr)
+		os.Exit(1)
+	}
+	var parsedScopeMode scope.Mode
+	if strings.TrimSpace(*scopeModeFlag) != "" {
+		m, mErr := scope.ParseMode(*scopeModeFlag)
+		if mErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", mErr)
+			os.Exit(1)
+		}
+		parsedScopeMode = m
+	}
+
 	results, err := mgr.Recall(context.Background(), brain.RecallRequest{
 		SessionID:           *session,
 		Category:            *category,
+		Scope:               resolvedScope,
+		ScopeMode:           parsedScopeMode,
+		ActiveScope:         resolvedScope,
 		Query:               query,
 		Limit:               *limit,
 		MinScore:            float32(*minScore),
@@ -731,11 +770,15 @@ func runRecall(args []string) {
 			catBadge = catBadge + " (learning)"
 		}
 
-		fmt.Printf("%d. [Score: %.3f] [%s | %s | %s]\n",
-			i+1, r.Score, tierBadge, catBadge, r.Node.SessionID)
+		scopeBadge := ""
+		if r.Node.Scope != "" {
+			scopeBadge = " | scope:" + r.Node.Scope
+		}
+		fmt.Printf("%d. [Score: %.3f] [%s | %s%s | %s]\n",
+			i+1, r.Score, tierBadge, catBadge, scopeBadge, r.Node.SessionID)
 		if *explain && r.Breakdown != nil {
-			fmt.Printf("   [explain: hybrid=%.2f actr=%.2f repo=%.2f graph=%.2f tier=%.2f]\n",
-				r.Breakdown.HybridScore, r.Breakdown.RecencyACTR, r.Breakdown.RepoAffinity, r.Breakdown.GraphBoost, r.Breakdown.TierWeight)
+			fmt.Printf("   [explain: hybrid=%.2f actr=%.2f scope=%.2f repo=%.2f graph=%.2f tier=%.2f]\n",
+				r.Breakdown.HybridScore, r.Breakdown.RecencyACTR, r.Breakdown.ScopeAffinity, r.Breakdown.RepoAffinity, r.Breakdown.GraphBoost, r.Breakdown.TierWeight)
 		}
 		if len(r.GraphLinks) > 0 {
 			fmt.Printf("   [graph-links: %s]\n", strings.Join(r.GraphLinks, ", "))
@@ -1056,6 +1099,8 @@ func runIndex(args []string) {
 	project := fs.String("project", "", "Target project vault")
 	targetDir := fs.String("dir", ".", "Codebase directory to index")
 	category := fs.String("category", "code", "Category for indexed code chunks")
+	scopeFlag := fs.String("scope", "", "Optional hierarchical scope for indexed chunks (e.g. platform/payments)")
+	scopeFromConfig := fs.Bool("scope-from-config", false, "Resolve per-file scopes from repo-confined .coppermind.yaml")
 	maxChunks := fs.Int("max-chunks", 1000, "Maximum chunks to index")
 	chunkLines := fs.Int("chunk-lines", 50, "Lines per chunk")
 	noProgress := fs.Bool("no-progress", false, "Disable progress meter")
@@ -1082,10 +1127,12 @@ func runIndex(args []string) {
 	defer meter.Close()
 
 	stats, err := indexer.IndexDirectory(context.Background(), mgr, *targetDir, indexer.IndexOptions{
-		Category:   *category,
-		MaxChunks:  *maxChunks,
-		ChunkLines: *chunkLines,
-		OnProgress: meter.Update,
+		Category:        *category,
+		Scope:           *scopeFlag,
+		ScopeFromConfig: *scopeFromConfig,
+		MaxChunks:       *maxChunks,
+		ChunkLines:      *chunkLines,
+		OnProgress:      meter.Update,
 	})
 	_ = meter.Close()
 
@@ -2239,6 +2286,8 @@ func runCapsule(args []string) {
 			if a == "--repo" || strings.HasPrefix(a, "--repo=") ||
 				a == "--tier" || strings.HasPrefix(a, "--tier=") ||
 				a == "--category" || strings.HasPrefix(a, "--category=") ||
+				a == "--scope" || strings.HasPrefix(a, "--scope=") ||
+				a == "--scope-mode" || strings.HasPrefix(a, "--scope-mode=") ||
 				a == "--since" || strings.HasPrefix(a, "--since=") ||
 				a == "--key" || strings.HasPrefix(a, "--key=") {
 				isCartridgeExport = true

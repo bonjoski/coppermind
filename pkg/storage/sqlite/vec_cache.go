@@ -12,6 +12,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/brain"
 	"github.com/bonjoski/coppermind/pkg/embedding"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
 
@@ -35,6 +36,7 @@ type VectorSlabEntry struct {
 	ExpiresAtNano   int64 // 0 means no expiration
 	EmbeddingModel  string
 	EmbeddingDim    int
+	Scope           string
 	Vector          []float32
 }
 
@@ -152,6 +154,7 @@ func nodeToSlabEntry(node *brain.MemoryNode) VectorSlabEntry {
 		ExpiresAtNano:   exp,
 		EmbeddingModel:  node.EmbeddingModel,
 		EmbeddingDim:    dim,
+		Scope:           node.Scope,
 		Vector:          vecCopy,
 	}
 }
@@ -230,6 +233,9 @@ func entryMatchesFilter(e VectorSlabEntry, filter brain.MemoryFilter, nowNano in
 		return false
 	}
 	if filter.AuthorityTier != "" && e.AuthorityTier != filter.AuthorityTier {
+		return false
+	}
+	if (filter.Scope != "" || filter.ScopeMode == scope.ModeExact) && !scope.Matches(e.Scope, filter.Scope, filter.ScopeMode) {
 		return false
 	}
 	if filter.CreatedAfter != nil && e.CreatedAtNano < filter.CreatedAfter.UnixNano() {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/bonjoski/coppermind/pkg/authz"
 	"github.com/bonjoski/coppermind/pkg/gitscope"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -42,6 +43,9 @@ type RememberRequest struct {
 	SupersedesID    string `json:"supersedes_id,omitempty"`
 	Rationale       string `json:"rationale,omitempty"`
 	AdvisoryRef     string `json:"advisory_ref,omitempty"`
+
+	// Hierarchical Scope field (RFC-2026-11-24-58): "" = vault-global
+	Scope string `json:"scope,omitempty"`
 }
 
 // RecallRequest specifies query parameters for retrieving memories.
@@ -74,6 +78,11 @@ type RecallRequest struct {
 	ActiveBranch  string     `json:"active_branch,omitempty"`
 	DisableMMR    bool       `json:"disable_mmr,omitempty"`
 	Explain       bool       `json:"explain,omitempty"`
+
+	// Hierarchical Scope filters (RFC-2026-11-24-58)
+	Scope       string     `json:"scope,omitempty"`
+	ScopeMode   scope.Mode `json:"scope_mode,omitempty"`
+	ActiveScope string     `json:"active_scope,omitempty"`
 }
 
 // EventHook is invoked when a canonical memory is successfully stored.
@@ -259,6 +268,11 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		return nil, fmt.Errorf("content cannot be empty")
 	}
 
+	normScope, err := scope.Normalize(req.Scope)
+	if err != nil {
+		return nil, err
+	}
+
 	if req.Provenance == "" {
 		req.Provenance = ProvenanceLocalWorkspace
 	}
@@ -321,11 +335,13 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		return nil, fmt.Errorf("embedding generation failed: %w", err)
 	}
 
-	// 5. Intelligent Near-Duplicate Deduplication: Check if identical content exists in session if requested
+	// 5. Intelligent Near-Duplicate Deduplication: Check if identical content exists in session+scope if requested
 	if req.Deduplicate {
 		existing, _ := m.store.RecallSemantic(ctx, vec, MemoryFilter{
 			SessionID: req.SessionID,
 			Category:  req.Category,
+			Scope:     normScope,
+			ScopeMode: scope.ModeExact,
 			Limit:     1,
 			MinScore:  0.98,
 		})
@@ -397,6 +413,7 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 		EmbeddingModel:  m.EmbedderModelName(),
 		EmbeddingDim:    len(vec),
 		ContentSHA256:   hex.EncodeToString(contentSum[:]),
+		Scope:           normScope,
 	}
 
 	type superseder interface {
@@ -404,6 +421,13 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 	}
 
 	if req.SupersedesID != "" {
+		// Fail-closed cross-scope supersession guard (also enforced atomically inside storage tx).
+		if target, tErr := m.store.GetByID(ctx, req.SupersedesID); tErr == nil && target != nil {
+			if target.Scope != normScope {
+				return nil, fmt.Errorf("%w: cannot supersede memory %q in scope %q from scope %q",
+					scope.ErrCrossScopeSupersession, req.SupersedesID, target.Scope, normScope)
+			}
+		}
 		if s, ok := m.store.(superseder); ok {
 			if err := s.Supersede(ctx, node, req.SupersedesID, req.Rationale, req.AdvisoryRef, req.AuthorIdentity, req.AuthorRole); err != nil {
 				return nil, fmt.Errorf("supersession failed: %w", err)
@@ -440,6 +464,24 @@ func (m *Manager) Remember(ctx context.Context, req RememberRequest) (*MemoryNod
 func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResult, error) {
 	if strings.TrimSpace(req.Query) == "" {
 		return nil, fmt.Errorf("query cannot be empty")
+	}
+
+	normScope, err := scope.Normalize(req.Scope)
+	if err != nil {
+		return nil, err
+	}
+	normActiveScope, err := scope.Normalize(req.ActiveScope)
+	if err != nil {
+		return nil, err
+	}
+	scopeMode := req.ScopeMode
+	if scopeMode != "" {
+		scopeMode, err = scope.ParseMode(string(scopeMode))
+		if err != nil {
+			return nil, err
+		}
+	} else if normScope != "" {
+		scopeMode = scope.ModeAncestors
 	}
 
 	normalizedQuery := sanitizeText(req.Query)
@@ -481,6 +523,9 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 		ActiveBranch:        req.ActiveBranch,
 		DisableMMR:          req.DisableMMR,
 		Explain:             req.Explain,
+		Scope:               normScope,
+		ScopeMode:           scopeMode,
+		ActiveScope:         normActiveScope,
 	}
 
 	var results []*SearchResult
@@ -536,9 +581,15 @@ func (m *Manager) Recall(ctx context.Context, req RecallRequest) ([]*SearchResul
 		activeBranch = req.GitBranch
 	}
 
+	activeScope := normActiveScope
+	if activeScope == "" && normScope != "" {
+		activeScope = normScope
+	}
+
 	rerankCfg := DefaultRerankConfig()
 	rerankCfg.ActiveRepo = activeRepo
 	rerankCfg.ActiveBranch = activeBranch
+	rerankCfg.ActiveScope = activeScope
 	rerankCfg.DisableMMR = req.DisableMMR
 	rerankCfg.Limit = targetLimit
 

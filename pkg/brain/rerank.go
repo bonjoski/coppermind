@@ -5,22 +5,26 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/bonjoski/coppermind/pkg/scope"
 )
 
 // ScoreBreakdown exposes normalized per-signal scoring components for `--explain` and Brain Explorer.
 type ScoreBreakdown struct {
-	HybridScore  float32 `json:"hybrid_score"`
-	RecencyACTR  float32 `json:"recency_actr"`
-	RepoAffinity float32 `json:"repo_affinity"`
-	GraphBoost   float32 `json:"graph_boost"`
-	TierWeight   float32 `json:"tier_weight"`
-	FinalScore   float32 `json:"final_score"`
+	HybridScore   float32 `json:"hybrid_score"`
+	RecencyACTR   float32 `json:"recency_actr"`
+	RepoAffinity  float32 `json:"repo_affinity"`
+	ScopeAffinity float32 `json:"scope_affinity,omitempty"`
+	GraphBoost    float32 `json:"graph_boost"`
+	TierWeight    float32 `json:"tier_weight"`
+	FinalScore    float32 `json:"final_score"`
 }
 
-// RerankConfig controls composite relevance, ACT-R reinforcement, repo affinity, and MMR diversity.
+// RerankConfig controls composite relevance, ACT-R reinforcement, repo/scope affinity, and MMR diversity.
 type RerankConfig struct {
 	ActiveRepo       string
 	ActiveBranch     string
+	ActiveScope      string
 	MMRLambda        float32 // Default 0.75 (0 = pure diversity, 1 = pure relevance)
 	HalfLifeDays     float64 // Default 30.0
 	Tier01RecencyMin float32 // Default 0.70 (core architecture invariants never decay away)
@@ -83,23 +87,30 @@ func RerankResults(results []*SearchResult, cfg RerankConfig) []*SearchResult {
 
 		recency := computeACTRScore(node, cfg)
 		repoAff := computeRepoAffinity(node, cfg.ActiveRepo, cfg.ActiveBranch)
+		scopeAff := scope.Affinity(node.Scope, cfg.ActiveScope)
 		graphBoost := float32(0.0)
 		if len(r.GraphLinks) > 0 {
 			graphBoost = clamp01(0.45 + 0.15*float32(len(r.GraphLinks)))
 		}
 
 		tierW := authorityTierWeight(node.AuthorityTier)
-		rawComposite := 0.58*hybridNorm + 0.18*recency + 0.14*repoAff + 0.10*graphBoost
+		var rawComposite float32
+		if cfg.ActiveScope != "" {
+			rawComposite = 0.54*hybridNorm + 0.16*recency + 0.14*scopeAff + 0.08*repoAff + 0.08*graphBoost
+		} else {
+			rawComposite = 0.58*hybridNorm + 0.18*recency + 0.14*repoAff + 0.10*graphBoost
+		}
 		finalScore := clamp01(rawComposite * tierW)
 
 		r.Score = finalScore
 		r.Breakdown = &ScoreBreakdown{
-			HybridScore:  hybridNorm,
-			RecencyACTR:  recency,
-			RepoAffinity: repoAff,
-			GraphBoost:   graphBoost,
-			TierWeight:   tierW,
-			FinalScore:   finalScore,
+			HybridScore:   hybridNorm,
+			RecencyACTR:   recency,
+			RepoAffinity:  repoAff,
+			ScopeAffinity: scopeAff,
+			GraphBoost:    graphBoost,
+			TierWeight:    tierW,
+			FinalScore:    finalScore,
 		}
 	}
 

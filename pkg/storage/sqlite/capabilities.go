@@ -2,12 +2,55 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"strings"
-	"time"
 
 	"github.com/bonjoski/coppermind/pkg/brain"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/storage"
 )
+
+func appendSQLiteScopePredicate(query string, args []any, targetScope string, mode scope.Mode) (string, []any) {
+	if targetScope == "" && mode != scope.ModeExact {
+		return query, args
+	}
+	if mode == "" {
+		mode = scope.ModeAncestors
+	}
+	if mode == scope.ModeAll {
+		return query, args
+	}
+	switch mode {
+	case scope.ModeExact:
+		return query + " AND scope = ?", append(args, targetScope)
+	case scope.ModeAncestors:
+		anc := scope.Ancestors(targetScope)
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(anc)), ",")
+		for _, a := range anc {
+			args = append(args, a)
+		}
+		return query + " AND scope IN (" + placeholders + ")", args
+	case scope.ModeSubtree:
+		if targetScope == "" {
+			return query, args
+		}
+		lo, hi := scope.SubtreeBounds(targetScope)
+		return query + " AND (scope = ? OR (scope >= ? AND scope < ?))", append(args, targetScope, lo, hi)
+	case scope.ModeLineage:
+		if targetScope == "" {
+			return query, args
+		}
+		anc := scope.Ancestors(targetScope)
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(anc)), ",")
+		for _, a := range anc {
+			args = append(args, a)
+		}
+		lo, hi := scope.SubtreeBounds(targetScope)
+		return query + " AND (scope IN (" + placeholders + ") OR (scope >= ? AND scope < ?))", append(args, lo, hi)
+	default:
+		return query, args
+	}
+}
 
 // Compile-time parity assertions ensuring SQLiteStore implements every capability interface.
 var (
@@ -44,6 +87,7 @@ func (s *SQLiteStore) ListTimeline(ctx context.Context, filter storage.TimelineF
 		query += " AND created_at >= ?"
 		args = append(args, filter.Since.UnixNano())
 	}
+	query, args = appendSQLiteScopePredicate(query, args, filter.Scope, filter.ScopeMode)
 	query += " ORDER BY created_at DESC LIMIT ?"
 	args = append(args, fetchLimit)
 
@@ -122,24 +166,59 @@ func (s *SQLiteStore) GetLineage(ctx context.Context, id string) ([]*brain.Memor
 	return ancestors, audit, nil
 }
 
+// ListScopes aggregates active non-derived memory and invariant counts per canonical scope.
+func (s *SQLiteStore) ListScopes(ctx context.Context) ([]storage.ScopeSummary, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT scope,
+		       COUNT(*) AS mem_count,
+		       SUM(CASE WHEN authority_tier IN ('TIER_0_SOVEREIGN', 'TIER_1_ARCHITECTURE') THEN 1 ELSE 0 END) AS inv_count
+		FROM memory_nodes
+		WHERE derived = 0
+		  AND (lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL)
+		GROUP BY scope
+		ORDER BY scope ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []storage.ScopeSummary
+	for rows.Next() {
+		var sc sql.NullString
+		var memCnt, invCnt int
+		if err := rows.Scan(&sc, &memCnt, &invCnt); err != nil {
+			return nil, err
+		}
+		out = append(out, storage.ScopeSummary{
+			Scope:          sc.String,
+			Depth:          scope.Depth(sc.String),
+			MemoryCount:    memCnt,
+			InvariantCount: invCnt,
+		})
+	}
+	return out, rows.Err()
+}
+
 // QueryActiveNodesForCartridge selects active, non-derived memory nodes matching cartridge export filters.
-func (s *SQLiteStore) QueryActiveNodesForCartridge(ctx context.Context, repo, category, tier string, since *time.Time) ([]*brain.MemoryNode, error) {
+func (s *SQLiteStore) QueryActiveNodesForCartridge(ctx context.Context, filter storage.CartridgeFilter) ([]*brain.MemoryNode, error) {
 	query := `SELECT ` + sqliteMemoryColumns + `
 	          FROM memory_nodes
 	          WHERE derived = 0 AND (lifecycle_status = 'ACTIVE' OR lifecycle_status = '' OR lifecycle_status IS NULL)`
 	var args []any
-	if category != "" {
+	if filter.Category != "" {
 		query += " AND category = ?"
-		args = append(args, category)
+		args = append(args, filter.Category)
 	}
-	if tier != "" {
+	if filter.Tier != "" {
 		query += " AND authority_tier = ?"
-		args = append(args, tier)
+		args = append(args, filter.Tier)
 	}
-	if since != nil {
+	if filter.Since != nil {
 		query += " AND created_at >= ?"
-		args = append(args, since.UnixNano())
+		args = append(args, filter.Since.UnixNano())
 	}
+	query, args = appendSQLiteScopePredicate(query, args, filter.Scope, filter.ScopeMode)
 	query += " ORDER BY id ASC"
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -154,7 +233,7 @@ func (s *SQLiteStore) QueryActiveNodesForCartridge(ctx context.Context, repo, ca
 		if err != nil {
 			return nil, err
 		}
-		if repo != "" && (n.Metadata == nil || !strings.EqualFold(n.Metadata["git_repo"], repo)) {
+		if filter.Repo != "" && (n.Metadata == nil || !strings.EqualFold(n.Metadata["git_repo"], filter.Repo)) {
 			continue
 		}
 		out = append(out, n)

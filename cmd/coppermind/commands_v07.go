@@ -20,6 +20,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/flightdeck"
 	"github.com/bonjoski/coppermind/pkg/hook"
 	"github.com/bonjoski/coppermind/pkg/lenses"
+	"github.com/bonjoski/coppermind/pkg/scope"
 	"github.com/bonjoski/coppermind/pkg/storage"
 	"github.com/bonjoski/coppermind/pkg/watcher"
 )
@@ -207,6 +208,7 @@ func runBrief(args []string) {
 	dataDir := fs.String("data-dir", "", "Data directory")
 	project := fs.String("project", "", "Project vault")
 	repoDir := fs.String("repo", "", "Repository directory (defaults to cwd)")
+	scopeFlag := fs.String("scope", "", "Optional hierarchical scope (e.g. platform/payments/webhooks)")
 	maxTokens := fs.Int("max-tokens", brief.HardMaxTokens, "Token budget ceiling (max 800)")
 	format := fs.String("format", "markdown", "Output format: markdown or json")
 	_ = fs.Parse(args)
@@ -220,6 +222,7 @@ func runBrief(args []string) {
 
 	res, err := brief.Compile(context.Background(), mgr, brief.BriefRequest{
 		RepoDir:   *repoDir,
+		Scope:     *scopeFlag,
 		MaxTokens: *maxTokens,
 		Format:    *format,
 	})
@@ -383,6 +386,8 @@ func runCapsuleCartridgePack(args []string) {
 	repo := fs.String("repo", "", "Filter by git_repo metadata")
 	category := fs.String("category", "", "Filter by category")
 	tier := fs.String("tier", "", "Filter by authority_tier")
+	scopeFlag := fs.String("scope", "", "Filter by hierarchical scope (e.g. platform/payments)")
+	scopeMode := fs.String("scope-mode", "subtree", "Scope matching mode for export (subtree|ancestors|exact|lineage|all)")
 	since := fs.String("since", "", "Filter created since (e.g. 30d or YYYY-MM-DD)")
 	keySpec := fs.String("key", "", "Optional Ed25519 private key file or hex for signing")
 	_ = fs.Parse(args)
@@ -400,11 +405,23 @@ func runCapsuleCartridgePack(args []string) {
 		os.Exit(1)
 	}
 
+	var parsedMode scope.Mode
+	if strings.TrimSpace(*scopeFlag) != "" {
+		m, mErr := scope.ParseMode(*scopeMode)
+		if mErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", mErr)
+			os.Exit(1)
+		}
+		parsedMode = m
+	}
+
 	opts := capsule.CartridgeExportOptions{
-		Name:     *name,
-		Repo:     *repo,
-		Category: *category,
-		Tier:     *tier,
+		Name:      *name,
+		Repo:      *repo,
+		Category:  *category,
+		Tier:      *tier,
+		Scope:     *scopeFlag,
+		ScopeMode: parsedMode,
 	}
 	if strings.TrimSpace(*since) != "" {
 		t, pErr := brain.ResolveTemporalBound(*since, "", time.Now().UTC())
@@ -438,6 +455,7 @@ func runCapsuleCartridgeMerge(args []string) {
 	project := fs.String("project", "", "Project vault")
 	pubKeySpec := fs.String("pubkey", "", "Ed25519 public key file or hex")
 	allowUnsigned := fs.Bool("allow-unsigned", false, "Allow merging an unsigned local cartridge (capped at TIER_2_MENTOR_CAPSULE / PROPOSED)")
+	scopePrefix := fs.String("scope-prefix", "", "Optional hierarchical scope prefix to mount imported records beneath")
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
@@ -466,6 +484,7 @@ func runCapsuleCartridgeMerge(args []string) {
 	res, err := capsule.MergeCartridge(context.Background(), mgr, inPath, capsule.CartridgeMergeOptions{
 		RequiredPubKey: pub,
 		AllowUnsigned:  *allowUnsigned,
+		ScopePrefix:    *scopePrefix,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Cartridge merge rejected: %v\n", err)
@@ -511,8 +530,9 @@ func runCapsuleCartridgeInspect(args []string) {
 	fmt.Printf("  • Records:   %d | Edges: %d\n", res.Manifest.RecordCount, res.EdgeCount)
 	fmt.Printf("  • Merkle:    %s (valid=%t)\n", res.Manifest.MerkleRoot, res.MerkleValid)
 	fmt.Printf("  • Signature: signed=%t verified=%t\n", res.Signed, res.SignatureValid)
-	if res.Manifest.FilterRepo != "" || res.Manifest.FilterTier != "" || res.Manifest.FilterCat != "" {
-		fmt.Printf("  • Filters:   repo=%q tier=%q category=%q\n", res.Manifest.FilterRepo, res.Manifest.FilterTier, res.Manifest.FilterCat)
+	if res.Manifest.FilterRepo != "" || res.Manifest.FilterTier != "" || res.Manifest.FilterCat != "" || res.Manifest.FilterScope != "" {
+		fmt.Printf("  • Filters:   repo=%q tier=%q category=%q scope=%q mode=%q\n",
+			res.Manifest.FilterRepo, res.Manifest.FilterTier, res.Manifest.FilterCat, res.Manifest.FilterScope, res.Manifest.FilterScopeMode)
 	}
 	if len(res.SampleRecords) > 0 {
 		fmt.Printf("  • Sample Previews (%d):\n", len(res.SampleRecords))
@@ -590,6 +610,8 @@ func runWatch(args []string) {
 	dataDir := fs.String("data-dir", "", "Data directory")
 	project := fs.String("project", "", "Project vault (e.g. personal)")
 	category := fs.String("category", "note", "Category assigned to synced Markdown notes")
+	scopeFlag := fs.String("scope", "", "Optional base hierarchical scope for synced notes (e.g. platform/docs)")
+	scopeFromDirs := fs.Bool("scope-from-dirs", false, "Derive nested child scopes from relative folder paths")
 	interval := fs.Duration("interval", watcher.DefaultPollInterval, "Hash-incremental scan interval (e.g. 5s)")
 	once := fs.Bool("once", false, "Run a single read-only sync pass and exit")
 	asJSON := fs.Bool("json", false, "Emit sync stats as JSON")
@@ -609,8 +631,10 @@ func runWatch(args []string) {
 	defer mgr.Close()
 
 	opts := watcher.Options{
-		Category: *category,
-		Interval: *interval,
+		Category:      *category,
+		Scope:         *scopeFlag,
+		ScopeFromDirs: *scopeFromDirs,
+		Interval:      *interval,
 	}
 
 	printStats := func(s *watcher.SyncStats, sErr error) {
@@ -688,4 +712,123 @@ func runIngestFlightdeck(args []string) {
 	}
 	fmt.Printf("✓ Ingested Flightdeck trace into vault %q\n  • Events: %d | Failures: %d | Failure→Fix Pairs Linked: %d | Dead Ends: %d | Quarantined: %d\n",
 		activeProj, res.EventsRead, res.FailuresFound, res.PairsLinked, len(res.DeadEndIDs), res.QuarantinedCount)
+}
+
+func runScope(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: coppermind scope <list | show <scope>> [--project <vault>] [--json]")
+		os.Exit(1)
+	}
+	action := strings.ToLower(strings.TrimSpace(args[0]))
+	fs := flag.NewFlagSet("scope "+action, flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory")
+	project := fs.String("project", "", "Project vault")
+	asJSON := fs.Bool("json", false, "Emit output as JSON")
+	limit := fs.Int("limit", 15, "Maximum inherited invariants to display (for show)")
+	_ = fs.Parse(args[1:])
+
+	mgr, activeProj, err := initManager(*dataDir, *project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+	switch action {
+	case "list", "ls", "tree":
+		expStore, ok := mgr.Store().(storage.ExplorerStore)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "Error: active storage backend does not support scope listing")
+			os.Exit(1)
+		}
+		scopes, err := expStore.ListScopes(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error listing scopes: %v\n", err)
+			os.Exit(1)
+		}
+		if *asJSON {
+			b, _ := json.MarshalIndent(map[string]any{"project": activeProj, "count": len(scopes), "scopes": scopes}, "", "  ")
+			fmt.Println(string(b))
+			return
+		}
+		if len(scopes) == 0 {
+			fmt.Printf("No active memories in vault %q.\n", activeProj)
+			return
+		}
+		fmt.Printf("Hierarchical Scopes in vault %q (%d):\n", activeProj, len(scopes))
+		for _, s := range scopes {
+			label := s.Scope
+			if label == "" {
+				label = "(vault-global)"
+			}
+			indent := strings.Repeat("  ", s.Depth)
+			fmt.Printf("%s• %-36s (%d memories, %d TIER_0/1 invariants)\n", indent, label, s.MemoryCount, s.InvariantCount)
+		}
+
+	case "show", "inspect":
+		if fs.NArg() == 0 {
+			fmt.Fprintln(os.Stderr, "Usage: coppermind scope show <scope> [--project <vault>] [--json]")
+			os.Exit(1)
+		}
+		norm, scErr := scope.Normalize(fs.Arg(0))
+		if scErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", scErr)
+			os.Exit(1)
+		}
+		ancestors := scope.Ancestors(norm)
+		results, err := mgr.Recall(ctx, brain.RecallRequest{
+			Query:       norm + " architecture invariant convention policy",
+			Scope:       norm,
+			ScopeMode:   scope.ModeAncestors,
+			ActiveScope: norm,
+			Hybrid:      true,
+			Limit:       *limit,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error inspecting scope %q: %v\n", norm, err)
+			os.Exit(1)
+		}
+		if *asJSON {
+			b, _ := json.MarshalIndent(map[string]any{
+				"project":   activeProj,
+				"scope":     norm,
+				"ancestors": ancestors,
+				"count":     len(results),
+				"results":   results,
+			}, "", "  ")
+			fmt.Println(string(b))
+			return
+		}
+		fmt.Printf("Scope %q in vault %q\n", norm, activeProj)
+		chainLabels := make([]string, len(ancestors))
+		for i, a := range ancestors {
+			if a == "" {
+				chainLabels[i] = "(vault-global)"
+			} else {
+				chainLabels[i] = a
+			}
+		}
+		fmt.Printf("Inheritance chain: %s\n\n", strings.Join(chainLabels, " → "))
+		if len(results) == 0 {
+			fmt.Println("No inherited memories found for this scope.")
+			return
+		}
+		for i, r := range results {
+			scLabel := r.Node.Scope
+			if scLabel == "" {
+				scLabel = "(vault-global)"
+			}
+			snippet := strings.Join(strings.Fields(r.Node.Content), " ")
+			if len(snippet) > 140 {
+				snippet = snippet[:137] + "..."
+			}
+			fmt.Printf("%d. [%.3f] [%s | %s | scope:%s] %s\n",
+				i+1, r.Score, r.Node.AuthorityTier, r.Node.Category, scLabel, snippet)
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown scope action %q (expected list or show)\n", action)
+		os.Exit(1)
+	}
 }
