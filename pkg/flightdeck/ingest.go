@@ -2,6 +2,7 @@ package flightdeck
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,7 +20,11 @@ import (
 	"github.com/bonjoski/coppermind/pkg/graph"
 	"github.com/bonjoski/coppermind/pkg/security"
 	"github.com/bonjoski/coppermind/pkg/storage"
+	tmtrace "github.com/bonjoski/tinmind/pkg/trace"
+	"github.com/klauspost/compress/zstd"
 )
+
+var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 
 const (
 	// DefaultMaxTraceBytes caps Flightdeck JSONL ingestion at 16 MiB (anti-DoS).
@@ -89,7 +94,22 @@ func IngestTrace(ctx context.Context, mgr *brain.Manager, tracePath string, opts
 	if mgr == nil {
 		return nil, fmt.Errorf("brain manager is required")
 	}
-	absPath, err := filepath.Abs(strings.TrimSpace(tracePath))
+	trimmedArg := strings.TrimSpace(tracePath)
+	// Allow passing a bare Tinmind trace ID (e.g. tm-20261127-a81c) in addition to a file path.
+	if trimmedArg != "" && !strings.ContainsAny(trimmedArg, `/\`) {
+		if _, statErr := os.Lstat(trimmedArg); os.IsNotExist(statErr) {
+			if defaultDir, derr := tmtrace.DefaultTraceDir(); derr == nil {
+				var extra []string
+				if legacy := tmtrace.LegacyFlightdeckTraceDir(); legacy != "" {
+					extra = append(extra, legacy)
+				}
+				if info, rerr := tmtrace.ResolveTrace(defaultDir, trimmedArg, extra...); rerr == nil {
+					trimmedArg = info.Path
+				}
+			}
+		}
+	}
+	absPath, err := filepath.Abs(trimmedArg)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +138,24 @@ func IngestTrace(ctx context.Context, mgr *brain.Manager, tracePath string, opts
 	}
 	defer f.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	// Transparently support both uncompressed .jsonl and Zstandard .jsonl.zst traces
+	// while strictly enforcing maxBytes on the decompressed stream (anti-zstd-bomb).
+	br := bufio.NewReaderSize(f, 32*1024)
+	magic, peekErr := br.Peek(4)
+	if peekErr != nil && !errors.Is(peekErr, io.EOF) && !errors.Is(peekErr, bufio.ErrBufferFull) {
+		return nil, peekErr
+	}
+	var streamReader io.Reader = br
+	if len(magic) == 4 && bytes.Equal(magic, zstdMagic) {
+		dec, zerr := zstd.NewReader(br)
+		if zerr != nil {
+			return nil, fmt.Errorf("failed to open zstd tinmind trace: %w", zerr)
+		}
+		defer dec.Close()
+		streamReader = dec
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(streamReader, maxBytes+1))
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +165,7 @@ func IngestTrace(ctx context.Context, mgr *brain.Manager, tracePath string, opts
 
 	sessionID := strings.TrimSpace(opts.SessionID)
 	if sessionID == "" {
-		sessionID = "flightdeck"
+		sessionID = "tinmind"
 	}
 
 	var events []TraceEvent

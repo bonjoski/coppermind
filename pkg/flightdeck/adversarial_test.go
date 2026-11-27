@@ -13,6 +13,7 @@ import (
 	"github.com/bonjoski/coppermind/pkg/graph"
 	"github.com/bonjoski/coppermind/pkg/scratchpad"
 	"github.com/bonjoski/coppermind/pkg/storage/sqlite"
+	tmtrace "github.com/bonjoski/tinmind/pkg/trace"
 )
 
 func TestAdversarial_FlightdeckIngestPairingSecretsSymlinkAndSizeCap(t *testing.T) {
@@ -79,5 +80,34 @@ func TestAdversarial_FlightdeckIngestPairingSecretsSymlinkAndSizeCap(t *testing.
 	_ = os.WriteFile(bigPath, []byte(strings.Repeat("a", 2048)), 0600)
 	if _, err := IngestTrace(ctx, mgr, bigPath, IngestOptions{MaxFileBytes: 1024}); !errors.Is(err, ErrTraceTooLarge) {
 		t.Fatalf("SECURITY VIOLATION: oversized trace not refused: %v", err)
+	}
+
+	// 4. Native compressed Tinmind .jsonl.zst trace MUST ingest directly without export
+	zstDir := t.TempDir()
+	w, err := tmtrace.NewWriter(tmtrace.WriterOptions{
+		TraceDir: zstDir,
+		TraceID:  "tm-20261127-zstingest",
+		Format:   tmtrace.FormatZstd,
+	})
+	if err != nil {
+		t.Fatalf("tinmind NewWriter: %v", err)
+	}
+	code1, code0 := 1, 0
+	_ = w.WriteEvent(tmtrace.Event{Type: tmtrace.TypeCmdExit, Command: "go build ./...", ExitCode: &code1, Stderr: "undefined: foo", Repo: "tinmind"})
+	_ = w.WriteEvent(tmtrace.Event{Type: tmtrace.TypeCmdExit, Command: "go mod tidy && go build ./...", ExitCode: &code0, Stdout: "ok", Repo: "tinmind"})
+	if _, _, err := w.Close(); err != nil {
+		t.Fatalf("tinmind Close: %v", err)
+	}
+	zres, err := IngestTrace(ctx, mgr, w.Path(), IngestOptions{RepoName: "tinmind"})
+	if err != nil {
+		t.Fatalf("IngestTrace(.jsonl.zst) failed: %v", err)
+	}
+	if zres.PairsLinked != 1 {
+		t.Fatalf("expected 1 failure->fix pair from .jsonl.zst, got %+v", zres)
+	}
+
+	// 5. Zstd decompression bomb exceeding MaxFileBytes MUST fail closed
+	if _, err := IngestTrace(ctx, mgr, w.Path(), IngestOptions{MaxFileBytes: 64}); !errors.Is(err, ErrTraceTooLarge) {
+		t.Fatalf("SECURITY VIOLATION: compressed zstd stream exceeding decompressed cap not refused: %v", err)
 	}
 }

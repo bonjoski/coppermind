@@ -151,7 +151,7 @@ func main() {
 		runUI(cmdArgs)
 	case "watch":
 		runWatch(cmdArgs)
-	case "ingest-flightdeck":
+	case "ingest-tinmind", "ingest-flightdeck":
 		runIngestFlightdeck(cmdArgs)
 	case "status":
 		runStatus(cmdArgs)
@@ -195,7 +195,7 @@ Commands:
   tui          Launch zero-dependency terminal Memory Explorer (search, graph, timeline, lineage, inbox, verify)
   ui           Launch strictly 127.0.0.1 token-gated local Web Memory Explorer (--allow-curate optional)
   watch        Read-only hash-incremental Markdown / Obsidian / ADR vault watcher (--once, --interval)
-  ingest-flightdeck Ingest Flightdeck JSONL traces into linked dead_end -> troubleshooting memories
+  ingest-tinmind    Ingest Tinmind (.jsonl / .jsonl.zst / trace-id) traces into dead_end -> troubleshooting memories (alias: ingest-flightdeck)
   verify       Audit cryptographic Merkle chain integrity for a session
   vacuum       Purge expired TTL memories and compact SQLite storage
   project      Manage isolated vaults (list, use, create, delete)

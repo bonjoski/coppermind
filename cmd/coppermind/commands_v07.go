@@ -690,16 +690,16 @@ func runWatch(args []string) {
 }
 
 func runIngestFlightdeck(args []string) {
-	fs := flag.NewFlagSet("ingest-flightdeck", flag.ExitOnError)
+	fs := flag.NewFlagSet("ingest-tinmind", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory")
 	project := fs.String("project", "", "Project vault")
-	session := fs.String("session", "flightdeck", "Target session ID")
+	session := fs.String("session", "tinmind", "Target session ID")
 	repo := fs.String("repo", "", "Optional git_repo metadata override")
 	asJSON := fs.Bool("json", false, "Emit ingestion report as JSON")
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: coppermind ingest-flightdeck [--project <vault>] [--repo <name>] [--json] <trace.jsonl>")
+		fmt.Fprintln(os.Stderr, "Usage: coppermind ingest-tinmind [--project <vault>] [--repo <name>] [--json] <trace-id | trace.jsonl | trace.jsonl.zst>")
 		os.Exit(1)
 	}
 	tracePath := fs.Arg(0)
@@ -716,7 +716,7 @@ func runIngestFlightdeck(args []string) {
 		RepoName:  *repo,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Flightdeck ingestion failed (fail-closed): %v\n", err)
+		fmt.Fprintf(os.Stderr, "Tinmind ingestion failed (fail-closed): %v\n", err)
 		os.Exit(1)
 	}
 	if *asJSON {
@@ -724,7 +724,7 @@ func runIngestFlightdeck(args []string) {
 		fmt.Println(string(b))
 		return
 	}
-	fmt.Printf("✓ Ingested Flightdeck trace into vault %q\n  • Events: %d | Failures: %d | Failure→Fix Pairs Linked: %d | Dead Ends: %d | Quarantined: %d\n",
+	fmt.Printf("✓ Ingested Tinmind trace into vault %q\n  • Events: %d | Failures: %d | Failure→Fix Pairs Linked: %d | Dead Ends: %d | Quarantined: %d\n",
 		activeProj, res.EventsRead, res.FailuresFound, res.PairsLinked, len(res.DeadEndIDs), res.QuarantinedCount)
 }
 
