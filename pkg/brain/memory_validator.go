@@ -10,10 +10,8 @@ import (
 	"strings"
 
 	"github.com/bonjoski/coppermind/pkg/authz"
+	"github.com/bonjoski/coppermind/pkg/memguard"
 	"github.com/bonjoski/coppermind/pkg/security"
-	stormfw "github.com/bonjoski/stormcage/pkg/firewall"
-	stormschema "github.com/bonjoski/stormcage/pkg/schema"
-	stormtaint "github.com/bonjoski/stormcage/pkg/taint"
 )
 
 var (
@@ -42,37 +40,38 @@ type ValidationVerdict struct {
 	IntegrityDigest   string   `json:"integrity_digest,omitempty"`
 }
 
-// MemoryValidator enforces episodic scratchpad integrity, in-process Stormcage semantic taint
-// tracking, author attribution, and partition quarantine with zero external daemon hop tax.
+// MemoryValidator enforces episodic scratchpad integrity, in-process cognitive memory
+// firewall & semantic taint tracking, author attribution, and partition quarantine with
+// zero external daemon hop tax or private repository dependencies.
 type MemoryValidator struct {
-	firewall  *stormfw.Firewall
-	sanitizer *stormfw.PreFlightSanitizer
-	ledger    *stormtaint.TaintLedger
+	firewall  *memguard.Firewall
+	sanitizer *memguard.PreFlightSanitizer
+	ledger    *memguard.TaintLedger
 }
 
-// NewMemoryValidator creates a new MemoryValidator backed by an embedded in-process Stormcage engine.
+// NewMemoryValidator creates a new MemoryValidator backed by the built-in in-process memguard engine.
 func NewMemoryValidator() *MemoryValidator {
 	return &MemoryValidator{
-		firewall:  stormfw.NewFirewall(),
-		sanitizer: stormfw.NewPreFlightSanitizer(),
-		ledger:    stormtaint.NewTaintLedger(),
+		firewall:  memguard.NewFirewall(),
+		sanitizer: memguard.NewPreFlightSanitizer(),
+		ledger:    memguard.NewTaintLedger(),
 	}
 }
 
 func (v *MemoryValidator) ensureEngines() {
 	if v.firewall == nil {
-		v.firewall = stormfw.NewFirewall()
+		v.firewall = memguard.NewFirewall()
 	}
 	if v.sanitizer == nil {
-		v.sanitizer = stormfw.NewPreFlightSanitizer()
+		v.sanitizer = memguard.NewPreFlightSanitizer()
 	}
 	if v.ledger == nil {
-		v.ledger = stormtaint.NewTaintLedger()
+		v.ledger = memguard.NewTaintLedger()
 	}
 }
 
-// TaintLedger returns the in-process session-partitioned Stormcage TaintLedger.
-func (v *MemoryValidator) TaintLedger() *stormtaint.TaintLedger {
+// TaintLedger returns the in-process session-partitioned memguard TaintLedger.
+func (v *MemoryValidator) TaintLedger() *memguard.TaintLedger {
 	v.ensureEngines()
 	return v.ledger
 }
@@ -87,10 +86,10 @@ func ComputeIntegrityDigest(effectiveTaint, cleanedContent string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func resolveEffectiveTaint(req *RememberRequest) stormtaint.TaintLevel {
-	base := req.Provenance.ToStormcageTaint()
+func resolveEffectiveTaint(req *RememberRequest) memguard.TaintLevel {
+	base := req.Provenance.ToTaintLevel()
 	if req.Provenance == "" {
-		base = stormtaint.TRUST_LOCAL_WORKSPACE
+		base = memguard.TRUST_LOCAL_WORKSPACE
 	}
 
 	// Prevent provenance spoofing on third-party/unsigned git diffs and shared history
@@ -103,7 +102,7 @@ func resolveEffectiveTaint(req *RememberRequest) stormtaint.TaintLevel {
 		}
 	}
 	if isDiffOrUnsigned {
-		base = stormtaint.MergeTaints(base, stormtaint.TAINT_SHARED_DOC)
+		base = memguard.MergeTaints(base, memguard.TAINT_SHARED_DOC)
 	}
 	return base
 }
@@ -177,12 +176,12 @@ func (v *MemoryValidator) Validate(_ context.Context, req *RememberRequest) (*Va
 	effectiveTaint := resolveEffectiveTaint(req)
 	verdict.EffectiveTaint = string(effectiveTaint)
 
-	// Escalate request provenance if Stormcage taint propagation elevated it (e.g. unsigned git diff)
-	if effectiveTaint != stormtaint.TRUST_LOCAL_WORKSPACE && req.Provenance == ProvenanceLocalWorkspace {
+	// Escalate request provenance if taint propagation elevated it (e.g. unsigned git diff)
+	if effectiveTaint != memguard.TRUST_LOCAL_WORKSPACE && req.Provenance == ProvenanceLocalWorkspace {
 		req.Provenance = ProvenanceTier(effectiveTaint)
 	}
 
-	normRes := stormschema.Normalize(req.Content)
+	normRes := memguard.Normalize(req.Content)
 	verdict.StrippedRunes = normRes.StrippedRunes
 	verdict.DecodedPayloads = len(normRes.DecodedPayloads)
 
@@ -190,31 +189,31 @@ func (v *MemoryValidator) Validate(_ context.Context, req *RememberRequest) (*Va
 	if req.Metadata != nil && req.Metadata["task_intent"] != "" {
 		taskIntent = req.Metadata["task_intent"]
 	}
-	stormRec := &stormschema.MemoryRecord{
+	guardRec := &memguard.MemoryRecord{
 		AgentID:    sanitizeAgentID(req.AuthorIdentity),
 		Taint:      effectiveTaint,
 		Content:    req.Content,
 		TaskIntent: taskIntent,
 		Metadata:   req.Metadata,
 	}
-	stormVerdict := v.firewall.Gate(stormRec, stormtaint.PRIVILEGE_HIGH)
-	verdict.StormcageDecision = string(stormVerdict.Status)
-	verdict.MatchedRules = append(verdict.MatchedRules, stormVerdict.MatchedRules...)
+	guardVerdict := v.firewall.Gate(guardRec, memguard.PRIVILEGE_HIGH)
+	verdict.StormcageDecision = string(guardVerdict.Status)
+	verdict.MatchedRules = append(verdict.MatchedRules, guardVerdict.MatchedRules...)
 
-	if stormVerdict.RiskScore > verdict.TaintScore {
-		verdict.TaintScore = stormVerdict.RiskScore
+	if guardVerdict.RiskScore > verdict.TaintScore {
+		verdict.TaintScore = guardVerdict.RiskScore
 	}
-	for _, rID := range stormVerdict.MatchedRules {
-		verdict.Flags = append(verdict.Flags, "stormcage:"+rID)
+	for _, rID := range guardVerdict.MatchedRules {
+		verdict.Flags = append(verdict.Flags, "memguard:"+rID)
 	}
 	if normRes.StrippedRunes > 0 {
-		verdict.Flags = append(verdict.Flags, fmt.Sprintf("stormcage_stripped_%d_invisible_runes", normRes.StrippedRunes))
+		verdict.Flags = append(verdict.Flags, fmt.Sprintf("memguard_stripped_%d_invisible_runes", normRes.StrippedRunes))
 	}
 	if len(normRes.DecodedPayloads) > 0 {
-		verdict.Flags = append(verdict.Flags, fmt.Sprintf("stormcage_decoded_%d_cloaked_payloads", len(normRes.DecodedPayloads)))
+		verdict.Flags = append(verdict.Flags, fmt.Sprintf("memguard_decoded_%d_cloaked_payloads", len(normRes.DecodedPayloads)))
 	}
 
-	// 3. Secret & Credential Sanitization (runs after Stormcage cloaking recovery; fails closed on raw private keys)
+	// 3. Secret & Credential Sanitization (runs after cloaking recovery; fails closed on raw private keys)
 	secRes, err := security.SanitizeMemory(req.Content)
 	if err != nil {
 		return nil, fmt.Errorf("memory content rejected by secret policy: %w", err)
@@ -223,19 +222,19 @@ func (v *MemoryValidator) Validate(_ context.Context, req *RememberRequest) (*Va
 
 	// 4. XML Tool Reflection & Artificial Delimiter Defanging
 	candidateText := secRes.SanitizedText
-	if stormVerdict.Status == stormfw.DecisionSanitized && stormVerdict.CleanedContent != "" {
-		// Re-run secret sanitization on Stormcage's cleaned text to preserve any credential redactions
-		if cleanedSec, secErr := security.SanitizeMemory(stormVerdict.CleanedContent); secErr == nil {
+	if guardVerdict.Status == memguard.DecisionSanitized && guardVerdict.CleanedContent != "" {
+		// Re-run secret sanitization on cleaned text to preserve any credential redactions
+		if cleanedSec, secErr := security.SanitizeMemory(guardVerdict.CleanedContent); secErr == nil {
 			candidateText = cleanedSec.SanitizedText
 		}
 	}
-	// Neutralize any remaining artificial delimiters or ws/localhost pivots if Stormcage flagged cloaking or non-local taint
-	isTrustedLensFinding := req.Derived && req.SourceLens != "" && effectiveTaint == stormtaint.TRUST_LOCAL_WORKSPACE
-	if !isTrustedLensFinding && (effectiveTaint != stormtaint.TRUST_LOCAL_WORKSPACE || stormVerdict.Status == stormfw.DecisionQuarantined) {
+	// Neutralize any remaining artificial delimiters or ws/localhost pivots if flagged cloaking or non-local taint
+	isTrustedLensFinding := req.Derived && req.SourceLens != "" && effectiveTaint == memguard.TRUST_LOCAL_WORKSPACE
+	if !isTrustedLensFinding && (effectiveTaint != memguard.TRUST_LOCAL_WORKSPACE || guardVerdict.Status == memguard.DecisionQuarantined) {
 		sanRes := v.sanitizer.Sanitize(candidateText)
 		if sanRes.TotalNeutralized > 0 {
 			candidateText = sanRes.Cleaned
-			verdict.Flags = append(verdict.Flags, fmt.Sprintf("stormcage_neutralized_%d_hazards", sanRes.TotalNeutralized))
+			verdict.Flags = append(verdict.Flags, fmt.Sprintf("memguard_neutralized_%d_hazards", sanRes.TotalNeutralized))
 		}
 	}
 
@@ -254,14 +253,14 @@ func (v *MemoryValidator) Validate(_ context.Context, req *RememberRequest) (*Va
 	}
 	verdict.Flags = append(verdict.Flags, threatRes.Flags...)
 
-	isCritical := threatRes.IsCritical || stormVerdict.Status == stormfw.DecisionQuarantined
+	isCritical := threatRes.IsCritical || guardVerdict.Status == memguard.DecisionQuarantined
 
-	// Fail-closed invariant: critical prompt injection or Stormcage quarantine from any non-local provenance is rejected immediately
-	if isCritical && effectiveTaint != stormtaint.TRUST_LOCAL_WORKSPACE {
+	// Fail-closed invariant: critical prompt injection or firewall quarantine from any non-local provenance is rejected immediately
+	if isCritical && effectiveTaint != memguard.TRUST_LOCAL_WORKSPACE {
 		return nil, fmt.Errorf(
-			"untrusted input rejected (taint=%s stormcage=%s rules=%s): %w",
+			"untrusted input rejected (taint=%s memguard=%s rules=%s): %w",
 			effectiveTaint,
-			stormVerdict.Status,
+			guardVerdict.Status,
 			strings.Join(verdict.MatchedRules, ","),
 			security.ErrPromptInjectionRejected,
 		)
@@ -278,18 +277,18 @@ func (v *MemoryValidator) Validate(_ context.Context, req *RememberRequest) (*Va
 			needsQuarantine = true
 			quarantineReasons = append(quarantineReasons, fmt.Sprintf("high_taint_score:%.2f", verdict.TaintScore))
 		}
-		if isCritical && effectiveTaint == stormtaint.TRUST_LOCAL_WORKSPACE {
+		if isCritical && effectiveTaint == memguard.TRUST_LOCAL_WORKSPACE {
 			needsQuarantine = true
 			quarantineReasons = append(quarantineReasons, "local_critical_threat_quarantined")
 		}
 		if (req.Category == "observation" || req.Category == "git_diff" || req.Category == "" || req.Derived) &&
-			effectiveTaint != stormtaint.TRUST_LOCAL_WORKSPACE {
+			effectiveTaint != memguard.TRUST_LOCAL_WORKSPACE {
 			needsQuarantine = true
 			quarantineReasons = append(quarantineReasons, fmt.Sprintf("untrusted_observation_provenance:%s", effectiveTaint))
 		}
-		if (normRes.StrippedRunes > 0 || len(normRes.DecodedPayloads) > 0) && effectiveTaint != stormtaint.TRUST_LOCAL_WORKSPACE {
+		if (normRes.StrippedRunes > 0 || len(normRes.DecodedPayloads) > 0) && effectiveTaint != memguard.TRUST_LOCAL_WORKSPACE {
 			needsQuarantine = true
-			quarantineReasons = append(quarantineReasons, "stormcage_cloaked_content_detected")
+			quarantineReasons = append(quarantineReasons, "memguard_cloaked_content_detected")
 		}
 		if req.Metadata != nil && req.Metadata["quarantined"] == "true" {
 			needsQuarantine = true
@@ -340,32 +339,32 @@ func (v *MemoryValidator) ValidateScratchpadWrite(
 	if provenance == "" {
 		provenance = ProvenanceSharedDoc
 	}
-	effectiveTaint := provenance.ToStormcageTaint()
+	effectiveTaint := provenance.ToTaintLevel()
 
-	// Run Stormcage normalization & firewall BEFORE secret redaction so U+E0000 Unicode tags
+	// Run memguard normalization & firewall BEFORE secret redaction so U+E0000 Unicode tags
 	// and Base64-cloaked injections are recovered and blocked instead of masked.
-	normRes := stormschema.Normalize(value)
-	stormRec := &stormschema.MemoryRecord{
+	normRes := memguard.Normalize(value)
+	guardRec := &memguard.MemoryRecord{
 		AgentID:    sanitizeAgentID(sessionID),
 		Taint:      effectiveTaint,
 		Content:    value,
 		TaskIntent: "scratchpad:" + key,
 	}
-	stormVerdict := v.firewall.Gate(stormRec, stormtaint.PRIVILEGE_HIGH)
+	guardVerdict := v.firewall.Gate(guardRec, memguard.PRIVILEGE_HIGH)
 
-	if stormVerdict.Status == stormfw.DecisionQuarantined {
+	if guardVerdict.Status == memguard.DecisionQuarantined {
 		return nil, fmt.Errorf(
-			"scratchpad write rejected for key %q (stormcage=%s rules=%s): %w",
+			"scratchpad write rejected for key %q (memguard=%s rules=%s): %w",
 			key,
-			stormVerdict.Status,
-			strings.Join(stormVerdict.MatchedRules, ","),
+			guardVerdict.Status,
+			strings.Join(guardVerdict.MatchedRules, ","),
 			security.ErrPromptInjectionRejected,
 		)
 	}
 
 	candidate := value
-	if stormVerdict.Status == stormfw.DecisionSanitized && stormVerdict.CleanedContent != "" {
-		candidate = stormVerdict.CleanedContent
+	if guardVerdict.Status == memguard.DecisionSanitized && guardVerdict.CleanedContent != "" {
+		candidate = guardVerdict.CleanedContent
 	}
 
 	secRes, err := security.SanitizeMemory(candidate)
@@ -389,8 +388,8 @@ func (v *MemoryValidator) ValidateScratchpadWrite(
 	}
 
 	taintScore := threatRes.TaintScore
-	if stormVerdict.RiskScore > taintScore {
-		taintScore = stormVerdict.RiskScore
+	if guardVerdict.RiskScore > taintScore {
+		taintScore = guardVerdict.RiskScore
 	}
 
 	flags := append([]string(nil), threatRes.Flags...)
@@ -398,7 +397,7 @@ func (v *MemoryValidator) ValidateScratchpadWrite(
 		flags = append(flags, fmt.Sprintf("defanged_%d_xml_delimiters", defanged))
 	}
 	if normRes.StrippedRunes > 0 {
-		flags = append(flags, fmt.Sprintf("stormcage_stripped_%d_invisible_runes", normRes.StrippedRunes))
+		flags = append(flags, fmt.Sprintf("memguard_stripped_%d_invisible_runes", normRes.StrippedRunes))
 	}
 
 	return &ValidationVerdict{
@@ -406,9 +405,9 @@ func (v *MemoryValidator) ValidateScratchpadWrite(
 		TaintScore:        taintScore,
 		Flags:             flags,
 		RedactedCount:     secRes.RedactedCount,
-		StormcageDecision: string(stormVerdict.Status),
+		StormcageDecision: string(guardVerdict.Status),
 		EffectiveTaint:    string(effectiveTaint),
-		MatchedRules:      stormVerdict.MatchedRules,
+		MatchedRules:      guardVerdict.MatchedRules,
 		StrippedRunes:     normRes.StrippedRunes,
 		DecodedPayloads:   len(normRes.DecodedPayloads),
 		IntegrityDigest:   ComputeIntegrityDigest(string(effectiveTaint), cleaned),
@@ -416,7 +415,7 @@ func (v *MemoryValidator) ValidateScratchpadWrite(
 }
 
 // VerifyGitDiff inspects an incoming git diff (e.g., from post-commit, post-merge, or a third-party PR)
-// using the embedded Stormcage engine to catch poisoned comments, invisible Unicode tag smuggling,
+// using the built-in memguard engine to catch poisoned comments, invisible Unicode tag smuggling,
 // Base64/Hex encoded prompt injections, XML tool reflection, and imperative drift before the diff
 // enters episodic memory or agent scratchpads.
 func (v *MemoryValidator) VerifyGitDiff(
@@ -430,9 +429,9 @@ func (v *MemoryValidator) VerifyGitDiff(
 	if strings.TrimSpace(diffContent) == "" {
 		return &ValidationVerdict{
 			CleanedContent:    "",
-			StormcageDecision: string(stormfw.DecisionAllowed),
-			EffectiveTaint:    string(stormtaint.TRUST_LOCAL_WORKSPACE),
-			IntegrityDigest:   ComputeIntegrityDigest(string(stormtaint.TRUST_LOCAL_WORKSPACE), ""),
+			StormcageDecision: string(memguard.DecisionAllowed),
+			EffectiveTaint:    string(memguard.TRUST_LOCAL_WORKSPACE),
+			IntegrityDigest:   ComputeIntegrityDigest(string(memguard.TRUST_LOCAL_WORKSPACE), ""),
 		}, nil
 	}
 

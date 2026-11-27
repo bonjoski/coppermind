@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bonjoski/coppermind/pkg/memguard"
 	"github.com/bonjoski/coppermind/pkg/scope"
-	stormtaint "github.com/bonjoski/stormcage/pkg/taint"
 )
 
 // ProvenanceTier defines the security and trust classification of ingested context.
@@ -36,21 +36,27 @@ func ParseProvenanceTier(raw string) (ProvenanceTier, error) {
 	}
 }
 
-// ToStormcageTaint maps Coppermind's ProvenanceTier to Stormcage's canonical TaintLevel.
+// ToTaintLevel maps Coppermind's ProvenanceTier to memguard's canonical TaintLevel.
 // Unknown or spoofed tiers fail closed to TAINT_UNTRUSTED_WEB.
-func (p ProvenanceTier) ToStormcageTaint() stormtaint.TaintLevel {
+func (p ProvenanceTier) ToTaintLevel() memguard.TaintLevel {
 	switch p {
 	case ProvenanceLocalWorkspace:
-		return stormtaint.TRUST_LOCAL_WORKSPACE
+		return memguard.TRUST_LOCAL_WORKSPACE
 	case ProvenanceSharedDoc:
-		return stormtaint.TAINT_SHARED_DOC
+		return memguard.TAINT_SHARED_DOC
 	case ProvenanceExternalUser:
-		return stormtaint.TAINT_EXTERNAL_USER
+		return memguard.TAINT_EXTERNAL_USER
 	case ProvenanceUntrustedWeb:
-		return stormtaint.TAINT_UNTRUSTED_WEB
+		return memguard.TAINT_UNTRUSTED_WEB
 	default:
-		return stormtaint.TAINT_UNTRUSTED_WEB
+		return memguard.TAINT_UNTRUSTED_WEB
 	}
+}
+
+// ToStormcageTaint is a backwards-compatible alias for ToTaintLevel backed by the
+// built-in in-process memguard taint engine.
+func (p ProvenanceTier) ToStormcageTaint() memguard.TaintLevel {
+	return p.ToTaintLevel()
 }
 
 // MemoryNode represents an atomic unit of episodic or semantic memory.

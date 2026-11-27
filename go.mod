@@ -3,7 +3,6 @@ module github.com/bonjoski/coppermind
 go 1.27.3
 
 require (
-	github.com/bonjoski/stormcage v0.4.0
 	github.com/lib/pq v1.12.3
 	github.com/mattn/go-isatty v0.0.24
 	github.com/rabbitmq/amqp091-go v1.16.0
