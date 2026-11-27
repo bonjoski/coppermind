@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/bonjoski/coppermind/actions/workflows/ci.yml/badge.svg)](https://github.com/bonjoski/coppermind/actions/workflows/ci.yml)
 [![SLSA 2](https://slsa.dev/images/gh-badge-level2.svg)](https://slsa.dev)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 > **Local-First AI Memory System for Coding Agents**  
 > *A local-first AI memory system that gives your coding agents persistent, searchable, tamper-evident memory across sessions—with zero cloud dependencies.*
@@ -428,4 +428,4 @@ soulcaster verify --attestation coppermind.intoto.jsonl bin/coppermind
 
 ## License
 
-MIT License. Copyright (c) 2026 Ben Skolmoski (`bonjoski`).
+Apache License 2.0. Copyright 2026 Ben Skolmoski (`bonjoski`). See `LICENSE` for details.
